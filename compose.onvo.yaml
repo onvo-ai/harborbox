@@ -1,0 +1,28 @@
+services:
+  onvo-sandbox-image:
+    image: harborbox-sandbox-onvo:local
+    build:
+      context: .
+      dockerfile: sandbox/Dockerfile
+      args:
+        SANDBOX_REQUIREMENTS: sandbox/requirements-onvo.txt
+    entrypoint: ["/bin/true"]
+    restart: "no"
+
+  api:
+    depends_on:
+      onvo-sandbox-image:
+        condition: service_completed_successfully
+    environment:
+      HARBORBOX_SANDBOX_IMAGE: harborbox-sandbox-onvo:local
+      HARBORBOX_SANDBOX_EGRESS_NETWORK: harborbox-egress
+      HARBORBOX_DEFAULT_SANDBOX_MEMORY_MB: ${HARBORBOX_ONVO_SANDBOX_MEMORY_MB:-1024}
+      HARBORBOX_DEFAULT_SANDBOX_CPU: ${HARBORBOX_ONVO_SANDBOX_CPU:-2}
+      HARBORBOX_DEFAULT_IDLE_TIMEOUT_SECONDS: ${HARBORBOX_ONVO_IDLE_TIMEOUT_SECONDS:-1200}
+      HARBORBOX_MAX_CONCURRENT_EXECUTIONS_PER_SANDBOX: ${HARBORBOX_ONVO_CONCURRENCY:-2}
+    networks:
+      egress:
+
+networks:
+  egress:
+    name: harborbox-egress

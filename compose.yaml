@@ -1,0 +1,86 @@
+name: harborbox
+
+services:
+  sandbox-image:
+    image: harborbox-sandbox:local
+    build:
+      context: .
+      dockerfile: sandbox/Dockerfile
+    entrypoint: ["/bin/true"]
+    restart: "no"
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: harborbox
+      POSTGRES_USER: harborbox
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-harborbox}
+    volumes:
+      - harborbox-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U harborbox -d harborbox"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 256
+    restart: unless-stopped
+    networks:
+      - control
+
+  api:
+    image: harborbox-api:local
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    depends_on:
+      sandbox-image:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      HARBORBOX_API_KEY: ${HARBORBOX_API_KEY:-change-me}
+      HARBORBOX_DATABASE_URL: postgresql+asyncpg://harborbox:${POSTGRES_PASSWORD:-harborbox}@postgres/harborbox
+      HARBORBOX_SANDBOX_IMAGE: harborbox-sandbox:local
+      HARBORBOX_SANDBOX_NETWORK: harborbox-net
+      HARBORBOX_SANDBOX_EGRESS_NETWORK: ${HARBORBOX_SANDBOX_EGRESS_NETWORK:-}
+      HARBORBOX_SANDBOX_RUNTIME: ${HARBORBOX_SANDBOX_RUNTIME:-}
+      HARBORBOX_HOST_MEMORY_RESERVE_PERCENT: ${HARBORBOX_HOST_MEMORY_RESERVE_PERCENT:-25}
+      HARBORBOX_HOST_MEMORY_RESERVE_MIN_MB: ${HARBORBOX_HOST_MEMORY_RESERVE_MIN_MB:-1024}
+      HARBORBOX_PLATFORM_MEMORY_RESERVE_MB: ${HARBORBOX_PLATFORM_MEMORY_RESERVE_MB:-512}
+      HARBORBOX_EMERGENCY_AVAILABLE_MEMORY_MB: ${HARBORBOX_EMERGENCY_AVAILABLE_MEMORY_MB:-512}
+      HARBORBOX_DEFAULT_SANDBOX_MEMORY_MB: ${HARBORBOX_DEFAULT_SANDBOX_MEMORY_MB:-512}
+      HARBORBOX_MAX_SANDBOX_MEMORY_MB: ${HARBORBOX_MAX_SANDBOX_MEMORY_MB:-4096}
+      HARBORBOX_MAX_PARALLEL_CPU: ${HARBORBOX_MAX_PARALLEL_CPU:-4}
+      HARBORBOX_MAX_CONCURRENT_EXECUTIONS_PER_SANDBOX: ${HARBORBOX_MAX_CONCURRENT_EXECUTIONS_PER_SANDBOX:-1}
+      HARBORBOX_MAX_UPLOAD_BYTES: ${HARBORBOX_MAX_UPLOAD_BYTES:-157286400}
+      HARBORBOX_DEFAULT_IDLE_TIMEOUT_SECONDS: ${HARBORBOX_DEFAULT_IDLE_TIMEOUT_SECONDS:-300}
+    volumes:
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+    ports:
+      - "127.0.0.1:${HARBORBOX_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    mem_limit: 768m
+    memswap_limit: 768m
+    pids_limit: 256
+    restart: unless-stopped
+    networks:
+      control:
+        aliases:
+          - harborbox-api
+      sandboxes:
+
+volumes:
+  harborbox-postgres:
+
+networks:
+  control:
+    name: harborbox-control
+  sandboxes:
+    name: harborbox-net
+    internal: true
