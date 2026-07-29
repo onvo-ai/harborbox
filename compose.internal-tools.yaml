@@ -105,9 +105,14 @@ volumes:
 
 networks:
   control:
+  # Declared external because Coolify rewrites managed network definitions and
+  # silently dropped this one — the API then created sandboxes against a network
+  # that did not exist, and every sandbox went straight to `failed` with nothing
+  # in the API log to say why. Created once out of band with:
+  #   docker network create --internal harborbox-net
   sandboxes:
     name: harborbox-net
-    internal: true
+    external: true
   trigger:
     name: nj9nsajrgcu76alcj6c1sq87
     external: true
