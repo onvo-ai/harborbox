@@ -1,0 +1,113 @@
+# Harborbox on Onvo's `internal-tools` host, alongside the Trigger.dev stack.
+#
+# The only consumer is Trigger.dev task code executing widget Python. Those task
+# runners are containers on the Trigger stack's own Docker network, so the API
+# joins that network as an external and is reachable at `http://harborbox:8000`.
+# Nothing is published to the host or to the internet.
+#
+# Two deliberate differences from compose.yaml:
+#
+#   1. `HARBORBOX_SANDBOX_EGRESS_NETWORK` is empty, so sandboxes sit only on the
+#      `internal: true` network and have no route anywhere. Onvo's worker
+#      downloads datasource CSVs and passes them in as files, so widget code
+#      never needs to fetch anything. If that ever changes, the sandbox needs
+#      egress and this comment is the thing that was wrong.
+#
+#   2. No published port. compose.yaml binds 127.0.0.1 for local development;
+#      here the API must not be reachable from the host at all.
+#
+# Memory is the binding constraint on this host (~6 GB available), not disk.
+# api 768M + postgres 512M + 2 concurrent sandboxes at 1 GB ≈ 3.3 GB.
+
+name: harborbox
+
+services:
+  sandbox-image:
+    image: harborbox-sandbox-onvo:local
+    build:
+      context: .
+      dockerfile: sandbox/Dockerfile
+      args:
+        SANDBOX_REQUIREMENTS: sandbox/requirements-onvo.txt
+    entrypoint: ["/bin/true"]
+    restart: "no"
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: harborbox
+      POSTGRES_USER: harborbox
+      POSTGRES_PASSWORD: ${SERVICE_PASSWORD_HARBORBOXDB}
+    volumes:
+      - harborbox-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U harborbox -d harborbox"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 256
+    restart: unless-stopped
+    networks:
+      - control
+
+  api:
+    image: harborbox-api:local
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    depends_on:
+      sandbox-image:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      HARBORBOX_API_KEY: ${SERVICE_PASSWORD_64_HARBORBOXAPI}
+      HARBORBOX_DATABASE_URL: postgresql+asyncpg://harborbox:${SERVICE_PASSWORD_HARBORBOXDB}@postgres/harborbox
+      HARBORBOX_SANDBOX_IMAGE: harborbox-sandbox-onvo:local
+      HARBORBOX_SANDBOX_NETWORK: harborbox-net
+      # Empty on purpose — see the header. Sandboxes get no egress.
+      HARBORBOX_SANDBOX_EGRESS_NETWORK: ""
+      HARBORBOX_DEFAULT_SANDBOX_MEMORY_MB: ${HARBORBOX_ONVO_SANDBOX_MEMORY_MB:-1024}
+      HARBORBOX_DEFAULT_SANDBOX_CPU: ${HARBORBOX_ONVO_SANDBOX_CPU:-2}
+      HARBORBOX_MAX_SANDBOX_MEMORY_MB: ${HARBORBOX_MAX_SANDBOX_MEMORY_MB:-2048}
+      HARBORBOX_MAX_PARALLEL_CPU: ${HARBORBOX_MAX_PARALLEL_CPU:-4}
+      HARBORBOX_MAX_CONCURRENT_EXECUTIONS_PER_SANDBOX: ${HARBORBOX_ONVO_CONCURRENCY:-2}
+      HARBORBOX_DEFAULT_IDLE_TIMEOUT_SECONDS: ${HARBORBOX_ONVO_IDLE_TIMEOUT_SECONDS:-1200}
+      # Leave headroom for the Trigger stack, which shares this host.
+      HARBORBOX_HOST_MEMORY_RESERVE_PERCENT: ${HARBORBOX_HOST_MEMORY_RESERVE_PERCENT:-40}
+      HARBORBOX_PLATFORM_MEMORY_RESERVE_MB: ${HARBORBOX_PLATFORM_MEMORY_RESERVE_MB:-1024}
+    volumes:
+      # Required: the API creates sandbox containers. This is the one privileged
+      # thing Harborbox needs, and the reason it belongs on a host running
+      # internal tooling rather than customer-facing apps.
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+    mem_limit: 768m
+    memswap_limit: 768m
+    pids_limit: 256
+    restart: unless-stopped
+    networks:
+      control:
+      sandboxes:
+      # The Trigger stack's network. `harborbox` is the name task code uses.
+      trigger:
+        aliases:
+          - harborbox
+
+volumes:
+  harborbox-postgres:
+
+networks:
+  control:
+  sandboxes:
+    name: harborbox-net
+    internal: true
+  trigger:
+    name: nj9nsajrgcu76alcj6c1sq87
+    external: true
