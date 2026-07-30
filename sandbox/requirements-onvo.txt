@@ -4,7 +4,13 @@ jupyter-client==8.6.3
 uvicorn==0.35.0
 
 duckdb
-pandas
+# Pinned to match the BullMQ workers image (Dockerfile.workers installs
+# pandas 2.2.3). Unpinned, this resolved to pandas 3.0.5 — so adopting the
+# sandbox would also have been a pandas major-version upgrade, and pandas 3
+# changes behaviour that existing widget code depends on. Two risky changes at
+# once, one of which nobody asked for. Unpin only alongside the golden-output
+# diff on DEV-1665.
+pandas==2.2.3
 numpy
 pymysql>=1.1.0
 cryptography
