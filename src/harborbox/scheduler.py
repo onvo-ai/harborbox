@@ -27,6 +27,27 @@ RESERVED_SANDBOX_STATES = ("starting", "running", "paused_memory")
 TERMINAL_EXECUTION_STATES = ("succeeded", "failed", "cancelled")
 
 
+def may_start_execution(
+    *,
+    cancel_requested: bool,
+    execution_status: str,
+    sandbox_status: str,
+) -> bool:
+    """Whether an admitted execution should actually be started.
+
+    Admission and start are separate transactions, so everything admission
+    checked can have changed in between — most importantly the sandbox can have
+    been deleted. Starting one anyway creates a container nobody owns: the caller
+    already holds its 204 and will never delete again, so it lives until the idle
+    reaper, holding CPU and a memory reservation the scheduler still counts.
+    """
+    if cancel_requested:
+        return False
+    if execution_status in TERMINAL_EXECUTION_STATES:
+        return False
+    return sandbox_status not in {"killed", "failed"}
+
+
 def has_sandbox_execution_slot(
     *,
     kind: str,
@@ -111,12 +132,17 @@ class Scheduler:
         now = utc_now()
         admitted_ids: list[str] = []
         async with session_factory() as session:
+            # FOR UPDATE so admission serialises against anything else that
+            # touches these rows — in particular DELETE /v1/sandboxes, which
+            # cancels queued executions. Without the lock both sides read, then
+            # both write, and the later commit silently wins.
             result = await session.execute(
                 select(Execution)
                 .options(selectinload(Execution.sandbox))
                 .where(Execution.status == "queued")
                 .order_by(Execution.created_at, Execution.id)
                 .limit(self.settings.scheduler_scan_limit)
+                .with_for_update(of=Execution)
             )
             queued = list(result.scalars())
 
@@ -232,6 +258,13 @@ class Scheduler:
                 if execution is None:
                     return
                 sandbox = execution.sandbox
+                # Re-validate rather than trust admission — see may_start_execution.
+                if not may_start_execution(
+                    cancel_requested=execution.cancel_requested,
+                    execution_status=execution.status,
+                    sandbox_status=sandbox.status,
+                ):
+                    return
                 execution.status = "starting"
                 if sandbox.status in {"created", "paused_cold"}:
                     sandbox.status = "starting"
@@ -337,6 +370,24 @@ class Scheduler:
             sandbox = await session.get(Sandbox, sandbox_id)
             if sandbox is None:
                 raise SandboxUnavailable("sandbox does not exist")
+            # The container exists now, so a sandbox killed while it was starting
+            # must have its container removed here. Writing `running` over
+            # `killed` is the write that used to strand it: DELETE's own
+            # runtime.kill() found no container to remove, having run before this
+            # one was created.
+            if sandbox.status in {"killed", "failed"}:
+                if started is not None:
+                    sandbox.container_id = started.id
+                    sandbox.container_name = started.name
+                    await session.commit()
+                    await self.runtime.kill(sandbox)
+                    async with session_factory() as cleanup:
+                        current = await cleanup.get(Sandbox, sandbox_id)
+                        if current is not None:
+                            current.container_id = None
+                            current.container_name = None
+                            await cleanup.commit()
+                raise SandboxUnavailable(f"sandbox is {sandbox.status}")
             if started is not None:
                 sandbox.container_id = started.id
                 sandbox.container_name = started.name

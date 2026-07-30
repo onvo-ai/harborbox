@@ -308,13 +308,20 @@ async def kill_sandbox(
     session: AsyncSession = Depends(get_session),
 ) -> Response:
     sandbox = await get_sandbox_or_404(session, sandbox_id)
+    # `cancel_requested` as well as the status, because the status alone is not
+    # durable against a concurrent scheduler pass: that pass may already hold a
+    # snapshot where this execution is `queued`, and committing it would write
+    # `admitted` straight over `cancelled` — resurrecting a sandbox the caller has
+    # already been told is gone, container and memory reservation included.
+    # `cancel_requested` is the flag the scheduler re-checks, so a lost update on
+    # `status` still ends with the execution cancelled.
     await session.execute(
         update(Execution)
         .where(
             Execution.sandbox_id == sandbox_id,
             Execution.status == "queued",
         )
-        .values(status="cancelled", finished_at=utc_now())
+        .values(status="cancelled", cancel_requested=True, finished_at=utc_now())
     )
     await runtime_from(request).kill(sandbox)
     sandbox.status = "killed"
