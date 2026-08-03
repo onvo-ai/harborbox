@@ -144,6 +144,43 @@ async def create_sandbox(
             detail=f"cpu cannot exceed {settings.max_sandbox_cpu}",
         )
 
+    idle_timeout = (
+        body.idle_timeout_seconds
+        if body.idle_timeout_seconds is not None
+        else settings.default_idle_timeout_seconds
+    )
+
+    # Take a pre-started sandbox when one matches the requested shape.
+    #
+    # The container is nearly all of a sandbox's cost, so adopting one that is
+    # already booted is the difference between ~2.6s and ~0.1s. This is a
+    # handover, not sharing: the pooled sandbox has its own agent token and its
+    # own empty volume, has run nothing, and is destroyed after this caller is
+    # done with it — exactly the lifecycle it would have had if it were started
+    # here. Only the timing of the start moves.
+    #
+    # `skip_locked` so two callers arriving together take different sandboxes
+    # rather than blocking on, or worse both adopting, the same row.
+    pooled = await session.scalar(
+        select(Sandbox)
+        .where(
+            Sandbox.status == "pooled",
+            Sandbox.memory_mb == memory_mb,
+            Sandbox.cpu == cpu,
+        )
+        .order_by(Sandbox.created_at)
+        .limit(1)
+        .with_for_update(skip_locked=True)
+    )
+    if pooled is not None:
+        pooled.status = "running"
+        pooled.idle_timeout_seconds = idle_timeout
+        pooled.metadata_ = body.metadata
+        pooled.last_activity_at = utc_now()
+        await session.commit()
+        await session.refresh(pooled)
+        return pooled
+
     sandbox = Sandbox(
         id=new_id("sbx"),
         status="created",
@@ -151,11 +188,7 @@ async def create_sandbox(
         memory_mb=memory_mb,
         cpu=cpu,
         pids_limit=settings.sandbox_pids_limit,
-        idle_timeout_seconds=(
-            body.idle_timeout_seconds
-            if body.idle_timeout_seconds is not None
-            else settings.default_idle_timeout_seconds
-        ),
+        idle_timeout_seconds=idle_timeout,
         metadata_=body.metadata,
     )
     session.add(sandbox)

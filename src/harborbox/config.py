@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     max_execution_timeout_seconds: int = Field(default=600, ge=1)
     default_idle_timeout_seconds: int = Field(default=300, ge=0)
     reaper_poll_seconds: float = Field(default=5.0, gt=0)
+    # How many started-but-unassigned sandboxes to keep ready. 0 disables the
+    # pool entirely, which is the old behaviour: every caller pays the container
+    # start. Each pooled sandbox holds its memory reservation but no CPU budget.
+    sandbox_pool_size: int = Field(default=0, ge=0)
+    sandbox_pool_poll_seconds: float = Field(default=2.0, gt=0)
     keep_completed_jobs_seconds: int = Field(default=86_400, ge=60)
 
     @property

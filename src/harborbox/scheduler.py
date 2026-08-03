@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import secrets
+from uuid import uuid4
 from collections.abc import Callable
 from dataclasses import replace
 
@@ -23,7 +25,17 @@ from harborbox.schemas import AgentCommandRequest, AgentExecutionRequest
 logger = logging.getLogger(__name__)
 
 ACTIVE_EXECUTION_STATES = ("admitted", "starting", "running")
-RESERVED_SANDBOX_STATES = ("starting", "running", "paused_memory")
+# Memory is genuinely held by a pooled container, so it is reserved here. CPU is
+# deliberately *not*: `capacity()` sums cpu over ("starting", "running") only, so
+# an idle pool cannot eat the max_parallel_cpu budget and starve real executions
+# — the failure mode that made every widget wait on `waiting_for: cpu`.
+RESERVED_SANDBOX_STATES = (
+    "starting",
+    "running",
+    "paused_memory",
+    "pooling",
+    "pooled",
+)
 TERMINAL_EXECUTION_STATES = ("succeeded", "failed", "cancelled")
 
 
@@ -67,6 +79,7 @@ class Scheduler:
         self._stop = asyncio.Event()
         self._loop_task: asyncio.Task[None] | None = None
         self._reaper_task: asyncio.Task[None] | None = None
+        self._pool_task: asyncio.Task[None] | None = None
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._sandbox_start_locks: dict[str, asyncio.Lock] = {}
 
@@ -74,10 +87,15 @@ class Scheduler:
         await self._recover_interrupted_jobs()
         self._loop_task = asyncio.create_task(self._scheduler_loop())
         self._reaper_task = asyncio.create_task(self._reaper_loop())
+        self._pool_task = asyncio.create_task(self._pool_loop())
 
     async def stop(self) -> None:
         self._stop.set()
-        tasks = [task for task in (self._loop_task, self._reaper_task) if task]
+        tasks = [
+            task
+            for task in (self._loop_task, self._reaper_task, self._pool_task)
+            if task
+        ]
         for task in tasks:
             task.cancel()
         if tasks:
@@ -412,6 +430,124 @@ class Scheduler:
                 container_status = await self.runtime.container_status(sandbox)
                 if container_status in {None, "dead", "exited"}:
                     sandbox.status = "failed"
+            await session.commit()
+
+    async def _pool_loop(self) -> None:
+        """Keeps `sandbox_pool_size` sandboxes started and unassigned.
+
+        Starting a container is nearly all of a sandbox's cost — ~2.6s, against
+        ~0.15s to run a script in one that already exists — so a caller that has
+        to start its own pays for the boot on the critical path. Pre-starting
+        them moves that cost off it.
+
+        This is *not* sandbox reuse: a pooled sandbox is handed to exactly one
+        caller and destroyed afterwards, with its own agent token and its own
+        empty volume. The isolation property is unchanged; only the timing of
+        the container start moves.
+        """
+        while not self._stop.is_set():
+            try:
+                await self._replenish_pool()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("sandbox pool replenish failed")
+            await asyncio.sleep(self.settings.sandbox_pool_poll_seconds)
+
+    async def _replenish_pool(self) -> None:
+        target = self.settings.sandbox_pool_size
+        if target <= 0:
+            return
+
+        async with session_factory() as session:
+            current = await session.scalar(
+                select(func.count())
+                .select_from(Sandbox)
+                .where(Sandbox.status.in_(("pooled", "pooling")))
+            )
+        missing = target - int(current or 0)
+        if missing <= 0:
+            return
+
+        memory_mb = self.settings.default_sandbox_memory_mb
+        cpu = self.settings.default_sandbox_cpu
+
+        # One per pass. Replenishing is background work and the host is shared;
+        # starting the whole shortfall at once would spike exactly when demand
+        # already did.
+        capacity = await self.capacity()
+        # Warming is background work. If the CPU budget is already committed,
+        # the host is busy doing the thing the pool is meant to accelerate;
+        # adding a container start now makes it slower, not faster.
+        if capacity.reserved_cpu >= capacity.max_parallel_cpu - cpu:
+            return
+        decision = can_admit(
+            capacity,
+            incremental_memory_mb=memory_mb,
+            # Zero: a pooled sandbox runs nothing until it is adopted, and
+            # charging it CPU here is what would starve real executions.
+            incremental_cpu=0.0,
+            emergency_available_memory_mb=self.settings.emergency_available_memory_mb,
+        )
+        if not decision.admitted:
+            return
+
+        sandbox = Sandbox(
+            id=f"sbx_{uuid4().hex}",
+            status="pooling",
+            agent_token=secrets.token_urlsafe(32),
+            memory_mb=memory_mb,
+            cpu=cpu,
+            pids_limit=self.settings.sandbox_pids_limit,
+            # Never reaped while unassigned: the reaper only looks at "running",
+            # but a pooled sandbox that is adopted inherits the caller's timeout.
+            idle_timeout_seconds=0,
+            metadata_={},
+        )
+        async with session_factory() as session:
+            session.add(sandbox)
+            await session.commit()
+            await session.refresh(sandbox)
+
+        try:
+            started = await self.runtime.start_sandbox(sandbox)
+            async with session_factory() as session:
+                current_row = await session.get(Sandbox, sandbox.id)
+                if current_row is None:
+                    return
+                current_row.container_id = started.id
+                current_row.container_name = started.name
+                # Deliberately NOT "running": that state is summed into
+                # reserved_cpu, so warming the pool would take budget from the
+                # executions it exists to make faster. Measured before this was
+                # fixed: one batch of a refresh waited 57s behind pool warm-up.
+                current_row.status = "pooling"
+                current_row.last_activity_at = utc_now()
+                await session.commit()
+                await session.refresh(current_row)
+                ready = current_row
+            # Booted and answering before it is offered to anyone, which is the
+            # entire point: the caller must not wait on the agent either.
+            await self.runtime.wait_until_ready(ready)
+            async with session_factory() as session:
+                current_row = await session.get(Sandbox, sandbox.id)
+                if current_row is not None and current_row.status == "pooling":
+                    current_row.status = "pooled"
+                    await session.commit()
+        except Exception:
+            logger.exception("failed to start a pooled sandbox; discarding it")
+            await self._discard_pooled(sandbox.id)
+
+    async def _discard_pooled(self, sandbox_id: str) -> None:
+        async with session_factory() as session:
+            sandbox = await session.get(Sandbox, sandbox_id)
+            if sandbox is None:
+                return
+            try:
+                await self.runtime.kill(sandbox)
+            except Exception:
+                logger.exception("could not destroy pooled sandbox %s", sandbox_id)
+            sandbox.status = "failed"
             await session.commit()
 
     async def _reaper_loop(self) -> None:

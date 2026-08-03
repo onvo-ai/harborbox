@@ -8,6 +8,10 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 SandboxStatus = Literal[
     "created",
     "starting",
+    # Starting up, and already idle, for nobody. Neither counts against the CPU
+    # budget; both reserve their memory. See _replenish_pool in scheduler.py.
+    "pooling",
+    "pooled",
     "running",
     "paused_memory",
     "paused_cold",
