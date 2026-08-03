@@ -41,6 +41,28 @@ class KernelSession:
         self.manager = AsyncKernelManager(kernel_name="python3")
         self.client: AsyncKernelClient | None = None
         self.lock = asyncio.Lock()
+        self._start_lock = asyncio.Lock()
+        self._started = False
+
+    async def ensure_started(self) -> None:
+        """Starts the kernel on first use, at most once.
+
+        Starting it eagerly cost every sandbox 3.5s before it would answer a
+        single request — measured as the gap between uvicorn's "Waiting for
+        application startup" and "Application startup complete". That is paid by
+        every sandbox, including the majority that only ever run `/v1/commands`
+        and never touch the kernel at all.
+
+        Separate lock from `self.lock`: that one serialises `execute`, and
+        `execute` calls this, so sharing it would deadlock on first use.
+        """
+        if self._started:
+            return
+        async with self._start_lock:
+            if self._started:
+                return
+            await self.start()
+            self._started = True
 
     async def start(self) -> None:
         await self.manager.start_kernel(cwd=self.workspace)

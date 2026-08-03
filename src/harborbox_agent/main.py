@@ -61,8 +61,10 @@ async def authenticate(x_sandbox_token: str | None = Header(default=None)) -> No
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     WORKSPACE.mkdir(parents=True, exist_ok=True)
+    # Constructed, not started. See KernelSession.ensure_started — starting the
+    # Jupyter kernel here delayed the agent answering anything by ~3.5s, and most
+    # sandboxes never use the kernel.
     kernel = KernelSession(str(WORKSPACE))
-    await kernel.start()
     app.state.kernel = kernel
     try:
         yield
@@ -82,6 +84,7 @@ async def health() -> dict[str, str]:
 @app.post("/v1/execute", dependencies=authenticated)
 async def execute(body: ExecuteRequest, request: Request) -> dict[str, Any]:
     kernel: KernelSession = request.app.state.kernel
+    await kernel.ensure_started()
     result = await kernel.execute(
         body.code,
         env=body.env,
