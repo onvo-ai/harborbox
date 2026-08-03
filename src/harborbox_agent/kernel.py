@@ -4,9 +4,10 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 from time import monotonic
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from jupyter_client import AsyncKernelClient, AsyncKernelManager
+if TYPE_CHECKING:
+    from jupyter_client import AsyncKernelClient, AsyncKernelManager
 
 
 @dataclass
@@ -38,8 +39,8 @@ class KernelExecution:
 class KernelSession:
     def __init__(self, workspace: str) -> None:
         self.workspace = workspace
-        self.manager = AsyncKernelManager(kernel_name="python3")
-        self.client: AsyncKernelClient | None = None
+        self.manager: "AsyncKernelManager | None" = None
+        self.client: "AsyncKernelClient | None" = None
         self.lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
         self._started = False
@@ -65,6 +66,16 @@ class KernelSession:
             self._started = True
 
     async def start(self) -> None:
+        """Imports jupyter_client here, not at module scope.
+
+        It costs ~1.2s to import on a sandbox's single core, and it was being
+        paid by every sandbox before the agent would answer anything — including
+        the majority that only ever run /v1/commands and never touch a kernel.
+        Deferring the *start* was not enough while the import stayed eager.
+        """
+        from jupyter_client import AsyncKernelManager
+
+        self.manager = AsyncKernelManager(kernel_name="python3")
         await self.manager.start_kernel(cwd=self.workspace)
         client = self.manager.client()
         client.start_channels()
@@ -74,7 +85,7 @@ class KernelSession:
     async def stop(self) -> None:
         if self.client is not None:
             self.client.stop_channels()
-        if self.manager.has_kernel:
+        if self.manager is not None and self.manager.has_kernel:
             await self.manager.shutdown_kernel(now=True)
 
     async def execute(
