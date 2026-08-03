@@ -19,6 +19,8 @@ RUN /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt
 
 COPY src/harborbox_agent /opt/harborbox_agent
+# Pre-warmed script runner. See sandbox/forkrun.py.
+COPY sandbox/forkrun.py /opt/forkrun.py
 
 WORKDIR /workspace
 USER 10001:10001
