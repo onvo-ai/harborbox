@@ -140,7 +140,7 @@ class DockerRuntime:
                 restart_policy={"Name": "no"},
                 **runtime_options,
             )
-            self._connect_egress(container)
+            self._connect_egress(container, sandbox)
         except APIError as exc:
             if container is not None:
                 try:
@@ -151,7 +151,17 @@ class DockerRuntime:
 
         return StartedContainer(container.id, container.name)
 
-    def _connect_egress(self, container: Any) -> None:
+    def _connect_egress(self, container: Any, sandbox: Sandbox) -> None:
+        """Attaches the egress network, for the sandboxes that asked for it.
+
+        Was unconditional, which made egress an instance-wide setting: turning
+        it on for one workload turned it on for every other sandbox the same
+        Harborbox serves. That is the wrong granularity — widget code is handed
+        its data as files and must stay unable to reach anything, while code
+        that has to talk to a customer database obviously cannot.
+        """
+        if not sandbox.egress:
+            return
         network_name = self.settings.sandbox_egress_network
         if not network_name:
             return

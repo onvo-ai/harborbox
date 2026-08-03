@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from harborbox.db import Base
@@ -24,6 +24,13 @@ class Sandbox(Base):
     memory_mb: Mapped[int] = mapped_column(Integer)
     cpu: Mapped[float] = mapped_column(Float)
     pids_limit: Mapped[int] = mapped_column(Integer)
+    # Whether this sandbox may reach the network at all. Off unless the caller
+    # asks: widget code is handed its data as files and needs none, so the
+    # default keeps "internet blocked" true for everything that does not
+    # explicitly opt out of it.
+    egress: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     idle_timeout_seconds: Mapped[int] = mapped_column(Integer)
     metadata_: Mapped[dict[str, str]] = mapped_column("metadata", JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)

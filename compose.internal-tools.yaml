@@ -67,8 +67,11 @@ services:
       HARBORBOX_DATABASE_URL: postgresql+asyncpg://harborbox:${SERVICE_PASSWORD_HARBORBOXDB}@postgres/harborbox
       HARBORBOX_SANDBOX_IMAGE: harborbox-sandbox-onvo:local
       HARBORBOX_SANDBOX_NETWORK: harborbox-net
-      # Empty on purpose — see the header. Sandboxes get no egress.
-      HARBORBOX_SANDBOX_EGRESS_NETWORK: ""
+      # Named, but only attached to sandboxes that ask for it (SandboxCreate
+      # .egress, default false). Widget code is handed its data as files and
+      # never opts in, so it stays unable to reach anything; a caller that must
+      # talk to a customer database can request it explicitly.
+      HARBORBOX_SANDBOX_EGRESS_NETWORK: ${HARBORBOX_SANDBOX_EGRESS_NETWORK:-harborbox-egress}
       HARBORBOX_DEFAULT_SANDBOX_MEMORY_MB: ${HARBORBOX_ONVO_SANDBOX_MEMORY_MB:-768}
       HARBORBOX_DEFAULT_SANDBOX_CPU: ${HARBORBOX_ONVO_SANDBOX_CPU:-1}
       HARBORBOX_MAX_SANDBOX_MEMORY_MB: ${HARBORBOX_MAX_SANDBOX_MEMORY_MB:-2048}

@@ -502,6 +502,10 @@ class Scheduler:
             # Never reaped while unassigned: the reaper only looks at "running",
             # but a pooled sandbox that is adopted inherits the caller's timeout.
             idle_timeout_seconds=0,
+            # The pool only warms the default, no-egress shape. A caller that
+            # wants egress gets a cold start rather than a sandbox that can
+            # reach more than the pool intended.
+            egress=False,
             metadata_={},
         )
         async with session_factory() as session:

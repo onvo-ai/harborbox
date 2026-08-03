@@ -167,6 +167,11 @@ async def create_sandbox(
             Sandbox.status == "pooled",
             Sandbox.memory_mb == memory_mb,
             Sandbox.cpu == cpu,
+            # A pooled sandbox is built without egress. Handing one to a caller
+            # that asked for egress would silently give it less than it asked
+            # for; handing an egress-capable one to a caller that did not would
+            # silently give it more. Both are wrong, so the shapes must match.
+            Sandbox.egress == body.egress,
         )
         .order_by(Sandbox.created_at)
         .limit(1)
@@ -189,6 +194,7 @@ async def create_sandbox(
         cpu=cpu,
         pids_limit=settings.sandbox_pids_limit,
         idle_timeout_seconds=idle_timeout,
+        egress=body.egress,
         metadata_=body.metadata,
     )
     session.add(sandbox)
