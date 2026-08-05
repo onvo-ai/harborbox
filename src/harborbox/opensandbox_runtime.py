@@ -219,11 +219,10 @@ class OpenSandboxRuntime:
             if snapshot_id:
                 handle = await OpenSandbox.create(snapshot_id=snapshot_id, **kwargs)
             elif handle is None:
+                template = sandbox.metadata_.get("template")
                 handle = await OpenSandbox.create(
-                    self.settings.image_for_template(
-                        sandbox.metadata_.get("template")
-                    ),
-                    entrypoint=["tail", "-f", "/dev/null"],
+                    self.settings.image_for_template(template),
+                    entrypoint=self.settings.entrypoint_for_template(template),
                     **kwargs,
                 )
             else:
@@ -236,7 +235,63 @@ class OpenSandboxRuntime:
             self._raise_runtime_error(exc, sandbox)
 
     async def wait_until_ready(self, sandbox: Sandbox) -> None:
-        await self._get_handle(sandbox, check_ready=True)
+        handle = await self._get_handle(sandbox, check_ready=True)
+        await self._wait_python_ready(sandbox, handle)
+
+    async def _wait_python_ready(self, sandbox: Sandbox, handle: OpenSandbox) -> None:
+        """Wait for the Jupyter kernel, not just the container.
+
+        opensandbox's health check covers execd, which is up almost
+        immediately. The Jupyter server that execd proxies Python to is started
+        by the sandbox entrypoint *after* execd, and takes an order of
+        magnitude longer to accept connections. execd retries `create_context`
+        for about twelve seconds and then gives up, so a cold sandbox raced its
+        own kernel and returned a 500 that said nothing about why — the only
+        trace being `no kernel specs found` in the sandbox's log.
+
+        Waiting here rather than retrying at execution time keeps the failure
+        in one place: by the time an execution is dispatched the sandbox can
+        actually run Python, or starting it failed and says so.
+        """
+        template = sandbox.metadata_.get("template")
+        base = self.settings.base_of_derived_template(template or "") or template
+        if base in self.settings.templates_without_python:
+            return
+
+        deadline = (
+            asyncio.get_running_loop().time()
+            + self.settings.sandbox_python_ready_timeout_seconds
+        )
+        last: Exception | None = None
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                interpreter = await CodeInterpreter.create(handle)
+                # The same call an execution makes, deliberately: a probe on a
+                # different endpoint proved nothing, since only this path goes
+                # through execd to the kernel.
+                # Generous per attempt: the first kernel start pays interpreter
+                # boot and import cost, and a tight cap here just turns a slow
+                # start into a retry storm against a sandbox that is working.
+                async with asyncio.timeout(60):
+                    await interpreter.codes.run(
+                        "pass", language=SupportedLanguage.PYTHON
+                    )
+                return
+            except Exception as exc:  # noqa: BLE001 - retried until the deadline
+                last = exc
+                logger.warning(
+                    "sandbox %s python not ready yet: %s: %s",
+                    sandbox.id,
+                    type(exc).__name__,
+                    exc,
+                )
+                await asyncio.sleep(1.0)
+        raise SandboxUnavailable(
+            "sandbox started but its Python kernel never became available after "
+            f"{self.settings.sandbox_python_ready_timeout_seconds}s: "
+            # The type matters: several SDK exceptions stringify to nothing.
+            f"{type(last).__name__}: {last}"
+        )
 
     async def execute_code(
         self, sandbox: Sandbox, request: AgentExecutionRequest

@@ -126,7 +126,11 @@ services:
       HARBORBOX_OPENSANDBOX_DOMAIN: opensandbox:8080
       HARBORBOX_OPENSANDBOX_PROTOCOL: http
       HARBORBOX_OPENSANDBOX_API_KEY: ${OPENSANDBOX_API_KEY:-change-me-opensandbox}
-      HARBORBOX_OPENSANDBOX_USE_SERVER_PROXY: "true"
+      # opensandbox v0.2.2's proxy returns 500 ("An internal error occurred in
+      # the proxy") for execd's streaming /code endpoint, while /ping through
+      # that same proxy is fine. So Python execution talks to the published
+      # execd port directly, which is what extra_hosts below is for.
+      HARBORBOX_OPENSANDBOX_USE_SERVER_PROXY: ${HARBORBOX_OPENSANDBOX_USE_SERVER_PROXY:-false}
       HARBORBOX_OPENSANDBOX_READY_TIMEOUT_SECONDS: ${HARBORBOX_OPENSANDBOX_READY_TIMEOUT_SECONDS:-30}
       HARBORBOX_OPENSANDBOX_SNAPSHOT_TIMEOUT_SECONDS: ${HARBORBOX_OPENSANDBOX_SNAPSHOT_TIMEOUT_SECONDS:-300}
       HARBORBOX_SANDBOX_IMAGE: ${HARBORBOX_TEMPLATE_IMAGE_PREFIX:-harborbox-sandbox}-onvo-lite:${HARBORBOX_TEMPLATE_VERSION:-local}
@@ -192,6 +196,8 @@ services:
       - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
     ports:
       - "127.0.0.1:${HARBORBOX_PORT:-8000}:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 3s

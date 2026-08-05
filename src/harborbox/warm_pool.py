@@ -53,7 +53,7 @@ class OpenSandboxWarmPools:
                     connection_config=self.connection,
                     creation_spec=PoolCreationSpec(
                         image=self.settings.image_for_template(template),
-                        entrypoint=["tail", "-f", "/dev/null"],
+                        entrypoint=self.settings.entrypoint_for_template(template),
                         resource={"cpu": str(cpu), "memory": f"{memory_mb}Mi"},
                         metadata={
                             "harborbox.warm_pool": "true",

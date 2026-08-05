@@ -1,5 +1,10 @@
 ipykernel==6.30.1
 jupyter-client==8.6.3
+# execd runs Python through a Jupyter kernel and connects to a server it is
+# told about via JUPYTER_HOST/JUPYTER_TOKEN. ipykernel and jupyter-client are
+# the kernel and the client; neither serves. Without this the image starts,
+# execd starts, /code answers 200 for bash — and every Python execution 500s.
+jupyter-server==2.14.2
 
 pandas==2.2.3
 numpy
