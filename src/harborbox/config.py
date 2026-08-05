@@ -53,6 +53,15 @@ class Settings(BaseSettings):
     relaydeck_image: str = "harborbox-sandbox-relaydeck:local"
     template_image_prefix: str = "harborbox-sandbox"
     template_version: str = "local"
+    # Must match JUPYTER_HOST baked into sandbox/Dockerfile: execd reads the
+    # host from the image's env, and this decides what actually listens.
+    sandbox_jupyter_port: int = Field(default=8888, ge=1, le=65535)
+    templates_without_python: frozenset[str] = frozenset({"relaydeck"})
+    # Cold sandboxes race their own Jupyter server; execd only retries for
+    # ~12s. Measured cold start is well under a minute, so this is generous
+    # rather than tuned — a sandbox that has not got a kernel by now is broken,
+    # not slow.
+    sandbox_python_ready_timeout_seconds: float = Field(default=120.0, gt=0)
     sandbox_network: str = "harborbox-net"
     sandbox_egress_network: str | None = None
     sandbox_runtime: str | None = None
@@ -149,6 +158,47 @@ class Settings(BaseSettings):
 
     def derived_template_image(self, template: str) -> str:
         return f"{self.template_image_prefix}-{template}:{self.template_version}"
+
+    def entrypoint_for_template(self, template: str | None) -> list[str]:
+        """What opensandbox runs as the sandbox's bootstrap command.
+
+        Not the image's CMD — opensandbox ignores that and runs whatever the
+        create request passes, so this is the only place a sandbox's long-lived
+        process is decided.
+
+        It has to be a Jupyter server for anything that runs Python. execd
+        executes bash itself but proxies Python to a Jupyter server it reaches
+        via JUPYTER_HOST/JUPYTER_TOKEN, and nothing else starts one: not execd,
+        not the opensandbox server, and not the image, whose CMD is discarded.
+        Both call sites here passed `tail -f /dev/null`, which produces a
+        sandbox that starts, reports healthy, runs bash, and fails every Python
+        execution with a 500 whose only clue is execd logging an empty
+        "Jupyter server host is: ".
+
+        Templates that never run Python keep the idle command — relaydeck is
+        sized at 256 MB and installs no Jupyter to start.
+        """
+        base = self.base_of_derived_template(template or "") or template
+        if base in self.templates_without_python:
+            return ["tail", "-f", "/dev/null"]
+        return [
+            # Absolute, not `jupyter`: opensandbox execs this through its
+            # bootstrap script, and the venv is only on PATH for the image's
+            # own entrypoint.
+            "/opt/venv/bin/jupyter",
+            "server",
+            "--ip=127.0.0.1",
+            f"--port={self.sandbox_jupyter_port}",
+            "--no-browser",
+            # Empty token: auth off. execd needs JUPYTER_TOKEN set to believe a
+            # Python runtime exists, but never sends it, so a server that
+            # enforces one answers 403 and execd reports "no kernel specs
+            # found". These flags must live here and not only in the image's
+            # CMD — opensandbox discards the image CMD and runs exactly this
+            # list, so a flag added there alone does nothing.
+            "--IdentityProvider.token=",
+            "--ServerApp.disable_check_xsrf=True",
+        ]
 
     def is_known_template_name(self, template: str) -> bool:
         """Whether the name is well-formed. Existence and readiness need the DB."""
