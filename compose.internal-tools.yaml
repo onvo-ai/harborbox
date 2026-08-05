@@ -89,39 +89,6 @@ services:
       # Leave headroom for the Trigger stack, which shares this host.
       HARBORBOX_HOST_MEMORY_RESERVE_PERCENT: ${HARBORBOX_HOST_MEMORY_RESERVE_PERCENT:-25}
       HARBORBOX_PLATFORM_MEMORY_RESERVE_MB: ${HARBORBOX_PLATFORM_MEMORY_RESERVE_MB:-1024}
-    # Routed publicly as harborbox.onvo.ai so onvo-lite, which runs on another
-    # host and in another Hetzner project, can reach it. Behind Cloudflare like
-    # every other name here, with the host firewall still closed to everything
-    # else, and every route requires HARBORBOX_API_KEY.
-    #
-    # Worth being clear about what this exposes: an authenticated API that
-    # creates containers. The sandboxes it creates still have no egress unless
-    # the caller asks for it, so widening the API's reach does not widen theirs.
-    labels:
-      # Routing is a switch, not a constant. A second instance of this stack
-      # on the same host must not answer for the live hostname, so the
-      # parallel deploy sets this false and is reached by its network alias
-      # instead. Traefik ignores a disabled container outright, which also
-      # keeps the two from registering the same router names. Flipping this
-      # true and stopping the old stack is the whole cutover.
-      #
-      # Note the router names below cannot be parameterised: Compose
-      # substitutes variables in label values, never in label keys.
-      traefik.enable: ${HARBORBOX_TRAEFIK_ENABLE:-true}
-      # Required, not optional: this container is on three networks and one of
-      # them (harborbox-net) is `internal: true`. Without naming the shared
-      # network, traefik can resolve the backend to an address with no route
-      # and every request hangs until the gateway times out.
-      traefik.docker.network: nj9nsajrgcu76alcj6c1sq87
-      traefik.http.routers.harborbox-http.entryPoints: http
-      traefik.http.routers.harborbox-http.rule: Host(`${HARBORBOX_PUBLIC_HOST:-harborbox.onvo.ai}`)
-      traefik.http.routers.harborbox-http.middlewares: redirect-to-https
-      traefik.http.routers.harborbox-https.entryPoints: https
-      traefik.http.routers.harborbox-https.rule: Host(`${HARBORBOX_PUBLIC_HOST:-harborbox.onvo.ai}`)
-      traefik.http.routers.harborbox-https.tls: "true"
-      traefik.http.routers.harborbox-https.tls.certresolver: letsencrypt
-      traefik.http.routers.harborbox-https.service: harborbox
-      traefik.http.services.harborbox.loadbalancer.server.port: "8000"
     volumes:
       # Required: the API creates sandbox containers. This is the one privileged
       # thing Harborbox needs, and the reason it belongs on a host running
@@ -137,8 +104,17 @@ services:
     pids_limit: 256
     restart: unless-stopped
     networks:
+      # Each entry carries an alias deliberately. Coolify's compose rewriter
+      # drops service network entries whose value is null, which silently left
+      # the API on neither the control nor the sandbox network — it came up
+      # healthy and could not reach a single sandbox it created. An alias is
+      # the smallest thing that makes the entry survive the rewrite.
       control:
+        aliases:
+          - harborbox-control
       sandboxes:
+        aliases:
+          - harborbox-sandboxes
       # The Trigger stack's network. `harborbox` is the name task code uses;
       # a parallel deploy takes a different alias so Docker DNS does not
       # round-robin between two stacks.
