@@ -23,7 +23,10 @@ name: harborbox
 
 services:
   sandbox-image:
-    image: harborbox-sandbox-onvo:local
+    # Tagged, because a second deploy on this host builds the same names.
+    # Left at `local` the Coolify build would retag the image the hand-rolled
+    # stack launches sandboxes from, changing it without anyone deciding to.
+    image: harborbox-sandbox-onvo:${HARBORBOX_IMAGE_TAG:-local}
     build:
       context: .
       dockerfile: sandbox/Dockerfile
@@ -53,7 +56,7 @@ services:
       - control
 
   api:
-    image: harborbox-api:local
+    image: harborbox-api:${HARBORBOX_IMAGE_TAG:-local}
     build:
       context: .
       dockerfile: Dockerfile.api
@@ -65,7 +68,7 @@ services:
     environment:
       HARBORBOX_API_KEY: ${SERVICE_PASSWORD_64_HARBORBOXAPI:?refusing to start with no API key - every sandbox call would 401. Set it in .env from Infisical Onvo/staging HARBORBOX_API_KEY.}
       HARBORBOX_DATABASE_URL: postgresql+asyncpg://harborbox:${SERVICE_PASSWORD_HARBORBOXDB}@postgres/harborbox
-      HARBORBOX_SANDBOX_IMAGE: harborbox-sandbox-onvo:local
+      HARBORBOX_SANDBOX_IMAGE: harborbox-sandbox-onvo:${HARBORBOX_IMAGE_TAG:-local}
       HARBORBOX_SANDBOX_NETWORK: ${HARBORBOX_SANDBOX_NETWORK:-harborbox-net}
       # Named, but only attached to sandboxes that ask for it (SandboxCreate
       # .egress, default false). Widget code is handed its data as files and
