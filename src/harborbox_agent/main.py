@@ -21,7 +21,8 @@ from harborbox_agent.files import (
     write_file,
     write_file_stream,
 )
-from harborbox_agent.kernel import KernelSession, OutputBudget
+from harborbox_agent.kernel import KernelSession
+from harborbox_agent.output import OutputBudget
 
 WORKSPACE = Path(os.environ.get("HARBORBOX_WORKSPACE", "/workspace"))
 AGENT_TOKEN = os.environ.get("HARBORBOX_AGENT_TOKEN", "")
@@ -37,6 +38,16 @@ class ExecuteRequest(BaseModel):
 
 class CommandRequest(BaseModel):
     command: str
+    timeout_seconds: int = Field(ge=1)
+    max_output_bytes: int = Field(ge=1024)
+    env: dict[str, str] = Field(default_factory=dict)
+    cwd: str | None = None
+
+
+class ProcessRequest(BaseModel):
+    executable: str = Field(min_length=1, max_length=1024)
+    args: list[str] = Field(default_factory=list, max_length=256)
+    stdin: str | None = None
     timeout_seconds: int = Field(ge=1)
     max_output_bytes: int = Field(ge=1024)
     env: dict[str, str] = Field(default_factory=dict)
@@ -69,6 +80,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        # Safe on a kernel that was never started: stop() guards on both the
+        # client and `manager.has_kernel`, and most sandboxes never start one.
         await kernel.stop()
 
 
@@ -152,6 +165,64 @@ async def command(body: CommandRequest) -> dict[str, Any]:
         error = {
             "name": "TimeoutError",
             "value": f"command exceeded {body.timeout_seconds} seconds",
+            "traceback": [],
+        }
+    await asyncio.gather(*readers)
+    return {
+        "logs": {
+            "stdout": stdout,
+            "stderr": stderr,
+            "truncated": budget.truncated,
+        },
+        "results": [],
+        "error": error,
+        "exit_code": exit_code,
+    }
+
+
+@app.post("/v1/processes", dependencies=authenticated)
+async def process(body: ProcessRequest) -> dict[str, Any]:
+    cwd = str(WORKSPACE)
+    if body.cwd:
+        from harborbox_agent.files import safe_path
+
+        cwd = str(safe_path(WORKSPACE, body.cwd))
+    environment = {**os.environ, **body.env}
+    child = await asyncio.create_subprocess_exec(
+        body.executable,
+        *body.args,
+        cwd=cwd,
+        env=environment,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    assert child.stdin is not None
+    assert child.stdout is not None
+    assert child.stderr is not None
+    budget = OutputBudget(body.max_output_bytes)
+    stdout: list[str] = []
+    stderr: list[str] = []
+    readers = [
+        asyncio.create_task(drain_stream(child.stdout, budget, stdout)),
+        asyncio.create_task(drain_stream(child.stderr, budget, stderr)),
+    ]
+    if body.stdin is not None:
+        child.stdin.write(body.stdin.encode("utf-8"))
+        await child.stdin.drain()
+    child.stdin.close()
+    await child.stdin.wait_closed()
+    error: dict[str, Any] | None = None
+    try:
+        async with asyncio.timeout(body.timeout_seconds):
+            exit_code = await child.wait()
+    except TimeoutError:
+        os.killpg(child.pid, signal.SIGKILL)
+        exit_code = await child.wait()
+        error = {
+            "name": "TimeoutError",
+            "value": f"process exceeded {body.timeout_seconds} seconds",
             "traceback": [],
         }
     await asyncio.gather(*readers)

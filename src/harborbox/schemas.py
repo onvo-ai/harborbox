@@ -29,7 +29,13 @@ ExecutionStatus = Literal[
 ]
 
 
+TemplateStatus = Literal["building", "ready", "failed"]
+
+
 class SandboxCreate(BaseModel):
+    # Free-form because a template may be a statically configured name or a
+    # derived, content-hashed one. Resolution happens against the registry.
+    template: str = Field(min_length=1, max_length=128)
     memory_mb: int | None = Field(default=None, ge=128)
     cpu: float | None = Field(default=None, gt=0)
     idle_timeout_seconds: int | None = Field(default=None, ge=0)
@@ -60,6 +66,34 @@ class SandboxUpdate(BaseModel):
     idle_timeout_seconds: int | None = Field(default=None, ge=0)
 
 
+class TemplateCreate(BaseModel):
+    base: str = Field(min_length=1, max_length=64)
+    apt: list[str] = Field(default_factory=list, max_length=200)
+    npm: list[str] = Field(default_factory=list, max_length=200)
+    env: dict[str, str] = Field(default_factory=dict)
+    memory_mb: int | None = Field(default=None, ge=128)
+    cpu: float | None = Field(default=None, gt=0)
+
+
+class TemplateResponse(BaseModel):
+    name: str
+    base: str
+    image: str
+    spec_hash: str | None = None
+    status: TemplateStatus
+    version: str
+    memory_mb: int
+    cpu: float
+    warm_pool: int = 0
+    error: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class TemplateListResponse(BaseModel):
+    templates: list[TemplateResponse]
+
+
 class PauseRequest(BaseModel):
     memory: bool = True
 
@@ -74,6 +108,16 @@ class CommandCreate(BaseModel):
     command: str
     timeout_seconds: int | None = Field(default=None, ge=1)
     env: dict[str, str] = Field(default_factory=dict)
+    cwd: str | None = None
+
+
+class ProcessCreate(BaseModel):
+    executable: str = Field(min_length=1, max_length=1024)
+    args: list[str] = Field(default_factory=list, max_length=256)
+    stdin: str | None = None
+    timeout_seconds: int | None = Field(default=None, ge=1)
+    env: dict[str, str] = Field(default_factory=dict)
+    secret_env: dict[str, str] = Field(default_factory=dict)
     cwd: str | None = None
 
 
@@ -106,7 +150,7 @@ class ExecutionError(BaseModel):
 class ExecutionResponse(BaseModel):
     id: str
     sandbox_id: str
-    kind: Literal["code", "command"]
+    kind: Literal["code", "command", "process"]
     status: ExecutionStatus
     queue_position: int | None = None
     waiting_for: Literal["memory", "cpu", "sandbox", "worker"] | None = None
@@ -119,6 +163,7 @@ class ExecutionResponse(BaseModel):
     started_at: datetime | None = None
     finished_at: datetime | None = None
     queued_ms: int | None = None
+    startup_ms: int | None = None
     execution_ms: int | None = None
 
 
@@ -158,8 +203,12 @@ class HealthResponse(BaseModel):
 class CapacityResponse(BaseModel):
     total_memory_mb: int
     reserve_memory_mb: int
+    configured_sandbox_budget_mb: int | None
     sandbox_budget_mb: int
     reserved_memory_mb: int
+    warm_pool_reserved_memory_mb: int
+    warm_pool_reserved_cpu: float
+    warm_pool_target_sandboxes: int
     available_reservation_mb: int
     host_available_memory_mb: int
     running_sandboxes: int
@@ -176,6 +225,16 @@ class AgentExecutionRequest(BaseModel):
 
 class AgentCommandRequest(BaseModel):
     command: str
+    timeout_seconds: int
+    max_output_bytes: int
+    env: dict[str, str] = Field(default_factory=dict)
+    cwd: str | None = None
+
+
+class AgentProcessRequest(BaseModel):
+    executable: str
+    args: list[str] = Field(default_factory=list)
+    stdin: str | None = None
     timeout_seconds: int
     max_output_bytes: int
     env: dict[str, str] = Field(default_factory=dict)

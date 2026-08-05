@@ -14,6 +14,7 @@ class Sandboxes:
     def create(
         self,
         *,
+        template: str,
         memory_mb: int | None = None,
         cpu: float | None = None,
         idle_timeout_seconds: int | None = None,
@@ -25,6 +26,7 @@ class Sandboxes:
                 "POST",
                 "/v1/sandboxes",
                 json={
+                    "template": template,
                     "memory_mb": memory_mb,
                     "cpu": cpu,
                     "idle_timeout_seconds": idle_timeout_seconds,
@@ -79,4 +81,3 @@ class SandboxClient:
 
     def __exit__(self, *_: object) -> None:
         self.close()
-

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
 from typing import Any
 
 import docker
@@ -11,10 +10,12 @@ from docker.errors import APIError, NotFound
 
 from harborbox.config import Settings
 from harborbox.models import Sandbox
+from harborbox.runtime_protocol import StartedSandbox, WarmPoolReservation
 from harborbox.schemas import (
     AgentCommandRequest,
     AgentExecutionRequest,
     AgentExecutionResponse,
+    AgentProcessRequest,
     FileListResponse,
     FileReadResponse,
     FileUploadResponse,
@@ -34,17 +35,17 @@ class SandboxMemoryExceeded(RuntimeErrorBase):
     pass
 
 
-@dataclass(frozen=True)
-class StartedContainer:
-    id: str
-    name: str
-
-
 class DockerRuntime:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.client = docker.DockerClient(**settings.docker_kwargs)
         self.http = httpx.AsyncClient(timeout=None)
+
+    async def start(self) -> None:
+        return None
+
+    def warm_pool_reservation(self) -> WarmPoolReservation:
+        return WarmPoolReservation()
 
     async def close(self) -> None:
         await self.http.aclose()
@@ -72,21 +73,32 @@ class DockerRuntime:
             return available
         return await self.total_memory_mb()
 
-    async def start_sandbox(self, sandbox: Sandbox) -> StartedContainer:
+    async def start_sandbox(self, sandbox: Sandbox) -> StartedSandbox:
         return await asyncio.to_thread(self._start_sandbox_sync, sandbox)
 
-    def _start_sandbox_sync(self, sandbox: Sandbox) -> StartedContainer:
+    def _start_sandbox_sync(self, sandbox: Sandbox) -> StartedSandbox:
         name = sandbox.container_name or f"harborbox-{sandbox.id}"
         memory_bytes = sandbox.memory_mb * 1024 * 1024
         volume_name = f"harborbox-workspace-{sandbox.id}"
         runtime_options: dict[str, Any] = {}
+        template = sandbox.metadata_.get("template")
+        try:
+            sandbox_image = self.settings.image_for_template(template)
+        except KeyError as exc:
+            raise SandboxUnavailable(f"unknown sandbox template: {template}") from exc
         if self.settings.sandbox_runtime:
             runtime_options["runtime"] = self.settings.sandbox_runtime
 
-        self.client.volumes.create(
-            name=volume_name,
-            labels={"harborbox.managed": "true", "harborbox.sandbox_id": sandbox.id},
-        )
+        try:
+            self.client.volumes.get(volume_name)
+        except NotFound:
+            self.client.volumes.create(
+                name=volume_name,
+                labels={
+                    "harborbox.managed": "true",
+                    "harborbox.sandbox_id": sandbox.id,
+                },
+            )
 
         if sandbox.container_id:
             try:
@@ -96,15 +108,15 @@ class DockerRuntime:
                     existing.start()
                 elif existing.status == "paused":
                     existing.unpause()
-                self._connect_egress(existing)
-                return StartedContainer(existing.id, existing.name)
+                self._connect_egress(existing, sandbox)
+                return StartedSandbox(existing.id, existing.name)
             except NotFound:
                 pass
 
         container: Any | None = None
         try:
             container = self.client.containers.run(
-                self.settings.sandbox_image,
+                sandbox_image,
                 detach=True,
                 name=name,
                 hostname="sandbox",
@@ -119,6 +131,7 @@ class DockerRuntime:
                 labels={
                     "harborbox.managed": "true",
                     "harborbox.sandbox_id": sandbox.id,
+                    "harborbox.template": template or "default",
                 },
                 volumes={volume_name: {"bind": "/workspace", "mode": "rw"}},
                 user="10001:10001",
@@ -149,7 +162,7 @@ class DockerRuntime:
                     pass
             raise SandboxUnavailable(str(exc)) from exc
 
-        return StartedContainer(container.id, container.name)
+        return StartedSandbox(container.id, container.name)
 
     def _connect_egress(self, container: Any, sandbox: Sandbox) -> None:
         """Attaches the egress network, for the sandboxes that asked for it.
@@ -188,7 +201,7 @@ class DockerRuntime:
                     return
             except httpx.HTTPError:
                 pass
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.05)
         await self._raise_container_failure(sandbox)
         raise SandboxUnavailable("sandbox agent did not become ready")
 
@@ -201,6 +214,11 @@ class DockerRuntime:
         self, sandbox: Sandbox, request: AgentCommandRequest
     ) -> AgentExecutionResponse:
         return await self._post_agent(sandbox, "/v1/commands", request.model_dump())
+
+    async def execute_process(
+        self, sandbox: Sandbox, request: AgentProcessRequest
+    ) -> AgentExecutionResponse:
+        return await self._post_agent(sandbox, "/v1/processes", request.model_dump())
 
     async def _post_agent(
         self, sandbox: Sandbox, path: str, payload: dict[str, Any]
@@ -282,21 +300,23 @@ class DockerRuntime:
         try:
             container = self.client.containers.get(container_id)
             container.reload()
-            if container.status != "running":
-                return
             if memory:
-                container.pause()
+                if container.status == "running":
+                    container.pause()
             else:
-                container.stop(timeout=10)
+                # A cold pause keeps only the named workspace volume. Removing
+                # the container returns all sandbox CPU/RAM and avoids keeping
+                # stopped-container writable layers around for every tenant.
+                container.remove(force=True)
         except NotFound:
             return
 
-    async def resume(self, sandbox: Sandbox) -> StartedContainer:
+    async def resume(self, sandbox: Sandbox) -> StartedSandbox:
         if not sandbox.container_id:
             return await self.start_sandbox(sandbox)
         return await asyncio.to_thread(self._resume_sync, sandbox)
 
-    def _resume_sync(self, sandbox: Sandbox) -> StartedContainer:
+    def _resume_sync(self, sandbox: Sandbox) -> StartedSandbox:
         try:
             container = self.client.containers.get(sandbox.container_id)
             container.reload()
@@ -304,7 +324,7 @@ class DockerRuntime:
                 container.unpause()
             elif container.status in {"exited", "created"}:
                 container.start()
-            return StartedContainer(container.id, container.name)
+            return StartedSandbox(container.id, container.name)
         except NotFound:
             return self._start_sandbox_sync(sandbox)
 

@@ -9,22 +9,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from jupyter_client import AsyncKernelClient, AsyncKernelManager
 
-
-@dataclass
-class OutputBudget:
-    limit: int
-    used: int = 0
-    truncated: bool = False
-
-    def take(self, text: str) -> str:
-        encoded = text.encode("utf-8", errors="replace")
-        remaining = max(0, self.limit - self.used)
-        if len(encoded) <= remaining:
-            self.used += len(encoded)
-            return text
-        self.truncated = True
-        self.used = self.limit
-        return encoded[:remaining].decode("utf-8", errors="ignore")
+from harborbox_agent.output import OutputBudget
 
 
 @dataclass
@@ -39,8 +24,8 @@ class KernelExecution:
 class KernelSession:
     def __init__(self, workspace: str) -> None:
         self.workspace = workspace
-        self.manager: "AsyncKernelManager | None" = None
-        self.client: "AsyncKernelClient | None" = None
+        self.manager: AsyncKernelManager | None = None
+        self.client: AsyncKernelClient | None = None
         self.lock = asyncio.Lock()
         self._start_lock = asyncio.Lock()
         self._started = False
@@ -201,4 +186,3 @@ class KernelSession:
             elif bounded is not None:
                 result["data"][mime] = bounded
         return result
-

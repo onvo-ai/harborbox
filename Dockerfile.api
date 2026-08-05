@@ -6,6 +6,24 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# The Docker CLI and the buildx plugin, for POST /v1/templates. Derived template
+# images are built through BuildKit: Docker Engine 29 removed the classic
+# builder that the docker-py build API talks to. The daemon itself is not
+# installed here — the API uses the socket mounted by compose.yaml.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg \
+      -o /etc/apt/keyrings/docker.asc \
+    && chmod a+r /etc/apt/keyrings/docker.asc \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable" \
+      > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin \
+    && apt-get purge -y gnupg \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY pyproject.toml README.md /app/
 COPY src/harborbox /app/src/harborbox
 COPY src/harborbox_sdk /app/src/harborbox_sdk

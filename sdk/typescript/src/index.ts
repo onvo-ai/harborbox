@@ -253,27 +253,22 @@ export class Sandbox {
   }
 
   static async create(
-    templateOrOptions?: string | SandboxCreateOptions,
-    maybeOptions: SandboxCreateOptions = {},
+    template: string,
+    options: SandboxCreateOptions = {},
   ): Promise<Sandbox> {
-    const template =
-      typeof templateOrOptions === "string" ? templateOrOptions : undefined;
-    const options =
-      typeof templateOrOptions === "object"
-        ? templateOrOptions
-        : maybeOptions;
+    if (!template) {
+      throw new Error("A registered Harborbox template is required");
+    }
     const connection = new HarborboxConnection(options);
     const timeoutMs = options.timeoutMs ?? 20 * 60_000;
     const metadata = { ...(options.metadata ?? {}) };
-    if (template) {
-      metadata.template = template;
-    }
     const payload = await connection.request<SandboxPayload>(
       "/v1/sandboxes",
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          template,
           memory_mb: options.memoryMb ?? null,
           cpu: options.cpu ?? null,
           idle_timeout_seconds: Math.max(0, Math.ceil(timeoutMs / 1000)),

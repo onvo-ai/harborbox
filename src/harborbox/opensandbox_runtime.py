@@ -1,0 +1,595 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import logging
+import os
+import shlex
+import tempfile
+from collections.abc import AsyncIterator
+from datetime import timedelta
+from typing import Any, NoReturn
+
+import httpx
+from code_interpreter import CodeInterpreter, SupportedLanguage
+from opensandbox import Sandbox as OpenSandbox
+from opensandbox import SandboxManager
+from opensandbox.config import ConnectionConfig
+from opensandbox.exceptions import SandboxApiException, SandboxException
+from opensandbox.models.execd import Execution, ExecutionHandlers, RunCommandOpts
+from opensandbox.models.filesystem import DirectoryListEntry
+
+from harborbox.config import Settings
+from harborbox.models import Sandbox
+from harborbox.runtime import SandboxMemoryExceeded, SandboxUnavailable
+from harborbox.runtime_protocol import StartedSandbox, WarmPoolReservation
+from harborbox.schemas import (
+    AgentCommandRequest,
+    AgentExecutionRequest,
+    AgentExecutionResponse,
+    AgentProcessRequest,
+    ExecutionError,
+    ExecutionResult,
+    FileEntry,
+    FileListResponse,
+    FileReadResponse,
+    FileUploadResponse,
+    FileWriteRequest,
+    LogOutput,
+)
+from harborbox.warm_pool import OpenSandboxWarmPools
+
+SNAPSHOT_METADATA_KEY = "harborbox.runtime.snapshot_id"
+logger = logging.getLogger(__name__)
+
+
+class _BoundedOutput:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.used = 0
+        self.truncated = False
+        self.stdout: list[str] = []
+        self.stderr: list[str] = []
+        self.results: list[ExecutionResult] = []
+        self.error: ExecutionError | None = None
+
+    def _append(self, target: list[str], text: str) -> None:
+        encoded = text.encode("utf-8")
+        remaining = max(0, self.limit - self.used)
+        if remaining == 0:
+            self.truncated = True
+            return
+        chunk = encoded[:remaining]
+        target.append(chunk.decode("utf-8", errors="replace"))
+        self.used += len(chunk)
+        if len(chunk) < len(encoded):
+            self.truncated = True
+
+    async def on_stdout(self, message: Any) -> None:
+        self._append(self.stdout, str(message.text))
+
+    async def on_stderr(self, message: Any) -> None:
+        self._append(self.stderr, str(message.text))
+
+    async def on_result(self, result: Any) -> None:
+        text = result.text
+        if text is not None:
+            encoded = str(text).encode("utf-8")
+            remaining = max(0, self.limit - self.used)
+            text = encoded[:remaining].decode("utf-8", errors="replace")
+            self.used += min(len(encoded), remaining)
+            if len(encoded) > remaining:
+                self.truncated = True
+        extra = dict(getattr(result, "extra_properties", {}) or {})
+        self.results.append(ExecutionResult(text=text, data=extra))
+
+    async def on_error(self, error: Any) -> None:
+        self.error = ExecutionError(
+            name=str(error.name),
+            value=str(error.value),
+            traceback=[str(line) for line in error.traceback],
+        )
+
+    def handlers(self) -> ExecutionHandlers:
+        return ExecutionHandlers(
+            on_stdout=self.on_stdout,
+            on_stderr=self.on_stderr,
+            on_result=self.on_result,
+            on_error=self.on_error,
+            skip_accumulation=True,
+        )
+
+    def response(self, execution: Execution) -> AgentExecutionResponse:
+        error = self.error
+        if error is None and execution.error is not None:
+            error = ExecutionError(
+                name=execution.error.name,
+                value=execution.error.value,
+                traceback=list(execution.error.traceback),
+            )
+        return AgentExecutionResponse(
+            logs=LogOutput(
+                stdout=self.stdout,
+                stderr=self.stderr,
+                truncated=self.truncated,
+            ),
+            results=self.results,
+            error=error,
+            exit_code=execution.exit_code,
+        )
+
+
+class OpenSandboxRuntime:
+    """OpenSandbox-backed runtime for Harborbox admission and orchestration.
+
+    Harborbox owns durable jobs, admission, quotas, and desired state. This
+    adapter deliberately delegates sandbox lifecycle, isolation, execution,
+    files, networking, and snapshots to an upstream OpenSandbox server.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._transport = httpx.AsyncHTTPTransport(
+            limits=httpx.Limits(
+                max_connections=100,
+                max_keepalive_connections=20,
+                keepalive_expiry=30,
+            )
+        )
+        self._connection = ConnectionConfig(
+            api_key=settings.opensandbox_api_key.get_secret_value(),
+            domain=settings.opensandbox_domain,
+            protocol=settings.opensandbox_protocol,
+            request_timeout=timedelta(
+                seconds=settings.opensandbox_ready_timeout_seconds
+            ),
+            use_server_proxy=settings.opensandbox_use_server_proxy,
+            disable_metrics=True,
+            transport=self._transport,
+        )
+        self._sandboxes: dict[str, OpenSandbox] = {}
+        self._manager: SandboxManager | None = None
+        self._manager_lock = asyncio.Lock()
+        self._warm_pools = OpenSandboxWarmPools(settings, self._connection)
+
+    async def start(self) -> None:
+        await self._warm_pools.start()
+
+    def warm_pool_reservation(self) -> WarmPoolReservation:
+        return self._warm_pools.reservation()
+
+    async def close(self) -> None:
+        await self._warm_pools.close()
+        handles = list(self._sandboxes.values())
+        self._sandboxes.clear()
+        await asyncio.gather(
+            *(handle.close() for handle in handles), return_exceptions=True
+        )
+        if self._manager is not None:
+            await self._manager.close()
+        await self._transport.aclose()
+
+    async def total_memory_mb(self) -> int:
+        if self.settings.total_memory_mb is not None:
+            return self.settings.total_memory_mb
+        total = await asyncio.to_thread(self._read_meminfo_mb, "MemTotal")
+        if total > 0:
+            return total
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        return int(pages * page_size) // (1024 * 1024)
+
+    async def available_memory_mb(self) -> int:
+        available = await asyncio.to_thread(self._read_meminfo_mb, "MemAvailable")
+        return available if available > 0 else await self.total_memory_mb()
+
+    @staticmethod
+    def _read_meminfo_mb(key: str) -> int:
+        try:
+            with open("/proc/meminfo", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith(f"{key}:"):
+                        return int(line.split()[1]) // 1024
+        except (OSError, ValueError):
+            pass
+        return 0
+
+    async def start_sandbox(self, sandbox: Sandbox) -> StartedSandbox:
+        snapshot_id = sandbox.metadata_.get(SNAPSHOT_METADATA_KEY)
+        try:
+            kwargs: dict[str, Any] = {
+                "timeout": None,
+                "ready_timeout": timedelta(
+                    seconds=self.settings.opensandbox_ready_timeout_seconds
+                ),
+                "metadata": self._runtime_metadata(sandbox),
+                "resource": {
+                    "cpu": str(sandbox.cpu),
+                    "memory": f"{sandbox.memory_mb}Mi",
+                },
+                "connection_config": self._connection,
+            }
+            handle = None
+            if not snapshot_id:
+                handle = await self._warm_pools.acquire(
+                    template=sandbox.metadata_.get("template"),
+                    memory_mb=sandbox.memory_mb,
+                    cpu=sandbox.cpu,
+                )
+            if snapshot_id:
+                handle = await OpenSandbox.create(snapshot_id=snapshot_id, **kwargs)
+            elif handle is None:
+                handle = await OpenSandbox.create(
+                    self.settings.image_for_template(
+                        sandbox.metadata_.get("template")
+                    ),
+                    entrypoint=["tail", "-f", "/dev/null"],
+                    **kwargs,
+                )
+            else:
+                metadata = dict(sandbox.metadata_)
+                metadata["harborbox.runtime.warm_pool"] = "true"
+                sandbox.metadata_ = metadata
+            self._sandboxes[sandbox.id] = handle
+            return StartedSandbox(id=handle.id, name=handle.id)
+        except SandboxException as exc:
+            self._raise_runtime_error(exc, sandbox)
+
+    async def wait_until_ready(self, sandbox: Sandbox) -> None:
+        await self._get_handle(sandbox, check_ready=True)
+
+    async def execute_code(
+        self, sandbox: Sandbox, request: AgentExecutionRequest
+    ) -> AgentExecutionResponse:
+        if request.env:
+            return await self._run_command(
+                sandbox=sandbox,
+                command=shlex.join(["python", "-c", request.code]),
+                timeout_seconds=request.timeout_seconds,
+                max_output_bytes=request.max_output_bytes,
+                environment=request.env,
+                cwd="/workspace",
+            )
+        handle = await self._get_handle(sandbox, check_ready=True)
+        output = _BoundedOutput(request.max_output_bytes)
+        try:
+            interpreter = await CodeInterpreter.create(handle)
+            async with asyncio.timeout(request.timeout_seconds):
+                execution = await interpreter.codes.run(
+                    request.code,
+                    language=SupportedLanguage.PYTHON,
+                    handlers=output.handlers(),
+                )
+            return output.response(execution)
+        except TimeoutError as exc:
+            raise SandboxUnavailable(
+                f"code execution exceeded {request.timeout_seconds} seconds"
+            ) from exc
+        except SandboxException as exc:
+            self._raise_runtime_error(exc, sandbox)
+
+    async def execute_command(
+        self, sandbox: Sandbox, request: AgentCommandRequest
+    ) -> AgentExecutionResponse:
+        return await self._run_command(
+            sandbox=sandbox,
+            command=request.command,
+            timeout_seconds=request.timeout_seconds,
+            max_output_bytes=request.max_output_bytes,
+            environment=request.env,
+            cwd=request.cwd,
+        )
+
+    async def execute_process(
+        self, sandbox: Sandbox, request: AgentProcessRequest
+    ) -> AgentExecutionResponse:
+        command = shlex.join([request.executable, *request.args])
+        if request.stdin is not None:
+            encoded = base64.b64encode(request.stdin.encode("utf-8")).decode("ascii")
+            command = f"printf %s {shlex.quote(encoded)} | base64 -d | {command}"
+        return await self._run_command(
+            sandbox=sandbox,
+            command=command,
+            timeout_seconds=request.timeout_seconds,
+            max_output_bytes=request.max_output_bytes,
+            environment=request.env,
+            cwd=request.cwd,
+        )
+
+    async def _run_command(
+        self,
+        *,
+        sandbox: Sandbox,
+        command: str,
+        timeout_seconds: int,
+        max_output_bytes: int,
+        environment: dict[str, str],
+        cwd: str | None,
+    ) -> AgentExecutionResponse:
+        handle = await self._get_handle(sandbox, check_ready=True)
+        output = _BoundedOutput(max_output_bytes)
+        try:
+            execution = await handle.commands.run(
+                command,
+                opts=RunCommandOpts(
+                    working_directory=cwd,
+                    timeout=timedelta(seconds=timeout_seconds),
+                    envs=environment,
+                ),
+                handlers=output.handlers(),
+            )
+            return output.response(execution)
+        except SandboxException as exc:
+            self._raise_runtime_error(exc, sandbox)
+
+    async def read_file(self, sandbox: Sandbox, path: str) -> FileReadResponse:
+        handle = await self._get_handle(sandbox, check_ready=True)
+        try:
+            content = await handle.files.read_bytes(path)
+        except SandboxException as exc:
+            self._raise_runtime_error(exc, sandbox)
+        try:
+            return FileReadResponse(
+                path=path, content=content.decode("utf-8"), encoding="utf-8"
+            )
+        except UnicodeDecodeError:
+            return FileReadResponse(
+                path=path,
+                content=base64.b64encode(content).decode("ascii"),
+                encoding="base64",
+            )
+
+    async def write_file(
+        self, sandbox: Sandbox, request: FileWriteRequest
+    ) -> FileReadResponse:
+        content = (
+            request.content.encode("utf-8")
+            if request.encoding == "utf-8"
+            else base64.b64decode(request.content, validate=True)
+        )
+        handle = await self._get_handle(sandbox, check_ready=True)
+        try:
+            await handle.files.write_file(request.path, content)
+        except SandboxException as exc:
+            self._raise_runtime_error(exc, sandbox)
+        return FileReadResponse(
+            path=request.path,
+            content=request.content,
+            encoding=request.encoding,
+        )
+
+    async def write_file_stream(
+        self,
+        sandbox: Sandbox,
+        path: str,
+        content: AsyncIterator[bytes],
+    ) -> FileUploadResponse:
+        handle = await self._get_handle(sandbox, check_ready=True)
+        size = 0
+        with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024) as upload:
+            async for chunk in content:
+                size += len(chunk)
+                if size > self.settings.max_upload_bytes:
+                    raise SandboxUnavailable("file upload exceeds configured limit")
+                upload.write(chunk)
+            upload.seek(0)
+            try:
+                await handle.files.write_file(path, upload)
+            except SandboxException as exc:
+                self._raise_runtime_error(exc, sandbox)
+        return FileUploadResponse(path=path, size=size)
+
+    async def list_files(self, sandbox: Sandbox, path: str) -> FileListResponse:
+        handle = await self._get_handle(sandbox, check_ready=True)
+        try:
+            entries = await handle.files.list_directory(
+                DirectoryListEntry(path=path, depth=1)
+            )
+        except SandboxException as exc:
+            self._raise_runtime_error(exc, sandbox)
+        return FileListResponse(
+            path=path,
+            entries=[
+                FileEntry(
+                    name=entry.path.rstrip("/").rsplit("/", 1)[-1],
+                    path=entry.path,
+                    type=(
+                        "directory"
+                        if (entry.entry_type or "").lower() in {"dir", "directory"}
+                        else "file"
+                    ),
+                    size=entry.size,
+                )
+                for entry in entries
+            ],
+        )
+
+    async def remove_file(self, sandbox: Sandbox, path: str) -> None:
+        handle = await self._get_handle(sandbox, check_ready=True)
+        try:
+            info = (await handle.files.get_file_info([path])).get(path)
+            if info and (info.entry_type or "").lower() in {"dir", "directory"}:
+                await handle.files.delete_directories([path])
+            else:
+                await handle.files.delete_files([path])
+        except SandboxException as exc:
+            self._raise_runtime_error(exc, sandbox)
+
+    async def pause(self, sandbox: Sandbox, memory: bool) -> None:
+        if not sandbox.container_id:
+            return
+        handle = await self._get_handle(sandbox, check_ready=False)
+        try:
+            if memory:
+                await handle.pause()
+            else:
+                previous_snapshot_id = sandbox.metadata_.get(SNAPSHOT_METADATA_KEY)
+                snapshot = await handle.create_snapshot(
+                    name=f"harborbox-{sandbox.id}"
+                )
+                await self._wait_snapshot_ready(snapshot.id)
+                await handle.kill()
+                if (
+                    previous_snapshot_id
+                    and previous_snapshot_id != snapshot.id
+                ):
+                    try:
+                        await self._delete_snapshot(previous_snapshot_id)
+                    except SandboxUnavailable:
+                        logger.warning(
+                            "Could not delete replaced snapshot %s for sandbox %s",
+                            previous_snapshot_id,
+                            sandbox.id,
+                        )
+                metadata = dict(sandbox.metadata_)
+                metadata[SNAPSHOT_METADATA_KEY] = snapshot.id
+                sandbox.metadata_ = metadata
+        except SandboxException as exc:
+            self._raise_runtime_error(exc, sandbox)
+        finally:
+            await handle.close()
+            self._sandboxes.pop(sandbox.id, None)
+
+    async def resume(self, sandbox: Sandbox) -> StartedSandbox:
+        if not sandbox.container_id:
+            return await self.start_sandbox(sandbox)
+        try:
+            handle = await OpenSandbox.resume(
+                sandbox.container_id,
+                connection_config=self._connection,
+                resume_timeout=timedelta(
+                    seconds=self.settings.opensandbox_ready_timeout_seconds
+                ),
+            )
+            self._sandboxes[sandbox.id] = handle
+            return StartedSandbox(id=handle.id, name=handle.id)
+        except SandboxException as exc:
+            self._raise_runtime_error(exc, sandbox)
+
+    async def kill(self, sandbox: Sandbox) -> None:
+        handle = self._sandboxes.pop(sandbox.id, None)
+        if handle is None and sandbox.container_id:
+            try:
+                handle = await OpenSandbox.connect(
+                    sandbox.container_id,
+                    connection_config=self._connection,
+                    skip_health_check=True,
+                )
+            except SandboxApiException as exc:
+                if exc.status_code != 404:
+                    self._raise_runtime_error(exc, sandbox)
+        if handle is not None:
+            try:
+                await handle.kill()
+            except SandboxApiException as exc:
+                if exc.status_code != 404:
+                    self._raise_runtime_error(exc, sandbox)
+            finally:
+                await handle.close()
+
+        snapshot_id = sandbox.metadata_.get(SNAPSHOT_METADATA_KEY)
+        if snapshot_id:
+            await self._delete_snapshot(snapshot_id, ignore_missing=True)
+            metadata = dict(sandbox.metadata_)
+            metadata.pop(SNAPSHOT_METADATA_KEY, None)
+            sandbox.metadata_ = metadata
+
+    async def container_status(self, sandbox: Sandbox) -> str | None:
+        if not sandbox.container_id:
+            return None
+        try:
+            info = await (await self._get_manager()).get_sandbox_info(
+                sandbox.container_id
+            )
+        except SandboxApiException as exc:
+            if exc.status_code == 404:
+                return None
+            self._raise_runtime_error(exc, sandbox)
+        state = info.status.state.lower()
+        return {
+            "running": "running",
+            "pending": "created",
+            "pausing": "paused",
+            "paused": "paused",
+            "resuming": "created",
+            "stopping": "exited",
+            "terminated": "exited",
+            "failed": "dead",
+        }.get(state, state)
+
+    async def _get_handle(
+        self, sandbox: Sandbox, *, check_ready: bool
+    ) -> OpenSandbox:
+        cached = self._sandboxes.get(sandbox.id)
+        if cached is not None:
+            return cached
+        if not sandbox.container_id:
+            raise SandboxUnavailable("sandbox has no OpenSandbox runtime id")
+        try:
+            handle = await OpenSandbox.connect(
+                sandbox.container_id,
+                connection_config=self._connection,
+                connect_timeout=timedelta(
+                    seconds=self.settings.opensandbox_ready_timeout_seconds
+                ),
+                skip_health_check=not check_ready,
+            )
+        except SandboxException as exc:
+            self._raise_runtime_error(exc, sandbox)
+        self._sandboxes[sandbox.id] = handle
+        return handle
+
+    async def _get_manager(self) -> SandboxManager:
+        if self._manager is not None:
+            return self._manager
+        async with self._manager_lock:
+            if self._manager is None:
+                self._manager = await SandboxManager.create(self._connection)
+        return self._manager
+
+    async def _wait_snapshot_ready(self, snapshot_id: str) -> None:
+        deadline = (
+            asyncio.get_running_loop().time()
+            + self.settings.opensandbox_snapshot_timeout_seconds
+        )
+        manager = await self._get_manager()
+        while asyncio.get_running_loop().time() < deadline:
+            snapshot = await manager.get_snapshot(snapshot_id)
+            state = snapshot.status.state.lower()
+            if state == "ready":
+                return
+            if state == "failed":
+                raise SandboxUnavailable(
+                    snapshot.status.message or "OpenSandbox snapshot failed"
+                )
+            await asyncio.sleep(0.1)
+        raise SandboxUnavailable("OpenSandbox snapshot did not become ready")
+
+    async def _delete_snapshot(
+        self, snapshot_id: str, *, ignore_missing: bool = False
+    ) -> None:
+        try:
+            await (await self._get_manager()).delete_snapshot(snapshot_id)
+        except SandboxApiException as exc:
+            if not (ignore_missing and exc.status_code == 404):
+                raise SandboxUnavailable(str(exc)) from exc
+
+    @staticmethod
+    def _runtime_metadata(sandbox: Sandbox) -> dict[str, str]:
+        metadata = {
+            key: value
+            for key, value in sandbox.metadata_.items()
+            if key != SNAPSHOT_METADATA_KEY
+        }
+        metadata["harborbox.sandbox_id"] = sandbox.id
+        return metadata
+
+    @staticmethod
+    def _raise_runtime_error(exc: SandboxException, sandbox: Sandbox) -> NoReturn:
+        message = str(exc)
+        lowered = message.lower()
+        if "oom" in lowered or "out of memory" in lowered or "exit code 137" in lowered:
+            raise SandboxMemoryExceeded(
+                f"sandbox exceeded its {sandbox.memory_mb} MiB memory limit"
+            ) from exc
+        raise SandboxUnavailable(message) from exc

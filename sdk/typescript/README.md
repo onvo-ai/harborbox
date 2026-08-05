@@ -3,7 +3,7 @@
 An E2B-shaped client for server-side TypeScript applications. It implements
 the subset used by Onvo Lite:
 
-- `Sandbox.create(template?, options?)`
+- `Sandbox.create(template, options?)` (template is mandatory)
 - `sandbox.sandboxId`
 - `sandbox.isRunning()`
 - `sandbox.setTimeout(timeoutMs)`
