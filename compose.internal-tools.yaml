@@ -242,13 +242,18 @@ services:
       # onvo-pro is used here — Onvo's client sends it for every widget — so the
       # other two warm nothing rather than holding memory for callers that do
       # not exist.
-      # One, not two, and the difference is CPU. The old pool held a memory
-      # reservation but deliberately no CPU budget, so four warm sandboxes cost
-      # nothing in admission terms. 0.2.0's pool reserves both — `capacity()`
-      # adds warm_pool.cpu to reserved_cpu — so each warm onvo-pro takes a whole
-      # slot out of MAX_PARALLEL_CPU. At two, a 43-widget refresh had six slots
-      # instead of eight and spent its time queued: measured executions ran in
-      # ~200ms while whole batches took 178s, against 13-22s before.
+      # One warm onvo-pro. Note the accounting difference from 0.1.0: that pool
+      # held a memory reservation but deliberately no CPU budget, while 0.2.0's
+      # reserves both (`capacity()` adds warm_pool.cpu to reserved_cpu), so each
+      # warm sandbox costs a real admission slot.
+      #
+      # Sized at one rather than two because two bought nothing: a 43-widget
+      # refresh measured 178s per batch at two slots-worth reserved and 190s
+      # after freeing them, so admission was not the constraint. **0.2.0 is
+      # still ~10x slower than 0.1.0 on this workload** (13-22s per batch
+      # before), and the cause is per-sandbox startup, not queueing — an
+      # isolated cold create-and-execute is ~6s while executions themselves run
+      # in ~200ms. A burst of 43 widgets pays that startup 43 times. Unresolved.
       HARBORBOX_WARM_POOL_ONVO_PRO: ${HARBORBOX_WARM_POOL_ONVO_PRO:-1}
       HARBORBOX_WARM_POOL_ONVO_LITE: ${HARBORBOX_WARM_POOL_ONVO_LITE:-0}
       HARBORBOX_WARM_POOL_RELAYDECK: ${HARBORBOX_WARM_POOL_RELAYDECK:-0}
