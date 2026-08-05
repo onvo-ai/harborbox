@@ -10,22 +10,15 @@ class Capacity:
     host_available_memory_mb: int
     reserved_cpu: float
     max_parallel_cpu: float
-    configured_sandbox_budget_mb: int | None = None
-    warm_pool_reserved_memory_mb: int = 0
-    warm_pool_reserved_cpu: float = 0.0
-    warm_pool_target_sandboxes: int = 0
 
     @property
     def sandbox_budget_mb(self) -> int:
-        host_budget = max(
+        return max(
             0,
             self.total_memory_mb
             - self.reserve_memory_mb
             - self.platform_memory_reserve_mb,
         )
-        if self.configured_sandbox_budget_mb is None:
-            return host_budget
-        return min(host_budget, self.configured_sandbox_budget_mb)
 
     @property
     def available_reservation_mb(self) -> int:
@@ -65,3 +58,4 @@ def can_admit(
         return AdmissionDecision(False, "cpu")
 
     return AdmissionDecision(True)
+

@@ -1,18 +1,15 @@
 [project]
 name = "harborbox"
-version = "0.2.0"
-description = "Durable admission and orchestration for OpenSandbox runtimes"
+version = "0.1.0"
+description = "A resource-aware, self-hosted Python sandbox platform"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
   "aiosqlite>=0.21.0",
   "asyncpg>=0.30.0",
-  "cryptography>=45.0.0",
   "docker>=7.1.0",
   "fastapi>=0.116.0",
   "httpx>=0.28.0",
-  "opensandbox>=0.1.15,<0.2.0",
-  "opensandbox-code-interpreter>=0.1.2,<0.2.0",
   "pydantic-settings>=2.10.0",
   "sqlalchemy[asyncio]>=2.0.40",
   "uvicorn[standard]>=0.35.0",

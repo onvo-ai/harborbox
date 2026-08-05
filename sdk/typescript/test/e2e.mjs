@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { Sandbox } from "../dist/index.js";
 
-const sandbox = await Sandbox.create("onvo-lite", {
+const sandbox = await Sandbox.create("onvo-data-processor", {
   memoryMb: 768,
   cpu: 1,
   timeoutMs: 120_000,

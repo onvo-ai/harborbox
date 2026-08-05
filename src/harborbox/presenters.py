@@ -56,6 +56,6 @@ async def execution_response(
             execution.created_at,
             execution.admitted_at or execution.finished_at,
         ),
-        startup_ms=elapsed_ms(execution.admitted_at, execution.started_at),
         execution_ms=elapsed_ms(execution.started_at, execution.finished_at),
     )
+

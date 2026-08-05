@@ -1,7 +1,6 @@
 FROM python:3.12-slim-bookworm
 
 ARG SANDBOX_REQUIREMENTS=sandbox/requirements.txt
-ARG SANDBOX_APT_PACKAGES=""
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -15,12 +14,6 @@ RUN python -m venv /opt/venv \
     && mkdir -p /workspace \
     && chown 10001:10001 /workspace
 
-RUN if [ -n "$SANDBOX_APT_PACKAGES" ]; then \
-      apt-get update \
-      && apt-get install -y --no-install-recommends $SANDBOX_APT_PACKAGES \
-      && rm -rf /var/lib/apt/lists/*; \
-    fi
-
 COPY ${SANDBOX_REQUIREMENTS} /tmp/requirements.txt
 RUN /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt
@@ -31,5 +24,6 @@ COPY sandbox/forkrun.py /opt/forkrun.py
 
 WORKDIR /workspace
 USER 10001:10001
+EXPOSE 8080
 
-CMD ["tail", "-f", "/dev/null"]
+ENTRYPOINT ["python", "-m", "uvicorn", "harborbox_agent.main:app", "--app-dir", "/opt", "--host", "0.0.0.0", "--port", "8080", "--no-access-log"]
