@@ -10,3 +10,8 @@ dist/
 build/
 .coverage
 htmlcov/
+
+# Backups written in place during deploys. Never committable.
+.env.bak.*
+*.bak
+*.pre-guard
