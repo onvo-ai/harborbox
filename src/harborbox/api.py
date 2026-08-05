@@ -14,7 +14,6 @@ from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from harborbox import __version__
 from harborbox.admission import can_admit
 from harborbox.config import Settings, get_settings
 from harborbox.db import create_schema, get_session, session_factory
@@ -104,12 +103,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="Harborbox API",
-    # From the package, not a literal. These drifted: `__init__` said 0.1.0
-    # while this said 0.2.0, and since FastAPI's own default is *also* 0.1.0,
-    # a version reported over `/openapi.json` could not distinguish "stale
-    # deploy" from "nobody set a version". That ambiguity cost a deploy
-    # investigation.
-    version=__version__,
+    version="0.2.0",
     description=(
         "Durable, resource-aware admission and orchestration for OpenSandbox"
     ),
