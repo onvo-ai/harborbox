@@ -25,11 +25,15 @@ COPY ${SANDBOX_REQUIREMENTS} /tmp/requirements.txt
 RUN /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt
 
-COPY src/harborbox_agent /opt/harborbox_agent
-# Pre-warmed script runner. See sandbox/forkrun.py.
-COPY sandbox/forkrun.py /opt/forkrun.py
-
 WORKDIR /workspace
 USER 10001:10001
 
+# No agent and no entrypoint of our own: opensandbox injects execd and runs the
+# code, which is why the requirements files dropped fastapi and uvicorn. This
+# matches Dockerfile.relaydeck.
+#
+# Rebasing 0.2.0 onto main briefly left main's `COPY src/harborbox_agent` and
+# forkrun.py here alongside this CMD. The image built fine and started fine —
+# it just sat doing nothing, because the agent was present and never launched,
+# and every execution failed with "sandbox agent did not become ready".
 CMD ["tail", "-f", "/dev/null"]

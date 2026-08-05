@@ -17,21 +17,90 @@
 #      here the API must not be reachable from the host at all.
 #
 # Memory is the binding constraint on this host (~6 GB available), not disk.
-# api 768M + postgres 512M + 2 concurrent sandboxes at 1 GB ≈ 3.3 GB.
+# api 768M + postgres 512M + opensandbox 768M + 2 concurrent sandboxes at
+# 768M ≈ 3.6 GB, plus 2 warm onvo-pro holding 1.5 GB of reservation.
+#
+# Since 0.2.0 this runs `opensandbox/server`, as compose.yaml does. That is not
+# optional: 0.2.0's template images ship no harborbox agent — no fastapi, no
+# uvicorn, `CMD ["tail","-f","/dev/null"]` — because execd runs the code, so
+# the old DockerRuntime path has nothing to talk to. The API keeps the docker
+# socket anyway, for building derived templates.
 
 name: harborbox
 
+configs:
+  # Mirrors compose.yaml's config, with two deliberate differences for this
+  # host: no egress section, because sandboxes here must reach nothing, and a
+  # narrower port range, since the Trigger stack shares these ephemeral ports.
+  opensandbox-config:
+    content: |
+      [server]
+      host = "0.0.0.0"
+      port = 8080
+      max_sandbox_timeout_seconds = 86400
+
+      [log]
+      level = "INFO"
+
+      [runtime]
+      type = "docker"
+      execd_image = "opensandbox/execd:v1.0.21"
+
+      [store]
+      type = "sqlite"
+      path = "/var/lib/opensandbox/opensandbox.db"
+
+      [docker]
+      network_mode = "bridge"
+      host_ip = "host.docker.internal"
+      port_range_min = 40000
+      port_range_max = 45000
+      drop_capabilities = ["AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG"]
+      no_new_privileges = true
+      pids_limit = 4096
+
+      [ingress]
+      mode = "direct"
+
 services:
-  sandbox-image:
-    # Tagged, because a second deploy on this host builds the same names.
-    # Left at `local` the Coolify build would retag the image the hand-rolled
-    # stack launches sandboxes from, changing it without anyone deciding to.
-    image: harborbox-sandbox-onvo:${HARBORBOX_IMAGE_TAG:-local}
+  # One build per static template. 0.2.0 made `template` required on
+  # POST /v1/sandboxes and resolves each name to its own image, so the single
+  # `harborbox-sandbox-onvo` image this used to build no longer satisfies any
+  # request — `image_for_template` would raise for every one of them.
+  #
+  # All three are tagged, for the same reason the single one was: a second
+  # deploy on this host builds the same names, and left at `local` the Coolify
+  # build would retag the images the hand-rolled stack launches sandboxes from,
+  # changing them without anyone deciding to.
+  #
+  # Derived templates (POST /v1/templates) are built at runtime by the API from
+  # these bases, which is why HARBORBOX_TEMPLATE_IMAGE_PREFIX and
+  # HARBORBOX_TEMPLATE_VERSION below must agree with the tags built here.
+  sandbox-onvo-pro-image:
+    image: harborbox-sandbox-onvo-pro:${HARBORBOX_IMAGE_TAG:-local}
     build:
       context: .
       dockerfile: sandbox/Dockerfile
       args:
-        SANDBOX_REQUIREMENTS: sandbox/requirements-onvo.txt
+        SANDBOX_REQUIREMENTS: sandbox/requirements-onvo-pro.txt
+    entrypoint: ["/bin/true"]
+    restart: "no"
+
+  sandbox-onvo-lite-image:
+    image: harborbox-sandbox-onvo-lite:${HARBORBOX_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: sandbox/Dockerfile
+      args:
+        SANDBOX_REQUIREMENTS: sandbox/requirements-onvo-lite.txt
+    entrypoint: ["/bin/true"]
+    restart: "no"
+
+  sandbox-relaydeck-image:
+    image: harborbox-sandbox-relaydeck:${HARBORBOX_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: sandbox/Dockerfile.relaydeck
     entrypoint: ["/bin/true"]
     restart: "no"
 
@@ -55,44 +124,136 @@ services:
     networks:
       - control
 
+  opensandbox:
+    image: opensandbox/server:v0.2.2
+    environment:
+      SANDBOX_CONFIG_PATH: /etc/opensandbox/config.toml
+      OPENSANDBOX_SERVER_API_KEY: ${SERVICE_PASSWORD_64_OPENSANDBOXAPI:?see the API service below - the same key must reach both sides.}
+    configs:
+      - source: opensandbox-config
+        target: /etc/opensandbox/config.toml
+    volumes:
+      # Same privilege as the API had, for the same reason: something has to
+      # create sandbox containers. Under 0.2.0 that is opensandbox, not the API.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - opensandbox-state:/var/lib/opensandbox
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    mem_limit: 768m
+    memswap_limit: 768m
+    pids_limit: 512
+    restart: unless-stopped
+    networks:
+      control:
+        aliases:
+          - opensandbox
+
   api:
     image: harborbox-api:${HARBORBOX_IMAGE_TAG:-local}
     build:
       context: .
       dockerfile: Dockerfile.api
     depends_on:
-      sandbox-image:
+      sandbox-onvo-pro-image:
+        condition: service_completed_successfully
+      sandbox-onvo-lite-image:
+        condition: service_completed_successfully
+      sandbox-relaydeck-image:
         condition: service_completed_successfully
       postgres:
+        condition: service_healthy
+      opensandbox:
         condition: service_healthy
     environment:
       HARBORBOX_API_KEY: ${SERVICE_PASSWORD_64_HARBORBOXAPI:?refusing to start with no API key - every sandbox call would 401. Set it in .env from Infisical Onvo/staging HARBORBOX_API_KEY.}
       HARBORBOX_DATABASE_URL: postgresql+asyncpg://harborbox:${SERVICE_PASSWORD_HARBORBOXDB}@postgres/harborbox
-      HARBORBOX_SANDBOX_IMAGE: harborbox-sandbox-onvo:${HARBORBOX_IMAGE_TAG:-local}
+      # The reason 0.2.0's first deploy failed here. Until 0.2.0 the API built
+      # `DockerRuntime` directly in its lifespan and never read this setting, so
+      # its `opensandbox` default was harmless. 0.2.0 routes through
+      # `create_runtime()`, which honours it — and no opensandbox ran on this
+      # host, so every create died at DNS with `[Errno -3] Temporary failure in
+      # name resolution` before a container existed. Trigger saw "Harborbox
+      # sandbox failed to become ready".
+      #
+      # Set explicitly rather than left to default, because the two halves of
+      # this decision live in different files: change it to `docker` and the
+      # opensandbox service below becomes dead weight, but the sandbox images
+      # also stop working. 0.2.0's template images ship no agent — no fastapi,
+      # no uvicorn, `CMD ["tail","-f","/dev/null"]` — because execd runs the
+      # code. DockerRuntime polls a harborbox agent on :8080 that those images
+      # do not contain, so `docker` needs different images, not just this flag.
+      HARBORBOX_RUNTIME_PROVIDER: opensandbox
+      HARBORBOX_OPENSANDBOX_DOMAIN: opensandbox:8080
+      HARBORBOX_OPENSANDBOX_PROTOCOL: http
+      HARBORBOX_OPENSANDBOX_API_KEY: ${SERVICE_PASSWORD_64_OPENSANDBOXAPI:?refusing to start with no opensandbox key - the API would fail every sandbox create against the runtime.}
+      # Static template images, built above. These three names are what
+      # `image_for_template` resolves for onvo-pro/onvo-lite/relaydeck.
+      HARBORBOX_ONVO_PRO_IMAGE: harborbox-sandbox-onvo-pro:${HARBORBOX_IMAGE_TAG:-local}
+      HARBORBOX_ONVO_LITE_IMAGE: harborbox-sandbox-onvo-lite:${HARBORBOX_IMAGE_TAG:-local}
+      HARBORBOX_RELAYDECK_IMAGE: harborbox-sandbox-relaydeck:${HARBORBOX_IMAGE_TAG:-local}
+      # Derived templates are named `<base>-<12 hex>` and their image name is a
+      # pure function of prefix + version, so these must match the tags built
+      # above or a derived template resolves to an image nobody built.
+      HARBORBOX_TEMPLATE_IMAGE_PREFIX: harborbox-sandbox
+      HARBORBOX_TEMPLATE_VERSION: ${HARBORBOX_IMAGE_TAG:-local}
       HARBORBOX_SANDBOX_NETWORK: ${HARBORBOX_SANDBOX_NETWORK:-harborbox-net}
-      # Named, but only attached to sandboxes that ask for it (SandboxCreate
-      # .egress, default false). Widget code is handed its data as files and
-      # never opts in, so it stays unable to reach anything; a caller that must
-      # talk to a customer database can request it explicitly.
-      HARBORBOX_SANDBOX_EGRESS_NETWORK: ${HARBORBOX_SANDBOX_EGRESS_NETWORK:-harborbox-egress}
+      # Empty, matching the header: sandboxes sit only on the `internal: true`
+      # network and have no route anywhere.
+      #
+      # This named `harborbox-egress` until 2026-08-05, and that network has
+      # never existed on this host — `_connect_egress` does `networks.get(name)`
+      # only after a caller opts in, so the first request to ask for egress
+      # would have died on a Docker NotFound rather than being cleanly told no.
+      # Empty takes the `if not network_name: return` path instead.
+      #
+      # To actually offer egress here, declare the network below and set this;
+      # it is opt-in per sandbox (SandboxCreate.egress, default false), so
+      # widget code is unaffected either way.
+      HARBORBOX_SANDBOX_EGRESS_NETWORK: ${HARBORBOX_SANDBOX_EGRESS_NETWORK:-}
       HARBORBOX_DEFAULT_SANDBOX_MEMORY_MB: ${HARBORBOX_ONVO_SANDBOX_MEMORY_MB:-768}
       HARBORBOX_DEFAULT_SANDBOX_CPU: ${HARBORBOX_ONVO_SANDBOX_CPU:-1}
       HARBORBOX_MAX_SANDBOX_MEMORY_MB: ${HARBORBOX_MAX_SANDBOX_MEMORY_MB:-2048}
       HARBORBOX_MAX_PARALLEL_CPU: ${HARBORBOX_MAX_PARALLEL_CPU:-8}
       HARBORBOX_MAX_CONCURRENT_EXECUTIONS_PER_SANDBOX: ${HARBORBOX_ONVO_CONCURRENCY:-2}
-      # Pre-started sandboxes kept ready. The container is ~2.6s of a sandbox's
-      # cost and ~0.1s of its work, so a caller that starts its own pays the
-      # boot on the critical path. Pooled sandboxes hold their memory
-      # reservation but no CPU budget - see RESERVED_SANDBOX_STATES.
-      HARBORBOX_SANDBOX_POOL_SIZE: ${HARBORBOX_SANDBOX_POOL_SIZE:-4}
+      # Warm pools. HARBORBOX_SANDBOX_POOL_SIZE used to sit here warming 4
+      # sandboxes; that pool matched on (memory_mb, cpu, egress) and carried no
+      # template, so it could hand an onvo-pro container to a relaydeck caller.
+      # 0.2.0 replaced it with per-template pools, which is why they are named
+      # individually now. They live in the opensandbox runtime, so they only
+      # work at all because the provider above is `opensandbox`.
+      #
+      # Sized down from the old 4: each pooled onvo-pro holds a 768 MB
+      # reservation, so 4 reserved 3 GB of the ~6 GB this host has. Only
+      # onvo-pro is used here — Onvo's client sends it for every widget — so the
+      # other two warm nothing rather than holding memory for callers that do
+      # not exist.
+      HARBORBOX_WARM_POOL_ONVO_PRO: ${HARBORBOX_WARM_POOL_ONVO_PRO:-2}
+      HARBORBOX_WARM_POOL_ONVO_LITE: ${HARBORBOX_WARM_POOL_ONVO_LITE:-0}
+      HARBORBOX_WARM_POOL_RELAYDECK: ${HARBORBOX_WARM_POOL_RELAYDECK:-0}
+      #
+      # Per-template sizing, pinned to what this host was already running.
+      # 0.2.0 takes resources from the resolved template, not from
+      # HARBORBOX_DEFAULT_SANDBOX_*, and onvo-pro's built-in default is
+      # 1024 MB / 2.0 CPU. Left alone that silently halves concurrency here:
+      # MAX_PARALLEL_CPU is 8, so 2.0 CPU per sandbox allows 4 at once where
+      # 1.0 allowed 8. Onvo's widget code has run in 768 MB / 1 CPU all along.
+      HARBORBOX_ONVO_PRO_TEMPLATE_MEMORY_MB: ${HARBORBOX_ONVO_SANDBOX_MEMORY_MB:-768}
+      HARBORBOX_ONVO_PRO_TEMPLATE_CPU: ${HARBORBOX_ONVO_SANDBOX_CPU:-1}
       HARBORBOX_DEFAULT_IDLE_TIMEOUT_SECONDS: ${HARBORBOX_ONVO_IDLE_TIMEOUT_SECONDS:-180}
       # Leave headroom for the Trigger stack, which shares this host.
       HARBORBOX_HOST_MEMORY_RESERVE_PERCENT: ${HARBORBOX_HOST_MEMORY_RESERVE_PERCENT:-25}
       HARBORBOX_PLATFORM_MEMORY_RESERVE_MB: ${HARBORBOX_PLATFORM_MEMORY_RESERVE_MB:-1024}
     volumes:
-      # Required: the API creates sandbox containers. This is the one privileged
-      # thing Harborbox needs, and the reason it belongs on a host running
-      # internal tooling rather than customer-facing apps.
+      # Still required, though no longer for running sandboxes — opensandbox
+      # does that now. The API builds derived template images (POST
+      # /v1/templates) with docker directly, so it keeps the socket. This is
+      # the privileged thing Harborbox needs, and the reason it belongs on a
+      # host running internal tooling rather than customer-facing apps.
       - /var/run/docker.sock:/var/run/docker.sock
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -124,6 +285,7 @@ services:
 
 volumes:
   harborbox-postgres:
+  opensandbox-state:
 
 networks:
   control:
