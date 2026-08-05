@@ -66,7 +66,7 @@ services:
       HARBORBOX_API_KEY: ${SERVICE_PASSWORD_64_HARBORBOXAPI:?refusing to start with no API key - every sandbox call would 401. Set it in .env from Infisical Onvo/staging HARBORBOX_API_KEY.}
       HARBORBOX_DATABASE_URL: postgresql+asyncpg://harborbox:${SERVICE_PASSWORD_HARBORBOXDB}@postgres/harborbox
       HARBORBOX_SANDBOX_IMAGE: harborbox-sandbox-onvo:local
-      HARBORBOX_SANDBOX_NETWORK: harborbox-net
+      HARBORBOX_SANDBOX_NETWORK: ${HARBORBOX_SANDBOX_NETWORK:-harborbox-net}
       # Named, but only attached to sandboxes that ask for it (SandboxCreate
       # .egress, default false). Widget code is handed its data as files and
       # never opts in, so it stays unable to reach anything; a caller that must
@@ -95,17 +95,26 @@ services:
     # creates containers. The sandboxes it creates still have no egress unless
     # the caller asks for it, so widening the API's reach does not widen theirs.
     labels:
-      traefik.enable: "true"
+      # Routing is a switch, not a constant. A second instance of this stack
+      # on the same host must not answer for the live hostname, so the
+      # parallel deploy sets this false and is reached by its network alias
+      # instead. Traefik ignores a disabled container outright, which also
+      # keeps the two from registering the same router names. Flipping this
+      # true and stopping the old stack is the whole cutover.
+      #
+      # Note the router names below cannot be parameterised: Compose
+      # substitutes variables in label values, never in label keys.
+      traefik.enable: ${HARBORBOX_TRAEFIK_ENABLE:-true}
       # Required, not optional: this container is on three networks and one of
       # them (harborbox-net) is `internal: true`. Without naming the shared
       # network, traefik can resolve the backend to an address with no route
       # and every request hangs until the gateway times out.
       traefik.docker.network: nj9nsajrgcu76alcj6c1sq87
       traefik.http.routers.harborbox-http.entryPoints: http
-      traefik.http.routers.harborbox-http.rule: Host(`harborbox.onvo.ai`)
+      traefik.http.routers.harborbox-http.rule: Host(`${HARBORBOX_PUBLIC_HOST:-harborbox.onvo.ai}`)
       traefik.http.routers.harborbox-http.middlewares: redirect-to-https
       traefik.http.routers.harborbox-https.entryPoints: https
-      traefik.http.routers.harborbox-https.rule: Host(`harborbox.onvo.ai`)
+      traefik.http.routers.harborbox-https.rule: Host(`${HARBORBOX_PUBLIC_HOST:-harborbox.onvo.ai}`)
       traefik.http.routers.harborbox-https.tls: "true"
       traefik.http.routers.harborbox-https.tls.certresolver: letsencrypt
       traefik.http.routers.harborbox-https.service: harborbox
@@ -127,10 +136,12 @@ services:
     networks:
       control:
       sandboxes:
-      # The Trigger stack's network. `harborbox` is the name task code uses.
+      # The Trigger stack's network. `harborbox` is the name task code uses;
+      # a parallel deploy takes a different alias so Docker DNS does not
+      # round-robin between two stacks.
       trigger:
         aliases:
-          - harborbox
+          - ${HARBORBOX_NETWORK_ALIAS:-harborbox}
 
 volumes:
   harborbox-postgres:
@@ -143,7 +154,7 @@ networks:
   # in the API log to say why. Created once out of band with:
   #   docker network create --internal harborbox-net
   sandboxes:
-    name: harborbox-net
+    name: ${HARBORBOX_SANDBOX_NETWORK:-harborbox-net}
     external: true
   trigger:
     name: nj9nsajrgcu76alcj6c1sq87
