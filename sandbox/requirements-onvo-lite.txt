@@ -1,0 +1,17 @@
+ipykernel==6.30.1
+jupyter-client==8.6.3
+
+duckdb
+pandas==2.2.3
+numpy
+pymysql>=1.1.0
+cryptography
+sqlalchemy
+psycopg2-binary
+pymongo
+pymssql
+clickhouse-connect
+snowflake-connector-python
+openpyxl
+gspread
+google-auth

@@ -1,7 +1,5 @@
-fastapi==0.116.1
 ipykernel==6.30.1
 jupyter-client==8.6.3
-uvicorn==0.35.0
 
 duckdb
 # Pinned to match the BullMQ workers image (Dockerfile.workers installs

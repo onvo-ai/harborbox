@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
-import secrets
-from uuid import uuid4
 from collections.abc import Callable
 from dataclasses import replace
 
@@ -14,13 +13,17 @@ from sqlalchemy.orm import selectinload
 from harborbox.admission import Capacity, can_admit, reserve_memory
 from harborbox.config import Settings
 from harborbox.db import session_factory
-from harborbox.models import Execution, Sandbox, utc_now
-from harborbox.runtime import (
-    DockerRuntime,
-    SandboxMemoryExceeded,
-    SandboxUnavailable,
+from harborbox.execution_secrets import open_environment, scrub_environment
+from harborbox.models import Execution, Sandbox, SandboxTemplate, utc_now
+from harborbox.opensandbox_compat import expiration
+from harborbox.runtime import SandboxMemoryExceeded, SandboxUnavailable
+from harborbox.runtime_protocol import SandboxRuntime
+from harborbox.schemas import (
+    AgentCommandRequest,
+    AgentExecutionRequest,
+    AgentProcessRequest,
 )
-from harborbox.schemas import AgentCommandRequest, AgentExecutionRequest
+from harborbox.template_builder import TemplateBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -69,31 +72,36 @@ def has_sandbox_execution_slot(
 ) -> bool:
     if active_count >= limit or active_code:
         return False
-    return kind == "command" or active_count == 0
+    return kind in {"command", "process"} or active_count == 0
 
 
 class Scheduler:
-    def __init__(self, settings: Settings, runtime: DockerRuntime) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        runtime: SandboxRuntime,
+        template_builder: TemplateBuilder | None = None,
+    ) -> None:
         self.settings = settings
         self.runtime = runtime
+        self.template_builder = template_builder
         self._stop = asyncio.Event()
         self._loop_task: asyncio.Task[None] | None = None
         self._reaper_task: asyncio.Task[None] | None = None
-        self._pool_task: asyncio.Task[None] | None = None
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._sandbox_start_locks: dict[str, asyncio.Lock] = {}
+        self._last_template_sweep: float | None = None
 
     async def start(self) -> None:
         await self._recover_interrupted_jobs()
         self._loop_task = asyncio.create_task(self._scheduler_loop())
         self._reaper_task = asyncio.create_task(self._reaper_loop())
-        self._pool_task = asyncio.create_task(self._pool_loop())
 
     async def stop(self) -> None:
         self._stop.set()
         tasks = [
             task
-            for task in (self._loop_task, self._reaper_task, self._pool_task)
+            for task in (self._loop_task, self._reaper_task)
             if task
         ]
         for task in tasks:
@@ -106,6 +114,7 @@ class Scheduler:
     async def capacity(self) -> Capacity:
         total_memory_mb = await self.runtime.total_memory_mb()
         host_available_memory_mb = await self.runtime.available_memory_mb()
+        warm_pool = self.runtime.warm_pool_reservation()
         reserve_mb = reserve_memory(
             total_memory_mb,
             self.settings.host_memory_reserve_percent,
@@ -129,10 +138,16 @@ class Scheduler:
             total_memory_mb=total_memory_mb,
             reserve_memory_mb=reserve_mb,
             platform_memory_reserve_mb=self.settings.platform_memory_reserve_mb,
-            reserved_memory_mb=int(reserved_memory or 0),
+            reserved_memory_mb=int(reserved_memory or 0) + warm_pool.memory_mb,
             host_available_memory_mb=host_available_memory_mb,
-            reserved_cpu=float(reserved_cpu or 0.0),
+            reserved_cpu=float(reserved_cpu or 0.0) + warm_pool.cpu,
             max_parallel_cpu=max_cpu,
+            configured_sandbox_budget_mb=(
+                self.settings.sandbox_memory_budget_mb
+            ),
+            warm_pool_reserved_memory_mb=warm_pool.memory_mb,
+            warm_pool_reserved_cpu=warm_pool.cpu,
+            warm_pool_target_sandboxes=warm_pool.sandboxes,
         )
 
     async def _scheduler_loop(self) -> None:
@@ -304,6 +319,10 @@ class Scheduler:
                 await session.commit()
                 sandbox = execution.sandbox
 
+            environment = open_environment(
+                self.settings,
+                execution.environment,
+            )
             if execution.kind == "code":
                 response = await self.runtime.execute_code(
                     sandbox,
@@ -311,17 +330,31 @@ class Scheduler:
                         code=execution.code or "",
                         timeout_seconds=execution.timeout_seconds,
                         max_output_bytes=self.settings.max_output_bytes,
-                        env=execution.environment,
+                        env=environment,
                     ),
                 )
-            else:
+            elif execution.kind == "command":
                 response = await self.runtime.execute_command(
                     sandbox,
                     AgentCommandRequest(
                         command=execution.command or "",
                         timeout_seconds=execution.timeout_seconds,
                         max_output_bytes=self.settings.max_output_bytes,
-                        env=execution.environment,
+                        env=environment,
+                        cwd=execution.cwd,
+                    ),
+                )
+            else:
+                process_spec = json.loads(execution.command or "{}")
+                response = await self.runtime.execute_process(
+                    sandbox,
+                    AgentProcessRequest(
+                        executable=process_spec["executable"],
+                        args=process_spec.get("args", []),
+                        stdin=process_spec.get("stdin"),
+                        timeout_seconds=execution.timeout_seconds,
+                        max_output_bytes=self.settings.max_output_bytes,
+                        env=environment,
                         cwd=execution.cwd,
                     ),
                 )
@@ -331,6 +364,7 @@ class Scheduler:
                 if execution is None:
                     return
                 execution.finished_at = utc_now()
+                execution.environment = scrub_environment(execution.environment)
                 execution.result = {
                     "logs": response.logs.model_dump(mode="json"),
                     "results": [
@@ -383,6 +417,7 @@ class Scheduler:
             started = None
         else:
             raise SandboxUnavailable(f"sandbox is {previous_status}")
+        runtime_metadata = dict(sandbox.metadata_)
 
         async with session_factory() as session:
             sandbox = await session.get(Sandbox, sandbox_id)
@@ -409,6 +444,7 @@ class Scheduler:
             if started is not None:
                 sandbox.container_id = started.id
                 sandbox.container_name = started.name
+                sandbox.metadata_ = runtime_metadata
             sandbox.status = "running"
             sandbox.last_activity_at = utc_now()
             await session.commit()
@@ -424,6 +460,7 @@ class Scheduler:
                 return
             execution.status = "failed"
             execution.finished_at = utc_now()
+            execution.environment = scrub_environment(execution.environment)
             execution.error = {"name": name, "value": value, "traceback": []}
             sandbox = await session.get(Sandbox, execution.sandbox_id)
             if sandbox is not None:
@@ -432,137 +469,66 @@ class Scheduler:
                     sandbox.status = "failed"
             await session.commit()
 
-    async def _pool_loop(self) -> None:
-        """Keeps `sandbox_pool_size` sandboxes started and unassigned.
-
-        Starting a container is nearly all of a sandbox's cost — ~2.6s, against
-        ~0.15s to run a script in one that already exists — so a caller that has
-        to start its own pays for the boot on the critical path. Pre-starting
-        them moves that cost off it.
-
-        This is *not* sandbox reuse: a pooled sandbox is handed to exactly one
-        caller and destroyed afterwards, with its own agent token and its own
-        empty volume. The isolation property is unchanged; only the timing of
-        the container start moves.
-        """
-        while not self._stop.is_set():
-            try:
-                await self._replenish_pool()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("sandbox pool replenish failed")
-            await asyncio.sleep(self.settings.sandbox_pool_poll_seconds)
-
-    async def _replenish_pool(self) -> None:
-        target = self.settings.sandbox_pool_size
-        if target <= 0:
-            return
-
-        async with session_factory() as session:
-            current = await session.scalar(
-                select(func.count())
-                .select_from(Sandbox)
-                .where(Sandbox.status.in_(("pooled", "pooling")))
-            )
-        missing = target - int(current or 0)
-        if missing <= 0:
-            return
-
-        memory_mb = self.settings.default_sandbox_memory_mb
-        cpu = self.settings.default_sandbox_cpu
-
-        # One per pass. Replenishing is background work and the host is shared;
-        # starting the whole shortfall at once would spike exactly when demand
-        # already did.
-        capacity = await self.capacity()
-        # Warming is background work. If the CPU budget is already committed,
-        # the host is busy doing the thing the pool is meant to accelerate;
-        # adding a container start now makes it slower, not faster.
-        if capacity.reserved_cpu >= capacity.max_parallel_cpu - cpu:
-            return
-        decision = can_admit(
-            capacity,
-            incremental_memory_mb=memory_mb,
-            # Zero: a pooled sandbox runs nothing until it is adopted, and
-            # charging it CPU here is what would starve real executions.
-            incremental_cpu=0.0,
-            emergency_available_memory_mb=self.settings.emergency_available_memory_mb,
-        )
-        if not decision.admitted:
-            return
-
-        sandbox = Sandbox(
-            id=f"sbx_{uuid4().hex}",
-            status="pooling",
-            agent_token=secrets.token_urlsafe(32),
-            memory_mb=memory_mb,
-            cpu=cpu,
-            pids_limit=self.settings.sandbox_pids_limit,
-            # Never reaped while unassigned: the reaper only looks at "running",
-            # but a pooled sandbox that is adopted inherits the caller's timeout.
-            idle_timeout_seconds=0,
-            # The pool only warms the default, no-egress shape. A caller that
-            # wants egress gets a cold start rather than a sandbox that can
-            # reach more than the pool intended.
-            egress=False,
-            metadata_={},
-        )
-        async with session_factory() as session:
-            session.add(sandbox)
-            await session.commit()
-            await session.refresh(sandbox)
-
-        try:
-            started = await self.runtime.start_sandbox(sandbox)
-            async with session_factory() as session:
-                current_row = await session.get(Sandbox, sandbox.id)
-                if current_row is None:
-                    return
-                current_row.container_id = started.id
-                current_row.container_name = started.name
-                # Deliberately NOT "running": that state is summed into
-                # reserved_cpu, so warming the pool would take budget from the
-                # executions it exists to make faster. Measured before this was
-                # fixed: one batch of a refresh waited 57s behind pool warm-up.
-                current_row.status = "pooling"
-                current_row.last_activity_at = utc_now()
-                await session.commit()
-                await session.refresh(current_row)
-                ready = current_row
-            # Booted and answering before it is offered to anyone, which is the
-            # entire point: the caller must not wait on the agent either.
-            await self.runtime.wait_until_ready(ready)
-            async with session_factory() as session:
-                current_row = await session.get(Sandbox, sandbox.id)
-                if current_row is not None and current_row.status == "pooling":
-                    current_row.status = "pooled"
-                    await session.commit()
-        except Exception:
-            logger.exception("failed to start a pooled sandbox; discarding it")
-            await self._discard_pooled(sandbox.id)
-
-    async def _discard_pooled(self, sandbox_id: str) -> None:
-        async with session_factory() as session:
-            sandbox = await session.get(Sandbox, sandbox_id)
-            if sandbox is None:
-                return
-            try:
-                await self.runtime.kill(sandbox)
-            except Exception:
-                logger.exception("could not destroy pooled sandbox %s", sandbox_id)
-            sandbox.status = "failed"
-            await session.commit()
-
     async def _reaper_loop(self) -> None:
         while not self._stop.is_set():
             try:
+                await self._terminate_expired_sandboxes()
                 await self._cold_pause_idle_sandboxes()
+                await self._sweep_unused_templates()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("idle sandbox reaper failed")
             await asyncio.sleep(self.settings.reaper_poll_seconds)
+
+    async def _sweep_unused_templates(self) -> None:
+        """Reclaim derived template images on the reaper's existing cadence.
+
+        The reaper polls every second; the sweep is rate-limited to its own,
+        much longer interval rather than given a loop of its own.
+        """
+        if self.template_builder is None or not self.settings.template_gc_enabled:
+            return
+        now = asyncio.get_running_loop().time()
+        if (
+            self._last_template_sweep is not None
+            and now - self._last_template_sweep
+            < self.settings.template_gc_interval_seconds
+        ):
+            return
+        self._last_template_sweep = now
+        await self.template_builder.collect_unused_templates()
+
+    async def _terminate_expired_sandboxes(self) -> None:
+        now = utc_now()
+        async with session_factory() as session:
+            sandboxes = list(
+                (
+                    await session.scalars(
+                        select(Sandbox).where(
+                            Sandbox.status.not_in(("killed", "failed")),
+                            Sandbox.id.not_in(
+                                select(Execution.sandbox_id).where(
+                                    Execution.status.in_(ACTIVE_EXECUTION_STATES)
+                                )
+                            ),
+                        )
+                    )
+                ).all()
+            )
+        for sandbox in sandboxes:
+            expires_at = expiration(sandbox)
+            if expires_at is None or expires_at > now:
+                continue
+            await self.runtime.kill(sandbox)
+            async with session_factory() as session:
+                current = await session.get(Sandbox, sandbox.id)
+                if current is not None and current.status not in {"killed", "failed"}:
+                    current.status = "killed"
+                    current.container_id = None
+                    current.container_name = None
+                    current.metadata_ = dict(sandbox.metadata_)
+                    await session.commit()
 
     async def _cold_pause_idle_sandboxes(self) -> None:
         now = utc_now()
@@ -590,6 +556,9 @@ class Scheduler:
                 current = await session.get(Sandbox, sandbox.id)
                 if current is not None and current.status == "running":
                     current.status = "paused_cold"
+                    current.container_id = None
+                    current.container_name = None
+                    current.metadata_ = dict(sandbox.metadata_)
                     await session.commit()
 
     async def _recover_interrupted_jobs(self) -> None:
@@ -605,6 +574,18 @@ class Scheduler:
                         "value": "control plane restarted while execution was active",
                         "traceback": [],
                     },
+                )
+            )
+            # An image build cancelled mid-flight cannot reliably record its own
+            # failure, so a `building` row surviving a restart is stale. Failing
+            # it here makes it re-buildable: POST /v1/templates retries failures.
+            await session.execute(
+                update(SandboxTemplate)
+                .where(SandboxTemplate.status == "building")
+                .values(
+                    status="failed",
+                    error="control plane restarted while the image build was in flight",
+                    updated_at=utc_now(),
                 )
             )
             starting_sandboxes = list(

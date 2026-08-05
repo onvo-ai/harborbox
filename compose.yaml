@@ -1,13 +1,67 @@
 name: harborbox
 
+configs:
+  opensandbox-config:
+    content: |
+      [server]
+      host = "0.0.0.0"
+      port = 8080
+      max_sandbox_timeout_seconds = 86400
+
+      [log]
+      level = "INFO"
+
+      [runtime]
+      type = "docker"
+      execd_image = "opensandbox/execd:v1.0.21"
+
+      [store]
+      type = "sqlite"
+      path = "/var/lib/opensandbox/opensandbox.db"
+
+      [docker]
+      network_mode = "bridge"
+      host_ip = "host.docker.internal"
+      port_range_min = 40000
+      port_range_max = 60000
+      drop_capabilities = ["AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG"]
+      no_new_privileges = true
+      pids_limit = 4096
+
+      [ingress]
+      mode = "direct"
+
+      [egress]
+      image = "opensandbox/egress:v1.1.5"
+      mode = "dns"
+
 services:
-  sandbox-image:
-    image: harborbox-sandbox:local
+  # Image build target only. The inactive profile keeps it out of the normal
+  # runtime stack and out of OrbStack's container list.
+  sandbox-onvo-pro-image:
+    profiles: ["build"]
+    image: ${HARBORBOX_TEMPLATE_IMAGE_PREFIX:-harborbox-sandbox}-onvo-pro:${HARBORBOX_TEMPLATE_VERSION:-local}
     build:
       context: .
       dockerfile: sandbox/Dockerfile
-    entrypoint: ["/bin/true"]
-    restart: "no"
+      args:
+        SANDBOX_REQUIREMENTS: sandbox/requirements-onvo-pro.txt
+
+  sandbox-onvo-lite-image:
+    profiles: ["build"]
+    image: ${HARBORBOX_TEMPLATE_IMAGE_PREFIX:-harborbox-sandbox}-onvo-lite:${HARBORBOX_TEMPLATE_VERSION:-local}
+    build:
+      context: .
+      dockerfile: sandbox/Dockerfile
+      args:
+        SANDBOX_REQUIREMENTS: sandbox/requirements-onvo-lite.txt
+
+  sandbox-relaydeck-image:
+    profiles: ["build"]
+    image: ${HARBORBOX_TEMPLATE_IMAGE_PREFIX:-harborbox-sandbox}-relaydeck:${HARBORBOX_TEMPLATE_VERSION:-local}
+    build:
+      context: .
+      dockerfile: sandbox/Dockerfile.relaydeck
 
   postgres:
     image: postgres:17-alpine
@@ -29,34 +83,112 @@ services:
     networks:
       - control
 
+  opensandbox:
+    image: opensandbox/server:v0.2.2
+    environment:
+      SANDBOX_CONFIG_PATH: /etc/opensandbox/config.toml
+      OPENSANDBOX_SERVER_API_KEY: ${OPENSANDBOX_API_KEY:-change-me-opensandbox}
+    configs:
+      - source: opensandbox-config
+        target: /etc/opensandbox/config.toml
+    volumes:
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+      - opensandbox-state:/var/lib/opensandbox
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    mem_limit: 768m
+    memswap_limit: 768m
+    pids_limit: 512
+    restart: unless-stopped
+    networks:
+      - control
+
   api:
     image: harborbox-api:local
     build:
       context: .
       dockerfile: Dockerfile.api
     depends_on:
-      sandbox-image:
-        condition: service_completed_successfully
       postgres:
+        condition: service_healthy
+      opensandbox:
         condition: service_healthy
     environment:
       HARBORBOX_API_KEY: ${HARBORBOX_API_KEY:-change-me}
+      HARBORBOX_EXECUTION_SECRET_KEY: ${HARBORBOX_EXECUTION_SECRET_KEY:-local-development-secret-change-me}
       HARBORBOX_DATABASE_URL: postgresql+asyncpg://harborbox:${POSTGRES_PASSWORD:-harborbox}@postgres/harborbox
-      HARBORBOX_SANDBOX_IMAGE: harborbox-sandbox:local
+      HARBORBOX_RUNTIME_PROVIDER: opensandbox
+      HARBORBOX_OPENSANDBOX_DOMAIN: opensandbox:8080
+      HARBORBOX_OPENSANDBOX_PROTOCOL: http
+      HARBORBOX_OPENSANDBOX_API_KEY: ${OPENSANDBOX_API_KEY:-change-me-opensandbox}
+      HARBORBOX_OPENSANDBOX_USE_SERVER_PROXY: "true"
+      HARBORBOX_OPENSANDBOX_READY_TIMEOUT_SECONDS: ${HARBORBOX_OPENSANDBOX_READY_TIMEOUT_SECONDS:-30}
+      HARBORBOX_OPENSANDBOX_SNAPSHOT_TIMEOUT_SECONDS: ${HARBORBOX_OPENSANDBOX_SNAPSHOT_TIMEOUT_SECONDS:-300}
+      HARBORBOX_SANDBOX_IMAGE: ${HARBORBOX_TEMPLATE_IMAGE_PREFIX:-harborbox-sandbox}-onvo-lite:${HARBORBOX_TEMPLATE_VERSION:-local}
+      HARBORBOX_ONVO_PRO_IMAGE: ${HARBORBOX_TEMPLATE_IMAGE_PREFIX:-harborbox-sandbox}-onvo-pro:${HARBORBOX_TEMPLATE_VERSION:-local}
+      HARBORBOX_ONVO_LITE_IMAGE: ${HARBORBOX_TEMPLATE_IMAGE_PREFIX:-harborbox-sandbox}-onvo-lite:${HARBORBOX_TEMPLATE_VERSION:-local}
+      HARBORBOX_RELAYDECK_IMAGE: ${HARBORBOX_TEMPLATE_IMAGE_PREFIX:-harborbox-sandbox}-relaydeck:${HARBORBOX_TEMPLATE_VERSION:-local}
+      HARBORBOX_TEMPLATE_IMAGE_PREFIX: ${HARBORBOX_TEMPLATE_IMAGE_PREFIX:-harborbox-sandbox}
+      HARBORBOX_TEMPLATE_VERSION: ${HARBORBOX_TEMPLATE_VERSION:-local}
+      HARBORBOX_TEMPLATE_APT_ALLOWLIST: ${HARBORBOX_TEMPLATE_APT_ALLOWLIST:-["ca-certificates","chromium","default-mysql-client","fonts-liberation","fonts-noto-core","postgresql-client","redis-tools"]}
+      HARBORBOX_TEMPLATE_NPM_ALLOWLIST: ${HARBORBOX_TEMPLATE_NPM_ALLOWLIST:-["@playwright/mcp"]}
+      HARBORBOX_TEMPLATE_MAX_APT_PACKAGES: ${HARBORBOX_TEMPLATE_MAX_APT_PACKAGES:-40}
+      HARBORBOX_TEMPLATE_MAX_NPM_PACKAGES: ${HARBORBOX_TEMPLATE_MAX_NPM_PACKAGES:-20}
+      HARBORBOX_TEMPLATE_MAX_ENV_VARS: ${HARBORBOX_TEMPLATE_MAX_ENV_VARS:-32}
+      HARBORBOX_TEMPLATE_BUILD_TIMEOUT_SECONDS: ${HARBORBOX_TEMPLATE_BUILD_TIMEOUT_SECONDS:-1800}
+      HARBORBOX_TEMPLATE_GC_ENABLED: ${HARBORBOX_TEMPLATE_GC_ENABLED:-true}
+      HARBORBOX_TEMPLATE_GC_MAX_IDLE_DAYS: ${HARBORBOX_TEMPLATE_GC_MAX_IDLE_DAYS:-14}
+      HARBORBOX_TEMPLATE_GC_INTERVAL_SECONDS: ${HARBORBOX_TEMPLATE_GC_INTERVAL_SECONDS:-3600}
+      HARBORBOX_WARM_POOL_ENABLED: ${HARBORBOX_WARM_POOL_ENABLED:-true}
+      HARBORBOX_WARM_POOL_RELAYDECK: ${HARBORBOX_WARM_POOL_RELAYDECK:-2}
+      HARBORBOX_WARM_POOL_ONVO_PRO: ${HARBORBOX_WARM_POOL_ONVO_PRO:-1}
+      HARBORBOX_WARM_POOL_ONVO_LITE: ${HARBORBOX_WARM_POOL_ONVO_LITE:-0}
+      HARBORBOX_WARM_POOL_WARMUP_CONCURRENCY: ${HARBORBOX_WARM_POOL_WARMUP_CONCURRENCY:-2}
+      HARBORBOX_WARM_POOL_RECONCILE_SECONDS: ${HARBORBOX_WARM_POOL_RECONCILE_SECONDS:-2}
+      HARBORBOX_WARM_POOL_IDLE_TTL_SECONDS: ${HARBORBOX_WARM_POOL_IDLE_TTL_SECONDS:-900}
+      HARBORBOX_WARM_POOL_RELEASE_AFTER_INACTIVITY_SECONDS: ${HARBORBOX_WARM_POOL_RELEASE_AFTER_INACTIVITY_SECONDS:-300}
+      HARBORBOX_WARM_POOL_RELEASE_ON_SHUTDOWN: ${HARBORBOX_WARM_POOL_RELEASE_ON_SHUTDOWN:-true}
+      HARBORBOX_RELAYDECK_TEMPLATE_MEMORY_MB: ${HARBORBOX_RELAYDECK_TEMPLATE_MEMORY_MB:-256}
+      HARBORBOX_RELAYDECK_TEMPLATE_CPU: ${HARBORBOX_RELAYDECK_TEMPLATE_CPU:-0.5}
+      HARBORBOX_ONVO_PRO_TEMPLATE_MEMORY_MB: ${HARBORBOX_ONVO_PRO_TEMPLATE_MEMORY_MB:-1024}
+      HARBORBOX_ONVO_PRO_TEMPLATE_CPU: ${HARBORBOX_ONVO_PRO_TEMPLATE_CPU:-2}
+      HARBORBOX_ONVO_LITE_TEMPLATE_MEMORY_MB: ${HARBORBOX_ONVO_LITE_TEMPLATE_MEMORY_MB:-1024}
+      HARBORBOX_ONVO_LITE_TEMPLATE_CPU: ${HARBORBOX_ONVO_LITE_TEMPLATE_CPU:-2}
       HARBORBOX_SANDBOX_NETWORK: harborbox-net
-      HARBORBOX_SANDBOX_EGRESS_NETWORK: ${HARBORBOX_SANDBOX_EGRESS_NETWORK:-}
+      HARBORBOX_SANDBOX_EGRESS_NETWORK: harborbox-egress
       HARBORBOX_SANDBOX_RUNTIME: ${HARBORBOX_SANDBOX_RUNTIME:-}
       HARBORBOX_HOST_MEMORY_RESERVE_PERCENT: ${HARBORBOX_HOST_MEMORY_RESERVE_PERCENT:-25}
       HARBORBOX_HOST_MEMORY_RESERVE_MIN_MB: ${HARBORBOX_HOST_MEMORY_RESERVE_MIN_MB:-1024}
       HARBORBOX_PLATFORM_MEMORY_RESERVE_MB: ${HARBORBOX_PLATFORM_MEMORY_RESERVE_MB:-512}
       HARBORBOX_EMERGENCY_AVAILABLE_MEMORY_MB: ${HARBORBOX_EMERGENCY_AVAILABLE_MEMORY_MB:-512}
-      HARBORBOX_DEFAULT_SANDBOX_MEMORY_MB: ${HARBORBOX_DEFAULT_SANDBOX_MEMORY_MB:-512}
+      # This is an admission ceiling, not a reservation. With no running
+      # sandboxes Harborbox allocates 0 MB of this budget.
+      HARBORBOX_SANDBOX_MEMORY_BUDGET_MB: ${HARBORBOX_SANDBOX_MEMORY_BUDGET_MB:-4096}
+      HARBORBOX_DEFAULT_SANDBOX_MEMORY_MB: ${HARBORBOX_ONVO_SANDBOX_MEMORY_MB:-1024}
       HARBORBOX_MAX_SANDBOX_MEMORY_MB: ${HARBORBOX_MAX_SANDBOX_MEMORY_MB:-4096}
+      HARBORBOX_DEFAULT_SANDBOX_CPU: ${HARBORBOX_ONVO_SANDBOX_CPU:-2}
       HARBORBOX_MAX_PARALLEL_CPU: ${HARBORBOX_MAX_PARALLEL_CPU:-4}
-      HARBORBOX_MAX_CONCURRENT_EXECUTIONS_PER_SANDBOX: ${HARBORBOX_MAX_CONCURRENT_EXECUTIONS_PER_SANDBOX:-1}
+      HARBORBOX_MAX_CONCURRENT_EXECUTIONS_PER_SANDBOX: ${HARBORBOX_ONVO_CONCURRENCY:-2}
+      # Match the deployed defaults. At 0.05 the scheduler ran `capacity()` —
+      # two memory probes and two aggregates — 20x a second on an empty queue,
+      # which idled at ~20% CPU and 27 database transactions per second against
+      # internal-tools' 7.5% and 4.4. The cost of 0.25 is up to 200ms of extra
+      # pickup latency, against seconds of sandbox startup.
+      HARBORBOX_SCHEDULER_POLL_SECONDS: ${HARBORBOX_SCHEDULER_POLL_SECONDS:-0.25}
+      HARBORBOX_REAPER_POLL_SECONDS: ${HARBORBOX_REAPER_POLL_SECONDS:-5}
       HARBORBOX_MAX_UPLOAD_BYTES: ${HARBORBOX_MAX_UPLOAD_BYTES:-157286400}
-      HARBORBOX_DEFAULT_IDLE_TIMEOUT_SECONDS: ${HARBORBOX_DEFAULT_IDLE_TIMEOUT_SECONDS:-300}
+      HARBORBOX_DEFAULT_IDLE_TIMEOUT_SECONDS: ${HARBORBOX_ONVO_IDLE_TIMEOUT_SECONDS:-1200}
     volumes:
+      # Required by POST /v1/templates: the API builds derived template images
+      # itself. This grants the API host-level Docker control, which it did not
+      # previously have — see the deployment notes in README.md. Set
+      # HARBORBOX_TEMPLATE_GC_ENABLED and the template endpoints aside and drop
+      # this mount if you do not use derived templates.
       - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
     ports:
       - "127.0.0.1:${HARBORBOX_PORT:-8000}:8000"
@@ -73,14 +205,11 @@ services:
       control:
         aliases:
           - harborbox-api
-      sandboxes:
 
 volumes:
   harborbox-postgres:
+  opensandbox-state:
 
 networks:
   control:
     name: harborbox-control
-  sandboxes:
-    name: harborbox-net
-    internal: true
