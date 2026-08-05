@@ -63,7 +63,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      HARBORBOX_API_KEY: ${SERVICE_PASSWORD_64_HARBORBOXAPI}
+      HARBORBOX_API_KEY: ${SERVICE_PASSWORD_64_HARBORBOXAPI:?refusing to start with no API key - every sandbox call would 401. Set it in .env from Infisical Onvo/staging HARBORBOX_API_KEY.}
       HARBORBOX_DATABASE_URL: postgresql+asyncpg://harborbox:${SERVICE_PASSWORD_HARBORBOXDB}@postgres/harborbox
       HARBORBOX_SANDBOX_IMAGE: harborbox-sandbox-onvo:local
       HARBORBOX_SANDBOX_NETWORK: harborbox-net
