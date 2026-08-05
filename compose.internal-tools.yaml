@@ -223,7 +223,12 @@ services:
       HARBORBOX_DEFAULT_SANDBOX_MEMORY_MB: ${HARBORBOX_ONVO_SANDBOX_MEMORY_MB:-768}
       HARBORBOX_DEFAULT_SANDBOX_CPU: ${HARBORBOX_ONVO_SANDBOX_CPU:-1}
       HARBORBOX_MAX_SANDBOX_MEMORY_MB: ${HARBORBOX_MAX_SANDBOX_MEMORY_MB:-2048}
-      HARBORBOX_MAX_PARALLEL_CPU: ${HARBORBOX_MAX_PARALLEL_CPU:-8}
+      # Raised from 8 to 10 to hold the old eight execution slots after the warm
+      # pool started charging CPU. The host has 8 cores and shares them with the
+      # Trigger stack, so this is deliberately an admission ceiling rather than
+      # a promise of parallelism — the same over-commit the old pool made
+      # implicitly by running four warm sandboxes outside the budget entirely.
+      HARBORBOX_MAX_PARALLEL_CPU: ${HARBORBOX_MAX_PARALLEL_CPU:-10}
       HARBORBOX_MAX_CONCURRENT_EXECUTIONS_PER_SANDBOX: ${HARBORBOX_ONVO_CONCURRENCY:-2}
       # Warm pools. HARBORBOX_SANDBOX_POOL_SIZE used to sit here warming 4
       # sandboxes; that pool matched on (memory_mb, cpu, egress) and carried no
@@ -237,7 +242,14 @@ services:
       # onvo-pro is used here — Onvo's client sends it for every widget — so the
       # other two warm nothing rather than holding memory for callers that do
       # not exist.
-      HARBORBOX_WARM_POOL_ONVO_PRO: ${HARBORBOX_WARM_POOL_ONVO_PRO:-2}
+      # One, not two, and the difference is CPU. The old pool held a memory
+      # reservation but deliberately no CPU budget, so four warm sandboxes cost
+      # nothing in admission terms. 0.2.0's pool reserves both — `capacity()`
+      # adds warm_pool.cpu to reserved_cpu — so each warm onvo-pro takes a whole
+      # slot out of MAX_PARALLEL_CPU. At two, a 43-widget refresh had six slots
+      # instead of eight and spent its time queued: measured executions ran in
+      # ~200ms while whole batches took 178s, against 13-22s before.
+      HARBORBOX_WARM_POOL_ONVO_PRO: ${HARBORBOX_WARM_POOL_ONVO_PRO:-1}
       HARBORBOX_WARM_POOL_ONVO_LITE: ${HARBORBOX_WARM_POOL_ONVO_LITE:-0}
       HARBORBOX_WARM_POOL_RELAYDECK: ${HARBORBOX_WARM_POOL_RELAYDECK:-0}
       #
