@@ -235,8 +235,18 @@ class OpenSandboxRuntime:
             self._raise_runtime_error(exc, sandbox)
 
     async def wait_until_ready(self, sandbox: Sandbox) -> None:
-        handle = await self._get_handle(sandbox, check_ready=True)
-        await self._wait_python_ready(sandbox, handle)
+        """Ready means the container answers — deliberately not the kernel.
+
+        Waiting for Jupyter here cost every sandbox ~6-11s of boot and kernel
+        spawn, and Onvo never uses the kernel: its client uploads a script and
+        runs it through /v1/sandboxes/{id}/commands, reading only stdout. So the
+        whole cost was paid for a capability the one caller does not touch, and
+        it showed up as a ~10x regression on dashboard refreshes.
+
+        `execute_code` waits for the kernel itself, so the callers that do use
+        Python contexts still get a clear failure instead of a race.
+        """
+        await self._get_handle(sandbox, check_ready=True)
 
     async def _wait_python_ready(self, sandbox: Sandbox, handle: OpenSandbox) -> None:
         """Wait for the Jupyter kernel, not just the container.
@@ -306,6 +316,9 @@ class OpenSandboxRuntime:
                 cwd="/workspace",
             )
         handle = await self._get_handle(sandbox, check_ready=True)
+        # Paid here rather than at sandbox-ready, so only callers that actually
+        # run Python through a kernel wait for one to exist.
+        await self._wait_python_ready(sandbox, handle)
         output = _BoundedOutput(request.max_output_bytes)
         try:
             interpreter = await CodeInterpreter.create(handle)

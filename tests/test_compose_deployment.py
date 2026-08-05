@@ -216,3 +216,44 @@ def test_jupyter_flags_live_in_the_entrypoint_not_only_the_image() -> None:
 
     assert entrypoint[0].endswith("jupyter")
     assert "--IdentityProvider.token=" in entrypoint
+
+
+def test_sandbox_readiness_does_not_wait_for_a_jupyter_kernel() -> None:
+    """Readiness must not include the kernel, because Onvo never uses it.
+
+    Onvo's client uploads a script and runs it through
+    /v1/sandboxes/{id}/commands, reading only stdout — the Jupyter path is
+    never touched. Waiting for a kernel in `wait_until_ready` therefore charged
+    every sandbox ~6-11s of Jupyter boot and kernel spawn for a capability the
+    only caller does not use, and turned a dashboard refresh from ~15s a batch
+    into ~190s.
+
+    `execute_code` still waits, so callers that do run Python through a kernel
+    get a clear failure rather than a race.
+    """
+    import inspect
+
+    from harborbox.opensandbox_runtime import OpenSandboxRuntime
+
+    ready = inspect.getsource(OpenSandboxRuntime.wait_until_ready)
+    execute = inspect.getsource(OpenSandboxRuntime.execute_code)
+
+    assert "_wait_python_ready" not in ready, (
+        "wait_until_ready waits for a Jupyter kernel again; that cost is paid "
+        "by every sandbox, including the ones that only ever run commands."
+    )
+    assert "_wait_python_ready" in execute
+
+
+def test_forkrun_is_installed_in_the_sandbox_image() -> None:
+    """The pre-warmed script runner is what makes a batch fast.
+
+    `import pandas` costs ~1.5s and a batch runs eight scripts in one sandbox.
+    The client guards with `[ -f /opt/forkrun.py ]`, so dropping it does not
+    fail anything — widgets just quietly pay the import every time.
+    """
+    dockerfile = (
+        Path(__file__).resolve().parent.parent / "sandbox" / "Dockerfile"
+    ).read_text()
+
+    assert "COPY sandbox/forkrun.py /opt/forkrun.py" in dockerfile

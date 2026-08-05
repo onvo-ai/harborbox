@@ -35,6 +35,15 @@ RUN if /opt/venv/bin/python -c "import ipykernel" 2>/dev/null; then \
       /opt/venv/bin/python -m ipykernel install --sys-prefix --name python --display-name "Python"; \
     fi
 
+# The pre-warmed script runner. Onvo does not use the Jupyter path at all — it
+# uploads a script and runs it through /v1/sandboxes/{id}/commands — so this,
+# not the kernel, is what makes a batch fast: `import pandas` costs ~1.5s and a
+# batch runs eight scripts, which forkrun pays once by forking each run from a
+# daemon that has already imported. Dropping it in the 0.2.0 rebase is why
+# widgets got slower; the client's `[ -f /opt/forkrun.py ]` guard meant they
+# still ran, just paying the import every time.
+COPY sandbox/forkrun.py /opt/forkrun.py
+
 WORKDIR /workspace
 USER 10001:10001
 
