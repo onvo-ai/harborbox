@@ -32,6 +32,7 @@ RUN /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt \
 # venv, so it survives the ephemeral JUPYTER_DATA_DIR set below.
 RUN if /opt/venv/bin/python -c "import ipykernel" 2>/dev/null; then \
       /opt/venv/bin/python -m ipykernel install --sys-prefix --name python3 --display-name "Python 3"; \
+      /opt/venv/bin/python -m ipykernel install --sys-prefix --name python --display-name "Python"; \
     fi
 
 WORKDIR /workspace

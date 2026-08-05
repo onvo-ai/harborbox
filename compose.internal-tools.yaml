@@ -190,6 +190,11 @@ services:
       HARBORBOX_RUNTIME_PROVIDER: opensandbox
       HARBORBOX_OPENSANDBOX_DOMAIN: opensandbox:8080
       HARBORBOX_OPENSANDBOX_PROTOCOL: http
+      # opensandbox v0.2.2's proxy 500s on execd's streaming /code endpoint
+      # ("An internal error occurred in the proxy") while /ping through the same
+      # proxy is fine. Python execution therefore goes straight to the execd
+      # port opensandbox publishes, which is what extra_hosts below is for.
+      HARBORBOX_OPENSANDBOX_USE_SERVER_PROXY: "false"
       HARBORBOX_OPENSANDBOX_API_KEY: ${SERVICE_PASSWORD_64_OPENSANDBOXAPI:?refusing to start with no opensandbox key - the API would fail every sandbox create against the runtime.}
       # Static template images, built above. These three names are what
       # `image_for_template` resolves for onvo-pro/onvo-lite/relaydeck.
@@ -248,6 +253,10 @@ services:
       # Leave headroom for the Trigger stack, which shares this host.
       HARBORBOX_HOST_MEMORY_RESERVE_PERCENT: ${HARBORBOX_HOST_MEMORY_RESERVE_PERCENT:-25}
       HARBORBOX_PLATFORM_MEMORY_RESERVE_MB: ${HARBORBOX_PLATFORM_MEMORY_RESERVE_MB:-1024}
+    extra_hosts:
+      # Reaching the published execd port needs the host gateway; see
+      # HARBORBOX_OPENSANDBOX_USE_SERVER_PROXY above.
+      - "host.docker.internal:host-gateway"
     volumes:
       # Still required, though no longer for running sandboxes — opensandbox
       # does that now. The API builds derived template images (POST

@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     # host from the image's env, and this decides what actually listens.
     sandbox_jupyter_port: int = Field(default=8888, ge=1, le=65535)
     templates_without_python: frozenset[str] = frozenset({"relaydeck"})
+    # DEBUG makes the sandbox's Jupyter log every request, which is the only
+    # way to see what execd actually asks for from outside the binary.
+    sandbox_jupyter_log_level: str = "INFO"
     # Cold sandboxes race their own Jupyter server; execd only retries for
     # ~12s. Measured cold start is well under a minute, so this is generous
     # rather than tuned — a sandbox that has not got a kernel by now is broken,
@@ -198,6 +201,7 @@ class Settings(BaseSettings):
             # list, so a flag added there alone does nothing.
             "--IdentityProvider.token=",
             "--ServerApp.disable_check_xsrf=True",
+            f"--ServerApp.log_level={self.sandbox_jupyter_log_level}",
         ]
 
     def is_known_template_name(self, template: str) -> bool:

@@ -180,3 +180,39 @@ def test_onvo_pro_sizing_fits_the_configured_cpu_budget(settings: Settings) -> N
         f"{budget} CPU budget at {per_sandbox} per onvo-pro sandbox allows only "
         f"{budget / per_sandbox:.0f} concurrent; this host has run 8."
     )
+
+
+def test_python_kernelspec_is_registered_under_the_language_name() -> None:
+    """execd looks a kernel up by the language it was asked for.
+
+    The SDK's default context language is `python`, and execd resolves that
+    against Jupyter's kernelspec *names*. `ipykernel install` registers
+    `python3` only, so execd fetched `/api/kernelspecs`, got a 200 listing
+    python3, found nothing called `python`, and reported `no kernel specs
+    found` — which reads like Jupyter is missing and is really a name mismatch.
+    Registering both names is what made execution work.
+    """
+    dockerfile = (
+        Path(__file__).resolve().parent.parent / "sandbox" / "Dockerfile"
+    ).read_text()
+
+    assert "--name python3" in dockerfile
+    assert "--name python " in dockerfile, (
+        "only python3 is registered; execd asks for a kernel named 'python' "
+        "and will report 'no kernel specs found'"
+    )
+
+
+def test_jupyter_flags_live_in_the_entrypoint_not_only_the_image() -> None:
+    """opensandbox discards the image CMD and runs the create request's list.
+
+    Flags added to the Dockerfile alone silently do nothing, which cost an
+    afternoon: token auth stayed on because `--IdentityProvider.token=` was in
+    the CMD and not in what actually ran.
+    """
+    from harborbox.config import Settings
+
+    entrypoint = Settings().entrypoint_for_template("onvo-pro")
+
+    assert entrypoint[0].endswith("jupyter")
+    assert "--IdentityProvider.token=" in entrypoint
