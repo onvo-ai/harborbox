@@ -30,4 +30,8 @@ RUN /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt \
 WORKDIR /workspace
 USER 10001:10001
 
+# Keeps Coolify's nightly `docker rmi` sweep off this image regardless of
+# whether a container is holding it. See the note in `sandbox/Dockerfile`.
+LABEL coolify.managed=true
+
 CMD ["tail", "-f", "/dev/null"]

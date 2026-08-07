@@ -320,3 +320,32 @@ def test_the_api_does_not_wait_for_the_image_holders_to_exit(compose: dict) -> N
             f"api waits for {name} to complete, but {name} is a long-lived "
             f"container by design."
         )
+
+
+def test_built_images_carry_the_label_that_survives_coolify_cleanup(
+    compose: dict,
+) -> None:
+    """The other half of the prune fix, and the half that needs no container.
+
+    Coolify's `CleanupDocker` runs a plain `docker rmi` over every image that is
+    neither named after an application repo nor labelled `coolify.managed=true`.
+    The keeper containers above defeat that too, but only while they are up —
+    a `docker stop` puts the image back on death row for the next 00:00 UTC
+    sweep. The label does not care about container state.
+    """
+    root = Path(__file__).resolve().parent.parent
+
+    dockerfiles = {
+        svc["build"]["dockerfile"]
+        for svc in compose["services"].values()
+        if isinstance(svc.get("build"), dict) and svc["build"].get("dockerfile")
+    }
+    assert dockerfiles, "no build targets found; this test would pass vacuously."
+
+    for name in sorted(dockerfiles):
+        body = (root / name).read_text()
+        assert "LABEL coolify.managed=true" in body, (
+            f"{name} builds an image on the host, and Coolify's nightly cleanup "
+            f"deletes host-built images that carry no `coolify.managed` label. "
+            f"A deleted one has no registry to be pulled back from."
+        )

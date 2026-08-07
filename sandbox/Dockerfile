@@ -81,6 +81,19 @@ ENV JUPYTER_HOST=http://127.0.0.1:8888 \
     JUPYTER_RUNTIME_DIR=/tmp/jupyter-runtime \
     JUPYTER_DATA_DIR=/tmp/jupyter-data
 
+# Tells Coolify's nightly cleanup to leave this image alone.
+#
+# `CleanupDocker` runs a plain `docker rmi` over every image that is neither
+# named after an application repo nor carrying this label. An image built on the
+# host has no registry to come back from, so what follows is a sandbox create
+# reporting `404 pull access denied` for a name that never existed upstream.
+#
+# This is the second of two guards and the sturdier one. The keeper container in
+# `compose.internal-tools.yaml` also protects the image, but only for as long as
+# it is running — `docker stop` on it and the next 00:00 UTC cleanup wins. This
+# label holds regardless of container state.
+LABEL coolify.managed=true
+
 CMD ["jupyter", "server", \
      "--ip=127.0.0.1", \
      "--port=8888", \

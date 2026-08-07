@@ -32,5 +32,13 @@ RUN pip install --upgrade pip \
     && pip install .
 
 EXPOSE 8000
+
+# Keeps Coolify's nightly `docker rmi` sweep off this image. It sits in the same
+# candidate list as the sandbox templates — `harborbox-api` matches neither the
+# application repo name (the app uuid) nor the helper/realtime exclusions — and
+# has survived only because its container happens to be running. See the note in
+# `sandbox/Dockerfile`.
+LABEL coolify.managed=true
+
 CMD ["uvicorn", "harborbox.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
