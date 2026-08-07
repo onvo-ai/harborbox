@@ -319,6 +319,29 @@ services:
     memswap_limit: 768m
     pids_limit: 256
     restart: unless-stopped
+    labels:
+      # Publishes exactly one path — GET /health — at harborbox.onvo.ai, so
+      # Uptime Kuma can probe it from another host. Everything else stays
+      # unroutable from the internet: the rule uses `Path`, which is an exact
+      # match, not `PathPrefix`. Do not relax it to PathPrefix(`/`) — this API
+      # holds the docker socket, and /v1/sandboxes would then be one guessed
+      # HARBORBOX_API_KEY away from arbitrary code execution on this host.
+      #
+      # Router names are explicit and unique (`harborbox-health`) because
+      # Coolify generates its own `http-0-<uuid>` / `https-0-<uuid>` routers
+      # and will clobber same-named ones on redeploy.
+      #
+      # traefik.docker.network is required: this container sits on four
+      # networks and Traefik picks one arbitrarily without it. It must name the
+      # network coolify-proxy actually shares with the API.
+      - traefik.enable=true
+      - traefik.docker.network=u95r9dynmb7i2kn945n61qiq
+      - traefik.http.routers.harborbox-health.rule=Host(`harborbox.onvo.ai`) && Path(`/health`)
+      - traefik.http.routers.harborbox-health.entryPoints=https
+      - traefik.http.routers.harborbox-health.tls=true
+      - traefik.http.routers.harborbox-health.tls.certresolver=letsencrypt
+      - traefik.http.routers.harborbox-health.service=harborbox-health
+      - traefik.http.services.harborbox-health.loadbalancer.server.port=8000
     networks:
       # Each entry carries an alias deliberately. Coolify's compose rewriter
       # drops service network entries whose value is null, which silently left
