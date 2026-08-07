@@ -257,3 +257,66 @@ def test_forkrun_is_installed_in_the_sandbox_image() -> None:
     ).read_text()
 
     assert "COPY sandbox/forkrun.py /opt/forkrun.py" in dockerfile
+
+
+def test_built_template_images_are_held_open_by_a_running_container(
+    compose: dict, settings: Settings
+) -> None:
+    """The second outage, pinned: images that nothing references get pruned.
+
+    This host runs Coolify's *forced* docker cleanup on `0 0 * * *` — forced, so
+    the 80% disk threshold never gets a vote — and that cleanup prunes stopped
+    containers and then runs `docker image prune -af`: delete every image no
+    container refers to. The API creates sandboxes from these images at runtime,
+    which is a `docker create` against a name, not a standing reference. So a
+    build target that exits after building holds nothing open, and at midnight
+    its tag is gone. The next widget got
+
+        Failed to pull image harborbox-sandbox-onvo-pro:coolify: 404 ...
+        pull access denied for harborbox-sandbox-onvo-pro
+
+    because a locally-built name has no registry to fall back to.
+
+    A running container is the reference prune honours. Nothing here needs the
+    container to *do* anything — only to still exist at 00:00 UTC.
+    """
+    for template in settings.template_images:
+        image = settings.image_for_template(template)
+        holders = {
+            name: svc
+            for name, svc in compose["services"].items()
+            if resolve(svc.get("image", "")) == image
+        }
+        assert holders, f"nothing in {COMPOSE.name} declares {image!r}."
+
+        for name, svc in holders.items():
+            assert svc.get("restart") in {"always", "unless-stopped"}, (
+                f"{name} builds {image!r} but does not restart, so a reboot or "
+                f"a cleanup leaves the image unreferenced until the next deploy."
+            )
+            assert svc.get("entrypoint") != ["/bin/true"], (
+                f"{name} exits as soon as it builds {image!r}. The nightly "
+                f"`docker image prune -af` then deletes the image and every "
+                f"sandbox create fails until someone redeploys."
+            )
+
+
+def test_the_api_does_not_wait_for_the_image_holders_to_exit(compose: dict) -> None:
+    """`service_completed_successfully` on a container that never exits hangs.
+
+    The two halves of the fix above live in different blocks of the same file:
+    make the build targets long-lived without loosening this condition and the
+    deploy waits forever for an exit code that is never coming.
+    """
+    holders = {
+        name
+        for name, svc in compose["services"].items()
+        if "build" in svc and svc.get("restart") in {"always", "unless-stopped"}
+    }
+    depends_on = compose["services"]["api"]["depends_on"]
+
+    for name in holders & set(depends_on):
+        assert depends_on[name]["condition"] != "service_completed_successfully", (
+            f"api waits for {name} to complete, but {name} is a long-lived "
+            f"container by design."
+        )

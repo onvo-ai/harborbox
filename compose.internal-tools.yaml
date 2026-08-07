@@ -76,6 +76,27 @@ services:
   # Derived templates (POST /v1/templates) are built at runtime by the API from
   # these bases, which is why HARBORBOX_TEMPLATE_IMAGE_PREFIX and
   # HARBORBOX_TEMPLATE_VERSION below must agree with the tags built here.
+  #
+  # **These three idle forever instead of exiting, and that is the whole point.**
+  # They used to be `entrypoint: /bin/true` + `restart: "no"`: build the image,
+  # exit 0, done. That lost the images every night. This server has Coolify's
+  # *forced* docker cleanup on `0 0 * * *` (`force_docker_cleanup: true`, so the
+  # 80% disk threshold never gets a vote), which prunes stopped containers and
+  # then runs `docker image prune -af` — delete every image no container refers
+  # to. Nothing refers to these: the API launches sandboxes from them at runtime
+  # through opensandbox, which is a `docker create` against a name, not a
+  # standing reference. So at 00:00 UTC the tags vanished, and the next sandbox
+  # create fell through to a registry pull of a locally-built name:
+  #
+  #   Failed to pull image harborbox-sandbox-onvo-pro:coolify: 404 ...
+  #   pull access denied for harborbox-sandbox-onvo-pro, repository does not
+  #   exist or may require 'docker login'
+  #
+  # which Trigger surfaced to the dashboard as "Harborbox sandbox failed to
+  # become ready" on every widget. A *running* container is the reference prune
+  # honours, so each build target now holds its own image open. `tail -f` and
+  # not the image's own CMD: sandbox/Dockerfile starts a Jupyter server, and
+  # paying ~150MB three times over to pin three tags would be absurd.
   sandbox-onvo-pro-image:
     image: harborbox-sandbox-onvo-pro:${HARBORBOX_IMAGE_TAG:-local}
     build:
@@ -83,8 +104,9 @@ services:
       dockerfile: sandbox/Dockerfile
       args:
         SANDBOX_REQUIREMENTS: sandbox/requirements-onvo-pro.txt
-    entrypoint: ["/bin/true"]
-    restart: "no"
+    entrypoint: ["tail", "-f", "/dev/null"]
+    restart: unless-stopped
+    mem_limit: 32m
 
   sandbox-onvo-lite-image:
     image: harborbox-sandbox-onvo-lite:${HARBORBOX_IMAGE_TAG:-local}
@@ -93,16 +115,18 @@ services:
       dockerfile: sandbox/Dockerfile
       args:
         SANDBOX_REQUIREMENTS: sandbox/requirements-onvo-lite.txt
-    entrypoint: ["/bin/true"]
-    restart: "no"
+    entrypoint: ["tail", "-f", "/dev/null"]
+    restart: unless-stopped
+    mem_limit: 32m
 
   sandbox-relaydeck-image:
     image: harborbox-sandbox-relaydeck:${HARBORBOX_IMAGE_TAG:-local}
     build:
       context: .
       dockerfile: sandbox/Dockerfile.relaydeck
-    entrypoint: ["/bin/true"]
-    restart: "no"
+    entrypoint: ["tail", "-f", "/dev/null"]
+    restart: unless-stopped
+    mem_limit: 32m
 
   postgres:
     image: postgres:17-alpine
@@ -159,12 +183,17 @@ services:
       context: .
       dockerfile: Dockerfile.api
     depends_on:
+      # `service_started`, not `service_completed_successfully`: these three no
+      # longer exit (see the note above them), and waiting for a container that
+      # idles by design to complete would hang every deploy forever. Compose
+      # builds all images before it starts any container, so a started keeper
+      # already proves its image was built.
       sandbox-onvo-pro-image:
-        condition: service_completed_successfully
+        condition: service_started
       sandbox-onvo-lite-image:
-        condition: service_completed_successfully
+        condition: service_started
       sandbox-relaydeck-image:
-        condition: service_completed_successfully
+        condition: service_started
       postgres:
         condition: service_healthy
       opensandbox:
