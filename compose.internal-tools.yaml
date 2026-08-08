@@ -342,6 +342,36 @@ services:
       - traefik.http.routers.harborbox-health.tls.certresolver=letsencrypt
       - traefik.http.routers.harborbox-health.service=harborbox-health
       - traefik.http.services.harborbox-health.loadbalancer.server.port=8000
+      #
+      # A second router publishes the API itself — /v1 only — for Onvo Lite,
+      # which runs on onvo-production (188.245.108.57) and so cannot use the
+      # internal http://harborbox:8000 the way Trigger can from this host.
+      #
+      # Read the warning above before touching this. The docker socket makes an
+      # open /v1 an arbitrary-code-execution surface, so the route is NOT open:
+      #
+      #  1. It hangs off harborbox-api.onvo.ai, which is DNS-only in Cloudflare
+      #     (grey cloud), NOT proxied. That is load-bearing: harborbox.onvo.ai
+      #     IS proxied, and behind Cloudflare every request reaches Traefik
+      #     wearing a Cloudflare source address, which would make the allowlist
+      #     below match everyone or no one.
+      #  2. `ipAllowList` restricts it to the two hosts that run Lite. The API
+      #     key stops being the only thing between the internet and the docker
+      #     socket; an attacker now needs the key *and* one of these hosts.
+      #  3. PathPrefix(`/v1`), so /openapi.json and /docs stay unroutable.
+      #
+      # Adding a Lite host means adding its egress IP here. If Lite is ever
+      # co-located with Harborbox, delete this router rather than leaving a
+      # public route nothing needs.
+      - traefik.http.routers.harborbox-api.rule=Host(`harborbox-api.onvo.ai`) && PathPrefix(`/v1`)
+      - traefik.http.routers.harborbox-api.entryPoints=https
+      - traefik.http.routers.harborbox-api.tls=true
+      - traefik.http.routers.harborbox-api.tls.certresolver=letsencrypt
+      - traefik.http.routers.harborbox-api.service=harborbox-api
+      - traefik.http.routers.harborbox-api.middlewares=harborbox-api-allowlist
+      - traefik.http.services.harborbox-api.loadbalancer.server.port=8000
+      # onvo-production (Lite prod) and staging-server (Lite staging).
+      - traefik.http.middlewares.harborbox-api-allowlist.ipAllowList.sourceRange=188.245.108.57/32,116.203.66.157/32
     networks:
       # Each entry carries an alias deliberately. Coolify's compose rewriter
       # drops service network entries whose value is null, which silently left
