@@ -36,8 +36,11 @@ def test_template_defaults_are_profile_specific() -> None:
     settings = Settings()
 
     assert settings.resources_for_template("relaydeck") == (256, 0.5)
-    assert settings.resources_for_template("onvo-pro") == (1024, 2.0)
-    assert settings.resources_for_template("onvo-lite") == (1024, 2.0)
+    # 1.0 CPU, not 2.0: measured against the real analysis workload, DuckDB
+    # profiling of a CSV finished in ~2.5s at 1.0 CPU and the run was dominated
+    # by the model, not compute. Halving it doubles how many sandboxes fit.
+    assert settings.resources_for_template("onvo-pro") == (1024, 1.0)
+    assert settings.resources_for_template("onvo-lite") == (1024, 1.0)
 
 
 def test_unregistered_template_has_no_generic_fallback() -> None:
