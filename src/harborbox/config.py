@@ -86,6 +86,15 @@ class Settings(BaseSettings):
     sandbox_pids_limit: int = Field(default=128, ge=16)
     sandbox_tmpfs_mb: int = Field(default=128, ge=16)
 
+    # Reaper — reclaims sandboxes nothing will come back for. See reaper.py.
+    reaper_enabled: bool = True
+    reaper_interval_seconds: int = Field(default=300, ge=10)
+    # A sandbox starts lazily on its first execution, so `created` is normal
+    # briefly. Fifteen minutes is far longer than any legitimate start.
+    reaper_stuck_created_after_seconds: int = Field(default=900, ge=60)
+    # Long enough that a failure is still there when someone comes to look.
+    reaper_failed_retention_hours: int = Field(default=24, ge=1)
+
     warm_pool_enabled: bool = True
     warm_pool_relaydeck: int = Field(default=2, ge=0, le=32)
     warm_pool_onvo_pro: int = Field(default=1, ge=0, le=32)
@@ -100,9 +109,9 @@ class Settings(BaseSettings):
     relaydeck_template_memory_mb: int = Field(default=256, ge=128)
     relaydeck_template_cpu: float = Field(default=0.5, gt=0)
     onvo_pro_template_memory_mb: int = Field(default=1024, ge=128)
-    onvo_pro_template_cpu: float = Field(default=2.0, gt=0)
+    onvo_pro_template_cpu: float = Field(default=1.0, gt=0)
     onvo_lite_template_memory_mb: int = Field(default=1024, ge=128)
-    onvo_lite_template_cpu: float = Field(default=2.0, gt=0)
+    onvo_lite_template_cpu: float = Field(default=1.0, gt=0)
 
     # Derived templates are built from caller-supplied package lists, so the
     # request body is hostile input: every name is regex-checked and must also
@@ -291,6 +300,32 @@ class Settings(BaseSettings):
             raise ValueError("warm pool exceeds the aggregate sandbox memory budget")
         if self.max_parallel_cpu is not None and warm_cpu > self.max_parallel_cpu:
             raise ValueError("warm pool exceeds the aggregate sandbox CPU budget")
+
+        """
+        A pool that fits is not the same as a pool that leaves room.
+
+        If the warm pool reserves everything but a sliver, any template larger
+        than that sliver can never be admitted: its executions queue on
+        `waiting_for: cpu` forever, because the budget is held by an idle pool
+        that never yields it. That is a deadlock, and it presents as silence —
+        a sandbox stuck in `created` with no error anywhere.
+
+        Onvo Lite hit exactly this: pool 3.0, ceiling 4.0, onvo-lite needs 2.0.
+        The check above passed it.
+        """
+        largest_template_cpu = max(
+            (cpu for _, cpu in self.template_resources.values()), default=0.0
+        )
+        if (
+            self.max_parallel_cpu is not None
+            and warm_cpu + largest_template_cpu > self.max_parallel_cpu
+        ):
+            raise ValueError(
+                f"warm pool leaves no CPU headroom: reserves {warm_cpu} of "
+                f"{self.max_parallel_cpu}, but the largest template needs "
+                f"{largest_template_cpu}. Raise max_parallel_cpu to at least "
+                f"{warm_cpu + largest_template_cpu} or shrink the pool."
+            )
         return self
 
 

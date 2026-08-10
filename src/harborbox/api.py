@@ -35,6 +35,7 @@ from harborbox.opensandbox_compat import (
     template_for,
 )
 from harborbox.presenters import execution_response
+from harborbox.reaper import reaper_loop
 from harborbox.runtime import SandboxUnavailable
 from harborbox.runtime_factory import create_runtime
 from harborbox.runtime_protocol import SandboxRuntime
@@ -94,9 +95,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.scheduler = scheduler
     app.state.template_builder = template_builder
     await scheduler.start()
+
+    # Reclaims sandboxes nothing will come back for. Started after the
+    # scheduler so a sweep never races an empty runtime on boot.
+    reaper_stop = asyncio.Event()
+    reaper_task: asyncio.Task[None] | None = None
+    if settings.reaper_enabled:
+        reaper_task = asyncio.create_task(
+            reaper_loop(session_factory, runtime, settings, reaper_stop),
+            name="harborbox-reaper",
+        )
+
     try:
         yield
     finally:
+        if reaper_task is not None:
+            reaper_stop.set()
+            reaper_task.cancel()
+            await asyncio.gather(reaper_task, return_exceptions=True)
         await scheduler.stop()
         await template_builder.close()
         await runtime.close()

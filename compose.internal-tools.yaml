@@ -284,17 +284,29 @@ services:
       # isolated cold create-and-execute is ~6s while executions themselves run
       # in ~200ms. A burst of 43 widgets pays that startup 43 times. Unresolved.
       HARBORBOX_WARM_POOL_ONVO_PRO: ${HARBORBOX_WARM_POOL_ONVO_PRO:-1}
-      HARBORBOX_WARM_POOL_ONVO_LITE: ${HARBORBOX_WARM_POOL_ONVO_LITE:-0}
+      # Was 0, so every Lite sandbox cold-started — ~6.5s of provisioning on
+      # the critical path of a user's first query. One warm slot covers the
+      # common case of a single analysis at a time.
+      HARBORBOX_WARM_POOL_ONVO_LITE: ${HARBORBOX_WARM_POOL_ONVO_LITE:-1}
       HARBORBOX_WARM_POOL_RELAYDECK: ${HARBORBOX_WARM_POOL_RELAYDECK:-0}
       #
       # Per-template sizing, pinned to what this host was already running.
       # 0.2.0 takes resources from the resolved template, not from
       # HARBORBOX_DEFAULT_SANDBOX_*, and onvo-pro's built-in default is
       # 1024 MB / 2.0 CPU. Left alone that silently halves concurrency here:
-      # MAX_PARALLEL_CPU is 8, so 2.0 CPU per sandbox allows 4 at once where
-      # 1.0 allowed 8. Onvo's widget code has run in 768 MB / 1 CPU all along.
+      # MAX_PARALLEL_CPU is 10, so 2.0 CPU per sandbox halves how many fit.
+      # Onvo's widget code has run in 768 MB / 1 CPU all along.
       HARBORBOX_ONVO_PRO_TEMPLATE_MEMORY_MB: ${HARBORBOX_ONVO_SANDBOX_MEMORY_MB:-768}
       HARBORBOX_ONVO_PRO_TEMPLATE_CPU: ${HARBORBOX_ONVO_SANDBOX_CPU:-1}
+      #
+      # onvo-lite was never pinned, so it inherited the old 2.0 CPU default
+      # while onvo-pro was pinned to 1.0 right above — the two Onvo sandboxes
+      # were sized differently for no reason anyone had decided. Measured on a
+      # real datasource analysis, DuckDB profiling took ~2.5s at 1.0 CPU and the
+      # run was dominated by the model, not compute. At 2.0 the host fits two
+      # concurrent Lite analyses; at 1.0 it fits four.
+      HARBORBOX_ONVO_LITE_TEMPLATE_MEMORY_MB: ${HARBORBOX_ONVO_LITE_SANDBOX_MEMORY_MB:-1024}
+      HARBORBOX_ONVO_LITE_TEMPLATE_CPU: ${HARBORBOX_ONVO_LITE_SANDBOX_CPU:-1}
       HARBORBOX_DEFAULT_IDLE_TIMEOUT_SECONDS: ${HARBORBOX_ONVO_IDLE_TIMEOUT_SECONDS:-180}
       # Leave headroom for the Trigger stack, which shares this host.
       HARBORBOX_HOST_MEMORY_RESERVE_PERCENT: ${HARBORBOX_HOST_MEMORY_RESERVE_PERCENT:-25}
