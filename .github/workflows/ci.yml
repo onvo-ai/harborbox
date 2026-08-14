@@ -94,6 +94,12 @@ jobs:
     # keeps the stack lean; the e2e tests create the sandboxes they need.
     env:
       HARBORBOX_WARM_POOL_ENABLED: "false"
+      # The stack is built, started, tested against, and torn down entirely
+      # within this job, and is never reachable from outside the runner. The
+      # key only has to match on both sides (compose's api service and the
+      # pytest client) — a repository secret would buy no security here, just
+      # an extra manual setup step and an ambient credential.
+      HARBORBOX_API_KEY: local-e2e-only-not-a-real-credential
 
     steps:
       - uses: actions/checkout@v4
@@ -118,8 +124,6 @@ jobs:
         run: docker compose up -d --wait
 
       - name: Run the e2e suites
-        env:
-          HARBORBOX_API_KEY: ${{ secrets.HARBORBOX_E2E_API_KEY }}
         run: uv run pytest -m e2e --json-report --json-report-file=e2e-results.json
 
       - name: Stack logs on failure
