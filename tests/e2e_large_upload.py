@@ -23,6 +23,7 @@ def test_large_streaming_upload_persists_full_size(client: SandboxClient) -> Non
     api_key = os.environ["HARBORBOX_API_KEY"]
     size_mb = int(os.environ.get("HARBORBOX_LARGE_UPLOAD_MB", "100"))
     sandbox = client.sandboxes.create(
+        template="onvo-lite",
         memory_mb=768,
         cpu=1,
         idle_timeout_seconds=120,

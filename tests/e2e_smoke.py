@@ -12,8 +12,12 @@ from harborbox_sdk import SandboxClient
 
 @pytest.mark.e2e
 def test_two_sandboxes_run_code_in_parallel(client: SandboxClient) -> None:
-    first = client.sandboxes.create(memory_mb=128, cpu=1, idle_timeout_seconds=60)
-    second = client.sandboxes.create(memory_mb=128, cpu=1, idle_timeout_seconds=60)
+    first = client.sandboxes.create(
+        template="onvo-lite", memory_mb=128, cpu=1, idle_timeout_seconds=60
+    )
+    second = client.sandboxes.create(
+        template="onvo-lite", memory_mb=128, cpu=1, idle_timeout_seconds=60
+    )
     try:
         started = time.monotonic()
         first_job = first.run_code(

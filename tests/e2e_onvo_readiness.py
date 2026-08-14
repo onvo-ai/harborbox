@@ -19,6 +19,7 @@ def timestamp(value: str | None) -> datetime:
 @pytest.fixture
 def sandbox(client: SandboxClient) -> Iterator[Sandbox]:
     box = client.sandboxes.create(
+        template="onvo-lite",
         memory_mb=768,
         cpu=1,
         idle_timeout_seconds=120,

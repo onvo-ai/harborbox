@@ -10,7 +10,7 @@ from harborbox_sdk import SandboxClient
 
 @pytest.mark.e2e
 def test_oom_is_contained_and_reported(client: SandboxClient) -> None:
-    sandbox = client.sandboxes.create(memory_mb=128, cpu=1)
+    sandbox = client.sandboxes.create(template="onvo-lite", memory_mb=128, cpu=1)
     try:
         execution = sandbox.run_code(
             "payload = bytearray(384 * 1024 * 1024)",
@@ -26,7 +26,7 @@ def test_oom_is_contained_and_reported(client: SandboxClient) -> None:
 
 @pytest.mark.e2e
 def test_api_stays_healthy_after_oom(client: SandboxClient) -> None:
-    sandbox = client.sandboxes.create(memory_mb=128, cpu=1)
+    sandbox = client.sandboxes.create(template="onvo-lite", memory_mb=128, cpu=1)
     try:
         execution = sandbox.run_code(
             "payload = bytearray(384 * 1024 * 1024)",
