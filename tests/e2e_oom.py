@@ -1,4 +1,4 @@
-"""Verify that a sandbox OOM is contained and reported."""
+"""Verify that a sandbox OOM is contained and reported. Selected with `pytest -m e2e`."""
 
 from __future__ import annotations
 
