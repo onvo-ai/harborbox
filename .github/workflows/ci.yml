@@ -88,6 +88,13 @@ jobs:
     permissions:
       contents: read
 
+    # The runner is 2 cores / 3.7GB. The warm pool alone wants 2x256MB plus
+    # 1x1024MB of sandboxes at boot, which is tight enough to tip api into
+    # "unhealthy" on its own even once the images below exist. Disabling it
+    # keeps the stack lean; the e2e tests create the sandboxes they need.
+    env:
+      HARBORBOX_WARM_POOL_ENABLED: "false"
+
     steps:
       - uses: actions/checkout@v4
 
@@ -99,8 +106,13 @@ jobs:
       - name: Install dependencies
         run: uv sync --extra dev
 
+      # compose.yaml puts the three sandbox template images behind
+      # `profiles: ["build"]` to keep them out of the normal runtime stack, but
+      # that also means a plain `docker compose build` silently skips them —
+      # leaving the warm pool with no images to start from. --profile build
+      # pulls them back in for this build-only invocation.
       - name: Build the stack
-        run: docker compose build
+        run: docker compose --profile build build
 
       - name: Start the stack
         run: docker compose up -d --wait
