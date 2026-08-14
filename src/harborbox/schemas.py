@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
+# Pydantic resolves field annotations at class-construction time, so `datetime`
+# must stay a real import here, not TYPE_CHECKING-only.
+from datetime import datetime  # noqa: TC003
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator

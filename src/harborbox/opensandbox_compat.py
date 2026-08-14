@@ -4,12 +4,14 @@ import json
 import math
 import re
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from harborbox.config import Settings
 from harborbox.models import Sandbox, utc_now
+
+if TYPE_CHECKING:
+    from harborbox.config import Settings
 
 INTERNAL_PREFIX = "harborbox.opensandbox."
 
@@ -200,7 +202,9 @@ def public_metadata(sandbox: Sandbox) -> dict[str, str]:
     }
 
 
-def _json_metadata(sandbox: Sandbox, key: str, fallback: Any) -> Any:
+# Callers pass heterogeneous fallbacks ({}, None, []) and the parsed JSON's
+# shape varies by key, so both `fallback` and the return are genuinely Any.
+def _json_metadata(sandbox: Sandbox, key: str, fallback: Any) -> Any:  # noqa: ANN401
     try:
         return json.loads(sandbox.metadata_.get(f"{INTERNAL_PREFIX}{key}", ""))
     except (TypeError, ValueError):

@@ -4,26 +4,30 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import Callable
 from dataclasses import replace
+from typing import TYPE_CHECKING
 
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import selectinload
 
 from harborbox.admission import Capacity, can_admit, reserve_memory
-from harborbox.config import Settings
 from harborbox.db import session_factory
 from harborbox.execution_secrets import open_environment, scrub_environment
 from harborbox.models import Execution, Sandbox, SandboxTemplate, utc_now
 from harborbox.opensandbox_compat import expiration
 from harborbox.runtime import SandboxMemoryExceeded, SandboxUnavailable
-from harborbox.runtime_protocol import SandboxRuntime
 from harborbox.schemas import (
     AgentCommandRequest,
     AgentExecutionRequest,
     AgentProcessRequest,
 )
-from harborbox.template_builder import TemplateBuilder
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from harborbox.config import Settings
+    from harborbox.runtime_protocol import SandboxRuntime
+    from harborbox.template_builder import TemplateBuilder
 
 logger = logging.getLogger(__name__)
 

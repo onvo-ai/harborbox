@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import docker
 import httpx
 from docker.errors import APIError, NotFound
 
-from harborbox.config import Settings
-from harborbox.models import Sandbox
 from harborbox.runtime_protocol import StartedSandbox, WarmPoolReservation
 from harborbox.schemas import (
     AgentCommandRequest,
@@ -21,6 +18,14 @@ from harborbox.schemas import (
     FileUploadResponse,
     FileWriteRequest,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from docker.models.containers import Container
+
+    from harborbox.config import Settings
+    from harborbox.models import Sandbox
 
 
 class RuntimeErrorBase(RuntimeError):
@@ -166,7 +171,7 @@ class DockerRuntime:
 
         return StartedSandbox(container.id, container.name)
 
-    def _connect_egress(self, container: Any, sandbox: Sandbox) -> None:
+    def _connect_egress(self, container: Container, sandbox: Sandbox) -> None:
         """Attaches the egress network, for the sandboxes that asked for it.
 
         Was unconditional, which made egress an instance-wide setting: turning

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 from opensandbox.exceptions import (
     PoolDestroyedException,
@@ -16,9 +16,13 @@ from opensandbox.pool_types import (
 )
 from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from harborbox.models import WarmPoolIdleSandbox, WarmPoolState
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 
 class AsyncPostgresPoolStateStore:

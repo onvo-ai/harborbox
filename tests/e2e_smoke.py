@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import time
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 import pytest
 
-from harborbox_sdk import SandboxClient
+if TYPE_CHECKING:
+    from harborbox_sdk import SandboxClient
 
 
 @pytest.mark.e2e

@@ -4,13 +4,16 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from harborbox.config import Settings
 from harborbox.models import SandboxTemplate, utc_now
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from harborbox.config import Settings
 
 TemplateStatus = str
 

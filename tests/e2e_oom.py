@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import httpx
 import pytest
 
-from harborbox_sdk import SandboxClient
+if TYPE_CHECKING:
+    from harborbox_sdk import SandboxClient
 
 
 @pytest.mark.e2e

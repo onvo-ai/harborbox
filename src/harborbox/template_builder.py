@@ -5,13 +5,16 @@ import logging
 import os
 import subprocess
 from datetime import timedelta
+from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 
-from harborbox.config import Settings
 from harborbox.db import session_factory
 from harborbox.models import Sandbox, SandboxTemplate, utc_now
 from harborbox.templates import TemplateSpec, render_dockerfile
+
+if TYPE_CHECKING:
+    from harborbox.config import Settings
 
 logger = logging.getLogger(__name__)
 

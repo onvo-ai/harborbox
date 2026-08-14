@@ -4,10 +4,9 @@ import asyncio
 import hmac
 import os
 import signal
-from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
@@ -23,6 +22,9 @@ from harborbox_agent.files import (
 )
 from harborbox_agent.kernel import KernelSession
 from harborbox_agent.output import OutputBudget
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 WORKSPACE = Path(os.environ.get("HARBORBOX_WORKSPACE", "/workspace"))
 AGENT_TOKEN = os.environ.get("HARBORBOX_AGENT_TOKEN", "")

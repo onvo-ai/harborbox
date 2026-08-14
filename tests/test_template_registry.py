@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from datetime import UTC, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
@@ -21,6 +20,9 @@ from harborbox.templates import (
     resolve_template,
     validate_template_spec,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 Sessions = async_sessionmaker[AsyncSession]
 
@@ -79,7 +81,11 @@ async def client(
     app.dependency_overrides.clear()
 
 
-def derived_row(*, apt: list[str] | None = None, **overrides: Any) -> SandboxTemplate:
+# `overrides` can set any SandboxTemplate column, whose types are
+# heterogeneous (str, int, float, dict, ...), so Any is the honest type here.
+def derived_row(
+    *, apt: list[str] | None = None, **overrides: Any  # noqa: ANN401
+) -> SandboxTemplate:
     settings = Settings()
     spec = validate_template_spec(
         settings, base="relaydeck", apt=apt or ["chromium"], npm=[], env={}

@@ -3,10 +3,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from typing import TYPE_CHECKING
 
 from cryptography.fernet import Fernet, InvalidToken
 
-from harborbox.config import Settings
+if TYPE_CHECKING:
+    from harborbox.config import Settings
 
 SECRET_ENVELOPE_KEY = "__harborbox_secret_environment"
 

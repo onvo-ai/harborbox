@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from harborbox.models import Execution
 from harborbox.schemas import ExecutionError, ExecutionResponse, ExecutionResult, LogOutput
+
+if TYPE_CHECKING:
+    from datetime import datetime
+
+    from sqlalchemy.ext.asyncio import AsyncSession
 
 
 def elapsed_ms(start: datetime | None, end: datetime | None) -> int | None:

@@ -63,7 +63,9 @@ class SandboxClient:
         )
         self.sandboxes = Sandboxes(self)
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+    # Forwards arbitrary httpx.request kwargs (json, params, headers, ...) and
+    # httpx.Response.json() itself is typed to return Any, so both are genuine.
+    def _request(self, method: str, path: str, **kwargs: Any) -> Any:  # noqa: ANN401
         response = self._http.request(method, path, **kwargs)
         response.raise_for_status()
         if response.status_code == 204:

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 import pytest
 
-from harborbox_sdk import Sandbox, SandboxClient
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from harborbox_sdk import Sandbox, SandboxClient
 
 
 def timestamp(value: str | None) -> datetime:

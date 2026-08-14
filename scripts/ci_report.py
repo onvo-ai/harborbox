@@ -28,7 +28,7 @@ FOOTNOTE = (
 )
 
 
-def read_json(path: Path) -> Any:
+def read_json(path: Path) -> Any:  # noqa: ANN401 - shape varies per artifact file
     """Return parsed JSON, or None if absent or malformed."""
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -46,7 +46,9 @@ def package_of(filename: str) -> str | None:
     return None
 
 
-def coverage_by_package(coverage: Any) -> dict[str, tuple[int, int]]:
+# `coverage` is the raw coverage.json blob (or None if the artifact is
+# missing/malformed) - its shape is an external tool's, not ours to pin down.
+def coverage_by_package(coverage: Any) -> dict[str, tuple[int, int]]:  # noqa: ANN401
     """Return {package: (covered_lines, total_statements)}."""
     totals: dict[str, tuple[int, int]] = {}
     files = (coverage or {}).get("files", {})
@@ -67,7 +69,8 @@ def pct(covered: int, total: int) -> str:
     return f"{(covered / total * 100):.1f}%" if total else "—"
 
 
-def counts(results: Any) -> tuple[int, int] | None:
+# `results` is the raw pytest-json-report blob (or None); shape is that tool's.
+def counts(results: Any) -> tuple[int, int] | None:  # noqa: ANN401
     """Return (total, failed) from a pytest-json-report summary."""
     summary = (results or {}).get("summary")
     if not isinstance(summary, dict):
@@ -82,7 +85,9 @@ def cell(pair: tuple[int, int] | None) -> str:
     return f"{failed}/{total} failed" if failed else str(total)
 
 
-def lint_by_rule(findings: Any) -> dict[str, int]:
+# `findings` is the raw ruff --output-format=json blob (or None); shape is
+# ruff's own JSON schema, not ours to pin down.
+def lint_by_rule(findings: Any) -> dict[str, int]:  # noqa: ANN401
     by_rule: dict[str, int] = {}
     for item in findings if isinstance(findings, list) else []:
         rule = (item.get("code") or "(no rule)") if isinstance(item, dict) else "(no rule)"

@@ -3,17 +3,21 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import timedelta
+from typing import TYPE_CHECKING
 
-from opensandbox import Sandbox as OpenSandbox
-from opensandbox.config import ConnectionConfig
 from opensandbox.exceptions import SandboxException
 from opensandbox.pool_async import SandboxPoolAsync
 from opensandbox.pool_types import AcquirePolicy, PoolCreationSpec
 
-from harborbox.config import Settings
 from harborbox.db import session_factory
 from harborbox.postgres_pool_store import AsyncPostgresPoolStateStore
 from harborbox.runtime_protocol import WarmPoolReservation
+
+if TYPE_CHECKING:
+    from opensandbox import Sandbox as OpenSandbox
+    from opensandbox.config import ConnectionConfig
+
+    from harborbox.config import Settings
 
 logger = logging.getLogger(__name__)
 

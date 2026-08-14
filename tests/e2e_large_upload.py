@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterator
+from typing import TYPE_CHECKING
 
 import httpx
 import pytest
 
-from harborbox_sdk import SandboxClient
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from harborbox_sdk import SandboxClient
 
 
 def upload_chunks(megabytes: int) -> Iterator[bytes]:

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import base64
 import shutil
-from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 
 class UnsafePath(ValueError):

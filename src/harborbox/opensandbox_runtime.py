@@ -6,9 +6,8 @@ import logging
 import os
 import shlex
 import tempfile
-from collections.abc import AsyncIterator
 from datetime import timedelta
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import httpx
 from code_interpreter import CodeInterpreter, SupportedLanguage
@@ -19,8 +18,6 @@ from opensandbox.exceptions import SandboxApiException, SandboxException
 from opensandbox.models.execd import Execution, ExecutionHandlers, RunCommandOpts
 from opensandbox.models.filesystem import DirectoryListEntry
 
-from harborbox.config import Settings
-from harborbox.models import Sandbox
 from harborbox.runtime import SandboxMemoryExceeded, SandboxUnavailable
 from harborbox.runtime_protocol import StartedSandbox, WarmPoolReservation
 from harborbox.schemas import (
@@ -38,6 +35,16 @@ from harborbox.schemas import (
     LogOutput,
 )
 from harborbox.warm_pool import OpenSandboxWarmPools
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from opensandbox.models.execd import ExecutionError as SdkExecutionError
+    from opensandbox.models.execd import ExecutionResult as SdkExecutionResult
+    from opensandbox.models.execd import OutputMessage
+
+    from harborbox.config import Settings
+    from harborbox.models import Sandbox
 
 SNAPSHOT_METADATA_KEY = "harborbox.runtime.snapshot_id"
 logger = logging.getLogger(__name__)
@@ -65,13 +72,13 @@ class _BoundedOutput:
         if len(chunk) < len(encoded):
             self.truncated = True
 
-    async def on_stdout(self, message: Any) -> None:
+    async def on_stdout(self, message: OutputMessage) -> None:
         self._append(self.stdout, str(message.text))
 
-    async def on_stderr(self, message: Any) -> None:
+    async def on_stderr(self, message: OutputMessage) -> None:
         self._append(self.stderr, str(message.text))
 
-    async def on_result(self, result: Any) -> None:
+    async def on_result(self, result: SdkExecutionResult) -> None:
         text = result.text
         if text is not None:
             encoded = str(text).encode("utf-8")
@@ -83,7 +90,7 @@ class _BoundedOutput:
         extra = dict(getattr(result, "extra_properties", {}) or {})
         self.results.append(ExecutionResult(text=text, data=extra))
 
-    async def on_error(self, error: Any) -> None:
+    async def on_error(self, error: SdkExecutionError) -> None:
         self.error = ExecutionError(
             name=str(error.name),
             value=str(error.value),

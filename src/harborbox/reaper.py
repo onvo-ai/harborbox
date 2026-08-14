@@ -26,7 +26,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from harborbox.config import Settings
+    from harborbox.runtime_protocol import SandboxRuntime
 
 
 @dataclass(frozen=True)
@@ -85,7 +93,9 @@ def plan_reap(
 
 
 async def reap_once(
-    session_factory: Any, runtime: Any, settings: Any
+    session_factory: async_sessionmaker[AsyncSession],
+    runtime: SandboxRuntime,
+    settings: Settings,
 ) -> ReapPlan:
     """Run one sweep. Returns what it acted on, for logging and tests."""
     import logging
@@ -158,7 +168,10 @@ def _aware(value: datetime | None) -> datetime | None:
 
 
 async def reaper_loop(
-    session_factory: Any, runtime: Any, settings: Any, stop: Any
+    session_factory: async_sessionmaker[AsyncSession],
+    runtime: SandboxRuntime,
+    settings: Settings,
+    stop: asyncio.Event,
 ) -> None:
     """Sweep on an interval until told to stop.
 

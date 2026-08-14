@@ -3,16 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
-from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy import func, select, update
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from harborbox import __version__
 from harborbox.admission import can_admit
@@ -38,7 +37,6 @@ from harborbox.presenters import execution_response
 from harborbox.reaper import reaper_loop
 from harborbox.runtime import SandboxUnavailable
 from harborbox.runtime_factory import create_runtime
-from harborbox.runtime_protocol import SandboxRuntime
 from harborbox.scheduler import (
     ACTIVE_EXECUTION_STATES,
     RESERVED_SANDBOX_STATES,
@@ -76,6 +74,13 @@ from harborbox.templates import (
     static_template,
     validate_template_spec,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from harborbox.runtime_protocol import SandboxRuntime
 
 
 def new_id(prefix: str) -> str:
