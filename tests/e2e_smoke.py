@@ -1,86 +1,63 @@
-"""Run against a live local Compose stack.
-
-Usage:
-    HARBORBOX_API_KEY=... .venv/bin/python tests/e2e_smoke.py
-"""
+"""Runs against a live local Compose stack. Selected with `pytest -m e2e`."""
 
 from __future__ import annotations
 
-import os
 import time
 from datetime import datetime
+
+import pytest
 
 from harborbox_sdk import SandboxClient
 
 
-def main() -> None:
-    api_key = os.environ["HARBORBOX_API_KEY"]
-    with SandboxClient(api_key=api_key) as client:
-        first = client.sandboxes.create(
-            memory_mb=128, cpu=1, idle_timeout_seconds=60
+@pytest.mark.e2e
+def test_two_sandboxes_run_code_in_parallel(client: SandboxClient) -> None:
+    first = client.sandboxes.create(memory_mb=128, cpu=1, idle_timeout_seconds=60)
+    second = client.sandboxes.create(memory_mb=128, cpu=1, idle_timeout_seconds=60)
+    try:
+        started = time.monotonic()
+        first_job = first.run_code(
+            "import time; time.sleep(2); first_value = 40; first_value + 2",
+            wait=False,
         )
-        second = client.sandboxes.create(
-            memory_mb=128, cpu=1, idle_timeout_seconds=60
+        second_job = second.run_code(
+            "import time; time.sleep(2); second_value = 5; second_value * 2",
+            wait=False,
         )
-        try:
-            started = time.monotonic()
-            first_job = first.run_code(
-                "import time; time.sleep(2); first_value = 40; first_value + 2",
-                wait=False,
-            )
-            second_job = second.run_code(
-                "import time; time.sleep(2); second_value = 5; second_value * 2",
-                wait=False,
-            )
-            first_job.wait(timeout=60, raise_on_error=True)
-            second_job.wait(timeout=60, raise_on_error=True)
-            elapsed = time.monotonic() - started
-            assert first_job.text == "42", first_job.error
-            assert second_job.text == "10", second_job.error
-            assert first_job.started_at and first_job.finished_at
-            assert second_job.started_at and second_job.finished_at
-            first_started = datetime.fromisoformat(first_job.started_at)
-            first_finished = datetime.fromisoformat(first_job.finished_at)
-            second_started = datetime.fromisoformat(second_job.started_at)
-            second_finished = datetime.fromisoformat(second_job.finished_at)
-            assert first_started < second_finished and second_started < first_finished
+        first_job.wait(timeout=60, raise_on_error=True)
+        second_job.wait(timeout=60, raise_on_error=True)
+        elapsed = time.monotonic() - started
+        assert first_job.text == "42", first_job.error
+        assert second_job.text == "10", second_job.error
+        assert first_job.started_at and first_job.finished_at
+        assert second_job.started_at and second_job.finished_at
+        first_started = datetime.fromisoformat(first_job.started_at)
+        first_finished = datetime.fromisoformat(first_job.finished_at)
+        second_started = datetime.fromisoformat(second_job.started_at)
+        second_finished = datetime.fromisoformat(second_job.finished_at)
+        assert first_started < second_finished and second_started < first_finished
+        assert elapsed < 10, f"parallel run took {elapsed:.1f}s; sandboxes serialised"
 
-            stateful = first.run_code("first_value + 3", wait=True, wait_timeout=30)
-            assert stateful.text == "43"
+        stateful = first.run_code("first_value + 3", wait=True, wait_timeout=30)
+        assert stateful.text == "43"
 
-            first.files.write("state.txt", "preserved")
-            assert first.files.read("state.txt") == "preserved"
+        first.files.write("state.txt", "preserved")
+        assert first.files.read("state.txt") == "preserved"
 
-            first.pause(memory=True)
-            first.resume()
-            warm_state = first.run_code("first_value", wait=True, wait_timeout=30)
-            assert warm_state.text == "40"
+        first.pause(memory=True)
+        first.resume()
+        warm_state = first.run_code("first_value", wait=True, wait_timeout=30)
+        assert warm_state.text == "40"
 
-            first.pause(memory=False)
-            first.resume()
-            assert first.files.read("state.txt") == "preserved"
-            cold_state = first.run_code("first_value", wait=True, wait_timeout=30)
-            assert cold_state.status == "failed"
-            assert cold_state.error and cold_state.error.name == "NameError"
+        first.pause(memory=False)
+        first.resume()
+        assert first.files.read("state.txt") == "preserved"
+        cold_state = first.run_code("first_value", wait=True, wait_timeout=30)
+        assert cold_state.status == "failed"
+        assert cold_state.error and cold_state.error.name == "NameError"
 
-            capacity = client.capacity()
-            assert capacity["reserved_memory_mb"] >= 256
-            print(
-                "e2e ok:",
-                {
-                    "parallel_elapsed_seconds": round(elapsed, 2),
-                    "first": first_job.text,
-                    "second": second_job.text,
-                    "stateful": stateful.text,
-                    "warm_pause_state": warm_state.text,
-                    "cold_pause_error": cold_state.error.name,
-                    "reserved_memory_mb": capacity["reserved_memory_mb"],
-                },
-            )
-        finally:
-            first.kill()
-            second.kill()
-
-
-if __name__ == "__main__":
-    main()
+        capacity = client.capacity()
+        assert capacity["reserved_memory_mb"] >= 256
+    finally:
+        first.kill()
+        second.kill()

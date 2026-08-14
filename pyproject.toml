@@ -41,6 +41,9 @@ packages = ["src/harborbox", "src/harborbox_sdk"]
 addopts = "-q -m 'not e2e'"
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# The e2e_*.py modules hold live-stack tests; pytest's default test_*.py
+# pattern would never discover them, leaving `pytest -m e2e` empty.
+python_files = ["test_*.py", "e2e_*.py"]
 markers = [
   "e2e: requires a live Compose stack (postgres, opensandbox, harborbox-api)",
   "postgres: requires a real Postgres; SQLite cannot run the pg-dialect SQL under test",
