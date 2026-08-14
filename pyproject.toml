@@ -41,6 +41,9 @@ packages = ["src/harborbox", "src/harborbox_sdk"]
 addopts = "-q -m 'not e2e'"
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# ci_report.py lives in scripts/, not src/; add it to sys.path so tests can
+# import it directly, matching how it is invoked in CI (python scripts/ci_report.py).
+pythonpath = ["scripts"]
 # The e2e_*.py modules hold live-stack tests; pytest's default test_*.py
 # pattern would never discover them, leaving `pytest -m e2e` empty.
 python_files = ["test_*.py", "e2e_*.py"]
@@ -64,6 +67,11 @@ ignore = [
 python_version = "3.12"
 strict = true
 packages = ["harborbox", "harborbox_sdk"]
+# ci_report.py is a standalone module in scripts/, not part of either src
+# package, so it needs its own entry: mypy_path lets mypy find it by name,
+# and modules brings it under the same strict checking as the packages above.
+mypy_path = ["scripts"]
+modules = ["ci_report"]
 
 [[tool.mypy.overrides]]
 module = ["docker", "docker.*"]
