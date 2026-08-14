@@ -43,6 +43,16 @@ RESERVED_SANDBOX_STATES = (
     "pooling",
     "pooled",
 )
+
+# Public error-taxonomy code written to `execution.error.name` and returned
+# to API clients (see presenters.py -> ExecutionResponse.error.name). This is
+# a wire contract, not a Python identifier: it is deliberately decoupled from
+# the `SandboxUnavailableError` class name so that renaming the exception
+# class does not silently change what callers see and match against (a
+# previous pass did exactly that; this is the fix). Do not rename this value
+# to track a future class rename without a coordinated API change.
+ERROR_NAME_SANDBOX_UNAVAILABLE = "SandboxUnavailable"
+
 TERMINAL_EXECUTION_STATES = ("succeeded", "failed", "cancelled")
 
 
@@ -209,7 +219,7 @@ class Scheduler:
                     execution.status = "failed"
                     execution.finished_at = now
                     execution.error = {
-                        "name": "SandboxUnavailableError",
+                        "name": ERROR_NAME_SANDBOX_UNAVAILABLE,
                         "value": f"sandbox is {sandbox.status}",
                         "traceback": [],
                     }
@@ -396,7 +406,9 @@ class Scheduler:
         except SandboxMemoryExceededError as exc:
             await self._fail_execution(execution_id, "MemoryLimitExceeded", str(exc))
         except SandboxUnavailableError as exc:
-            await self._fail_execution(execution_id, "SandboxUnavailableError", str(exc))
+            await self._fail_execution(
+                execution_id, ERROR_NAME_SANDBOX_UNAVAILABLE, str(exc)
+            )
         except Exception as exc:
             logger.exception("execution failed", extra={"execution_id": execution_id})
             await self._fail_execution(execution_id, type(exc).__name__, str(exc))
