@@ -27,8 +27,8 @@
 | `ruff check --select ALL` | 1524 findings |
 | Findings after the documented ignore list | **444** (345 src/sandbox/scripts, 99 tests) |
 | `mypy` | passes, 25 files |
-| `pytest` | 115 tests passing |
-| Line coverage over `src/` | **49%** — 1643 of 3239 statements uncovered |
+| `pytest` | 128 tests passing |
+| Line coverage over `src/` | **48%** — 1643 of 3239 statements uncovered |
 
 Per-module uncovered statements, which are the burn-down targets in Tasks 12–19:
 
@@ -184,8 +184,8 @@ Run:
 uv sync --extra dev && uv run python -V && uv run pytest --cov --cov-report=json --json-report --json-report-file=unit-results.json
 ```
 
-Expected: `Python 3.12.x`; 115 tests pass; `coverage.json` and
-`unit-results.json` both exist. Confirm the total is still 49% — this task
+Expected: `Python 3.12.x`; 128 tests pass; `coverage.json` and
+`unit-results.json` both exist. Confirm the total is still 48% — this task
 changes no coverage, it only makes it machine-readable.
 
 - [ ] **Step 6: Verify mypy and ruff still pass on 3.12**
@@ -303,7 +303,7 @@ report counts them individually and a failure names the phase.
 - [ ] **Step 4: Verify e2e is excluded from the default run**
 
 Run: `uv run pytest --collect-only -q | tail -3`
-Expected: the count is still 115. The e2e tests are collected but deselected
+Expected: the count is still 128. The e2e tests are collected but deselected
 by `-m 'not e2e'`.
 
 - [ ] **Step 5: Verify e2e is selectable and reports counts**
@@ -863,7 +863,7 @@ Run:
 uv run pytest --cov --cov-report=json --json-report --json-report-file=unit-results.json; uv run ruff check --select ALL --output-format=json -o ruff-strict.json . || true; uv run python scripts/ci_report.py
 ```
 
-Expected: a Markdown table with three package rows, roughly 49% total coverage,
+Expected: a Markdown table with three package rows, roughly 48% total coverage,
 and a `Lint backlog: 1524` details block. Those are today's honest numbers.
 
 - [ ] **Step 4: Commit**
@@ -949,7 +949,7 @@ review and are handled per-family in Tasks 6–9.
 - [ ] **Step 4: Verify nothing broke**
 
 Run: `uv run pytest && uv run mypy`
-Expected: 115 tests pass, mypy exits zero.
+Expected: 128 tests pass, mypy exits zero.
 
 - [ ] **Step 5: Commit**
 
@@ -1040,7 +1040,7 @@ Expected: `All checks passed!`
 - [ ] **Step 6: Verify behaviour is unchanged**
 
 Run: `uv run pytest && uv run mypy`
-Expected: 115 tests pass, mypy exits zero. These are message-shape changes; if
+Expected: 128 tests pass, mypy exits zero. These are message-shape changes; if
 a test fails it is asserting on an exception string, and the assertion — not
 the fix — should be updated.
 
@@ -1105,7 +1105,7 @@ Expected: `All checks passed!`
 - [ ] **Step 4: Verify**
 
 Run: `uv run pytest && uv run mypy`
-Expected: 115 tests pass, mypy exits zero. mypy matters more than usual here —
+Expected: 128 tests pass, mypy exits zero. mypy matters more than usual here —
 a wrongly-moved `TYPE_CHECKING` import shows up as a runtime `NameError`, and
 these tests are what catch it.
 
@@ -1193,7 +1193,7 @@ Expected: `All checks passed!`
 - [ ] **Step 7: Verify**
 
 Run: `uv run pytest && uv run mypy`
-Expected: 115 tests pass, mypy exits zero.
+Expected: 128 tests pass, mypy exits zero.
 
 - [ ] **Step 8: Commit**
 
@@ -1290,7 +1290,7 @@ the documented ignore list.
 - [ ] **Step 9: Verify**
 
 Run: `uv run pytest && uv run mypy`
-Expected: 115 tests pass, mypy exits zero.
+Expected: 128 tests pass, mypy exits zero.
 
 - [ ] **Step 9: Commit**
 
