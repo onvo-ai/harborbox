@@ -56,6 +56,7 @@ jobs:
 
       # Blocking from Task 20, when fail_under = 100 is added.
       - name: Tests and coverage
+        if: always()
         continue-on-error: true
         run: >-
           uv run pytest --cov --cov-report=json --cov-report=term-missing
@@ -143,6 +144,8 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
 
       - name: Download unit reports
         continue-on-error: true
