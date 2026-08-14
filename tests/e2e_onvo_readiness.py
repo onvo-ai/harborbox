@@ -50,7 +50,11 @@ def test_onvo_sandbox_has_required_python_packages(sandbox: Sandbox) -> None:
 @pytest.mark.e2e
 def test_onvo_sandbox_persists_binary_files(sandbox: Sandbox) -> None:
     payload = b"onvo\x00binary\xffpayload"
-    assert sandbox.files.write_bytes("/tmp/onvo.bin", payload) == len(payload)
+    # Path is inside the sandbox container's own tmpfs.
+    assert sandbox.files.write_bytes(
+        "/tmp/onvo.bin",  # noqa: S108
+        payload,
+    ) == len(payload)
     binary_check = sandbox.commands.run(
         'python -c "from pathlib import Path; '
         "print(Path('/tmp/onvo.bin').read_bytes().hex())\"",
@@ -62,9 +66,11 @@ def test_onvo_sandbox_persists_binary_files(sandbox: Sandbox) -> None:
 @pytest.mark.e2e
 def test_onvo_sandbox_runs_duckdb_transform(sandbox: Sandbox) -> None:
     csv_payload = b"region,revenue\nnorth,10\nsouth,20\nnorth,15\n"
-    assert sandbox.files.write_bytes("/tmp/data_probe.csv", csv_payload) == len(
-        csv_payload
-    )
+    # Path is inside the sandbox container's own tmpfs.
+    assert sandbox.files.write_bytes(
+        "/tmp/data_probe.csv",  # noqa: S108
+        csv_payload,
+    ) == len(csv_payload)
     transform = sandbox.commands.run(
         'python -c "import duckdb,json; '
         "duckdb.execute(\\\"SET memory_limit='400MB'\\\"); "

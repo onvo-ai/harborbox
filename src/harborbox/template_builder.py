@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import subprocess
 from datetime import timedelta
 from typing import TYPE_CHECKING
@@ -21,6 +22,13 @@ logger = logging.getLogger(__name__)
 MAX_ERROR_LENGTH = 4000
 BUILD_LOG_TAIL_LINES = 20
 TERMINAL_SANDBOX_STATES = ("killed", "failed")
+
+# Resolved once at import time from the Harborbox API image's own PATH (the
+# image installs docker-ce-cli via apt; see Dockerfile.api), not from
+# caller-supplied input, so an absolute path is used wherever it can be
+# found. `arguments` passed to `_run_docker` below come only from other
+# methods on this class, never from request bodies.
+_DOCKER_BIN = shutil.which("docker") or "docker"
 
 
 class TemplateBuildError(RuntimeError):
@@ -122,8 +130,12 @@ class TemplateBuilder:
 
     def _run_docker(self, arguments: list[str], stdin: str | None = None) -> str:
         try:
-            completed = subprocess.run(
-                ["docker", *arguments],
+            # `arguments` is always a literal list built by _build_sync /
+            # _remove_image_sync below, never a caller-supplied string passed
+            # through as-is (and shell=True is not used), so there is no
+            # shell-injection surface here.
+            completed = subprocess.run(  # noqa: S603
+                [_DOCKER_BIN, *arguments],
                 input=stdin,
                 capture_output=True,
                 text=True,

@@ -24,13 +24,17 @@ forkserver is the speed we had before it.
 Usage:  python forkrun.py <script.py>
 """
 
+import contextlib
 import os
 import socket
 import struct
 import sys
 import time
 
-SOCKET_PATH = "/tmp/.harborbox-forkrun.sock"
+# Runs only inside the single-tenant sandbox container's tmpfs /tmp (see
+# DockerRuntime._start_sandbox_sync in src/harborbox/runtime.py); a fixed
+# path is fine because nothing outside this one container ever sees it.
+SOCKET_PATH = "/tmp/.harborbox-forkrun.sock"  # noqa: S108
 
 # Imported once in the daemon and inherited by every child. Kept to what widget
 # templates actually import: anything else is memory every child pays for.
@@ -50,7 +54,10 @@ def _run_in_process(path: str) -> int:
         if code is None:
             return 0
         return code if isinstance(code, int) else 1
-    except BaseException:
+    except BaseException:  # noqa: BLE001 -- widget code is customer-authored and
+        # arbitrary; anything it raises, including KeyboardInterrupt/GeneratorExit,
+        # must be turned into a normal (code, stdout, stderr) result rather than
+        # propagate, or a single bad widget kills the whole daemon/batch.
         import traceback
 
         traceback.print_exc()
@@ -94,16 +101,14 @@ def _drain(read_fds: "list[int]") -> "dict[int, bytes]":
 
 def _serve() -> None:
     for name in PRELOAD:
-        try:
+        # A missing optional dependency (pandas/numpy not installed in a
+        # minimal image) is a slower child, not a broken one. Anything other
+        # than ImportError is a real bug in the preload and should surface.
+        with contextlib.suppress(ImportError):
             __import__(name)
-        except Exception:
-            # A missing preload is a slower child, not a broken one.
-            pass
 
-    try:
+    with contextlib.suppress(FileNotFoundError):
         os.unlink(SOCKET_PATH)
-    except FileNotFoundError:
-        pass
 
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(SOCKET_PATH)
@@ -132,7 +137,11 @@ def _serve() -> None:
                     code = _run_in_process(path)
                     sys.stdout.flush()
                     sys.stderr.flush()
-                except BaseException:
+                except BaseException:  # noqa: BLE001 -- fork-safety: the child must
+                    # reach `os._exit` below no matter what, never fall through to
+                    # normal interpreter shutdown, which would run atexit/finalizer
+                    # state inherited (copy-on-write) from the parent and could
+                    # corrupt or double-release resources the parent still owns.
                     code = 1
                 os._exit(code)
 
@@ -145,13 +154,16 @@ def _serve() -> None:
             conn.sendall(
                 struct.pack("!iII", rc, len(stdout), len(stderr)) + stdout + stderr
             )
-        except Exception:
+        # One connection's protocol/IO failure (a client that disconnects
+        # mid-request, a malformed length prefix, a pipe/fork error) must not
+        # take down the daemon loop -- the next `accept()` should still get a
+        # chance. Narrowed to the failure modes this block can actually raise;
+        # anything else (e.g. a bug in our own code) is left to propagate.
+        except (OSError, EOFError, UnicodeDecodeError, struct.error):
             pass
         finally:
-            try:
+            with contextlib.suppress(OSError):
                 conn.close()
-            except Exception:
-                pass
 
 
 def _spawn_daemon() -> None:
@@ -213,13 +225,15 @@ def main(argv: "list[str]") -> int:
         rc, out_len, err_len = struct.unpack("!iII", _recv_exact(sock, 12))
         stdout = _recv_exact(sock, out_len)
         stderr = _recv_exact(sock, err_len)
-    except Exception:
+    # Anything wrong with the daemon exchange (it died, the socket dropped,
+    # a malformed reply) falls back to running the script in this process --
+    # the documented fallback behaviour, narrowed to what this exchange can
+    # actually raise.
+    except (OSError, EOFError, struct.error):
         return _run_in_process(path)
     finally:
-        try:
+        with contextlib.suppress(OSError):
             sock.close()
-        except Exception:
-            pass
 
     sys.stdout.buffer.write(stdout)
     sys.stdout.buffer.flush()

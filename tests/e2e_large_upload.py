@@ -41,7 +41,7 @@ def test_large_streaming_upload_persists_full_size(client: SandboxClient) -> Non
         ) as upload_client:
             response = upload_client.put(
                 f"/v1/sandboxes/{sandbox.id}/files/content",
-                params={"path": "/tmp/large.bin"},
+                params={"path": "/tmp/large.bin"},  # noqa: S108 -- path inside the sandbox container's own tmpfs
                 content=upload_chunks(size_mb),
                 headers={"Content-Type": "application/octet-stream"},
             )

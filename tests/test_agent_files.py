@@ -4,8 +4,8 @@ from pathlib import Path
 import pytest
 
 from harborbox_agent.files import (
-    FileTooLarge,
-    UnsafePath,
+    FileTooLargeError,
+    UnsafePathError,
     list_files,
     read_file,
     safe_path,
@@ -19,7 +19,7 @@ def test_safe_path_stays_under_workspace(tmp_path: Path) -> None:
 
 
 def test_safe_path_rejects_traversal(tmp_path: Path) -> None:
-    with pytest.raises(UnsafePath):
+    with pytest.raises(UnsafePathError):
         safe_path(tmp_path, "../../etc/passwd")
 
 
@@ -31,10 +31,13 @@ def test_safe_path_preserves_supported_absolute_roots(tmp_path: Path) -> None:
         == workspace / "data.csv"
     )
     assert (
-        safe_path(workspace, "/tmp/script.py", temp_root=temp_root)
+        # "/tmp/..." is the in-container virtual path safe_path() maps onto
+        # `temp_root`, which is a pytest tmp_path fixture here -- no real
+        # /tmp is touched.
+        safe_path(workspace, "/tmp/script.py", temp_root=temp_root)  # noqa: S108
         == temp_root / "script.py"
     )
-    with pytest.raises(UnsafePath):
+    with pytest.raises(UnsafePathError):
         safe_path(workspace, "/etc/passwd", temp_root=temp_root)
 
 
@@ -61,20 +64,23 @@ async def byte_chunks(*chunks: bytes) -> AsyncIterator[bytes]:
 async def test_streaming_file_write_is_atomic_and_bounded(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     temp_root = tmp_path / "tmp"
+    # "/tmp/..." is the in-container virtual path safe_path() maps onto
+    # `temp_root`, which is a pytest tmp_path fixture here -- no real /tmp
+    # is touched.
     result = await write_file_stream(
         workspace,
-        "/tmp/data.bin",
+        "/tmp/data.bin",  # noqa: S108
         byte_chunks(b"abc", b"123"),
         max_bytes=6,
         temp_root=temp_root,
     )
-    assert result == {"path": "/tmp/data.bin", "size": 6}
+    assert result == {"path": "/tmp/data.bin", "size": 6}  # noqa: S108
     assert (temp_root / "data.bin").read_bytes() == b"abc123"
 
-    with pytest.raises(FileTooLarge):
+    with pytest.raises(FileTooLargeError):
         await write_file_stream(
             workspace,
-            "/tmp/too-large.bin",
+            "/tmp/too-large.bin",  # noqa: S108
             byte_chunks(b"1234", b"5678"),
             max_bytes=7,
             temp_root=temp_root,

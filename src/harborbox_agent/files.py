@@ -10,11 +10,11 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
 
-class UnsafePath(ValueError):
+class UnsafePathError(ValueError):
     pass
 
 
-class FileTooLarge(ValueError):
+class FileTooLargeError(ValueError):
     def __init__(self, max_bytes: int) -> None:
         super().__init__(f"file exceeds the {max_bytes} byte upload limit")
 
@@ -23,19 +23,23 @@ def safe_path(
     workspace: Path,
     requested: str,
     *,
-    temp_root: Path = Path("/tmp"),
+    # This module runs only inside the single-tenant sandbox container, where
+    # /tmp is the tmpfs mounted by DockerRuntime._start_sandbox_sync for that
+    # container alone (see runtime.py); it is never shared across tenants or
+    # writable by anything outside this sandbox.
+    temp_root: Path = Path("/tmp"),  # noqa: S108 -- in-container tmpfs, see comment above
 ) -> Path:
     workspace_root = workspace.resolve()
     temp_root = temp_root.resolve()
-    if requested == "/tmp" or requested.startswith("/tmp/"):
+    if requested == "/tmp" or requested.startswith("/tmp/"):  # noqa: S108 -- in-container tmpfs, see safe_path
         root = temp_root
-        relative = requested.removeprefix("/tmp").lstrip("/")
+        relative = requested.removeprefix("/tmp").lstrip("/")  # noqa: S108 -- in-container tmpfs, see safe_path
     elif requested == "/workspace" or requested.startswith("/workspace/"):
         root = workspace_root
         relative = requested.removeprefix("/workspace").lstrip("/")
     elif requested.startswith("/"):
         message = "absolute paths are limited to /workspace and /tmp"
-        raise UnsafePath(message)
+        raise UnsafePathError(message)
     else:
         root = workspace_root
         relative = requested
@@ -45,7 +49,7 @@ def safe_path(
         candidate.relative_to(root)
     except ValueError as exc:
         message = "path escapes the sandbox workspace"
-        raise UnsafePath(message) from exc
+        raise UnsafePathError(message) from exc
     return candidate
 
 
@@ -82,7 +86,7 @@ async def write_file_stream(
     chunks: AsyncIterator[bytes],
     *,
     max_bytes: int,
-    temp_root: Path = Path("/tmp"),
+    temp_root: Path = Path("/tmp"),  # noqa: S108 -- in-container tmpfs, see safe_path
 ) -> dict[str, str | int]:
     path = safe_path(workspace, requested, temp_root=temp_root)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -93,7 +97,7 @@ async def write_file_stream(
             async for chunk in chunks:
                 size += len(chunk)
                 if size > max_bytes:
-                    raise FileTooLarge(max_bytes)
+                    raise FileTooLargeError(max_bytes)
                 handle.write(chunk)
         staging.replace(path)
     finally:

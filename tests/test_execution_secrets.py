@@ -8,7 +8,7 @@ from harborbox.execution_secrets import (
 
 
 def test_secret_environment_is_encrypted_then_scrubbed() -> None:
-    settings = Settings(execution_secret_key="unit-test-key")
+    settings = Settings(execution_secret_key="unit-test-key")  # noqa: S106 -- fixed test fixture, not a real credential
     stored = seal_environment(
         settings,
         {"VISIBLE": "value"},

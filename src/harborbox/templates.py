@@ -42,11 +42,11 @@ class TemplateSpecError(ValueError):
     """A caller-supplied template spec that must never reach a Dockerfile."""
 
 
-class UnknownTemplate(LookupError):
+class UnknownTemplateError(LookupError):
     pass
 
 
-class TemplateNotReady(RuntimeError):
+class TemplateNotReadyError(RuntimeError):
     def __init__(self, name: str, status: str, error: str | None) -> None:
         detail = f"template {name} is {status}"
         if error:
@@ -323,10 +323,10 @@ async def resolve_template(
     resolved = await find_template(session, settings, name)
     if resolved is None:
         message = f"unknown sandbox template: {name}"
-        raise UnknownTemplate(message)
+        raise UnknownTemplateError(message)
     if resolved.status != "ready":
         template = await session.get(SandboxTemplate, name)
-        raise TemplateNotReady(
+        raise TemplateNotReadyError(
             name, resolved.status, template.error if template else None
         )
     return resolved

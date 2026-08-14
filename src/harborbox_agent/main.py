@@ -12,8 +12,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Res
 from pydantic import BaseModel, Field
 
 from harborbox_agent.files import (
-    FileTooLarge,
-    UnsafePath,
+    FileTooLargeError,
+    UnsafePathError,
     list_files,
     read_file,
     remove_file,
@@ -244,7 +244,7 @@ async def process(body: ProcessRequest) -> dict[str, Any]:
 async def get_file(path: str = Query(...)) -> dict[str, str]:
     try:
         return read_file(WORKSPACE, path)
-    except UnsafePath as exc:
+    except UnsafePathError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="file not found") from exc
@@ -256,7 +256,7 @@ async def put_file(body: FileWriteRequest) -> dict[str, str]:
         raise HTTPException(status_code=422, detail="unsupported encoding")
     try:
         return write_file(WORKSPACE, body.path, body.content, body.encoding)
-    except UnsafePath as exc:
+    except UnsafePathError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -275,9 +275,9 @@ async def put_file_content(
             request.stream(),
             max_bytes=MAX_UPLOAD_BYTES,
         )
-    except FileTooLarge as exc:
+    except FileTooLargeError as exc:
         raise HTTPException(status_code=413, detail=str(exc)) from exc
-    except UnsafePath as exc:
+    except UnsafePathError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
@@ -285,7 +285,7 @@ async def put_file_content(
 async def get_files(path: str = Query(default=".")) -> dict[str, Any]:
     try:
         return list_files(WORKSPACE, path)
-    except UnsafePath as exc:
+    except UnsafePathError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="directory not found") from exc
@@ -299,7 +299,7 @@ async def get_files(path: str = Query(default=".")) -> dict[str, Any]:
 async def delete_file(path: str = Query(...)) -> Response:
     try:
         remove_file(WORKSPACE, path)
-    except UnsafePath as exc:
+    except UnsafePathError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="file not found") from exc

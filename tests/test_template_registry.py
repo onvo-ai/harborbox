@@ -15,8 +15,8 @@ from harborbox.db import Base, get_session
 from harborbox.models import Sandbox, SandboxTemplate, utc_now
 from harborbox.security import require_api_key
 from harborbox.templates import (
-    TemplateNotReady,
-    UnknownTemplate,
+    TemplateNotReadyError,
+    UnknownTemplateError,
     resolve_template,
     validate_template_spec,
 )
@@ -134,10 +134,10 @@ async def test_derived_templates_resolve_to_their_registry_row(
 async def test_unknown_templates_are_rejected(session: AsyncSession) -> None:
     settings = Settings()
 
-    with pytest.raises(UnknownTemplate):
+    with pytest.raises(UnknownTemplateError):
         await resolve_template(session, settings, "not-a-template")
     # Well-formed, but never registered.
-    with pytest.raises(UnknownTemplate):
+    with pytest.raises(UnknownTemplateError):
         await resolve_template(session, settings, "relaydeck-a1b2c3d4e5f6")
 
 
@@ -149,7 +149,7 @@ async def test_templates_that_are_not_ready_report_their_build_status(
     session.add(template)
     await session.commit()
 
-    with pytest.raises(TemplateNotReady) as raised:
+    with pytest.raises(TemplateNotReadyError) as raised:
         await resolve_template(session, Settings(), template.name)
 
     assert raised.value.status == status
@@ -418,7 +418,7 @@ async def test_garbage_collection_spares_recent_and_in_use_templates(
             Sandbox(
                 id="sbx_live",
                 status="running",
-                agent_token="token",
+                agent_token="token",  # noqa: S106 -- placeholder fixture value, not a real credential
                 memory_mb=512,
                 cpu=1.0,
                 pids_limit=128,

@@ -15,7 +15,7 @@ from harborbox.db import session_factory
 from harborbox.execution_secrets import open_environment, scrub_environment
 from harborbox.models import Execution, Sandbox, SandboxTemplate, utc_now
 from harborbox.opensandbox_compat import expiration
-from harborbox.runtime import SandboxMemoryExceeded, SandboxUnavailable
+from harborbox.runtime import SandboxMemoryExceededError, SandboxUnavailableError
 from harborbox.schemas import (
     AgentCommandRequest,
     AgentExecutionRequest,
@@ -209,7 +209,7 @@ class Scheduler:
                     execution.status = "failed"
                     execution.finished_at = now
                     execution.error = {
-                        "name": "SandboxUnavailable",
+                        "name": "SandboxUnavailableError",
                         "value": f"sandbox is {sandbox.status}",
                         "traceback": [],
                     }
@@ -393,10 +393,10 @@ class Scheduler:
                 if current_sandbox is not None:
                     current_sandbox.last_activity_at = utc_now()
                 await session.commit()
-        except SandboxMemoryExceeded as exc:
+        except SandboxMemoryExceededError as exc:
             await self._fail_execution(execution_id, "MemoryLimitExceeded", str(exc))
-        except SandboxUnavailable as exc:
-            await self._fail_execution(execution_id, "SandboxUnavailable", str(exc))
+        except SandboxUnavailableError as exc:
+            await self._fail_execution(execution_id, "SandboxUnavailableError", str(exc))
         except Exception as exc:
             logger.exception("execution failed", extra={"execution_id": execution_id})
             await self._fail_execution(execution_id, type(exc).__name__, str(exc))
@@ -411,7 +411,7 @@ class Scheduler:
             sandbox = await session.get(Sandbox, sandbox_id)
             if sandbox is None:
                 message = "sandbox does not exist"
-                raise SandboxUnavailable(message)
+                raise SandboxUnavailableError(message)
             previous_status = sandbox.status
 
         if previous_status == "paused_memory":
@@ -422,14 +422,14 @@ class Scheduler:
             started = None
         else:
             message = f"sandbox is {previous_status}"
-            raise SandboxUnavailable(message)
+            raise SandboxUnavailableError(message)
         runtime_metadata = dict(sandbox.metadata_)
 
         async with session_factory() as session:
             sandbox = await session.get(Sandbox, sandbox_id)
             if sandbox is None:
                 message = "sandbox does not exist"
-                raise SandboxUnavailable(message)
+                raise SandboxUnavailableError(message)
             # The container exists now, so a sandbox killed while it was starting
             # must have its container removed here. Writing `running` over
             # `killed` is the write that used to strand it: DELETE's own
@@ -448,7 +448,7 @@ class Scheduler:
                             current.container_name = None
                             await cleanup.commit()
                 message = f"sandbox is {sandbox.status}"
-                raise SandboxUnavailable(message)
+                raise SandboxUnavailableError(message)
             if started is not None:
                 sandbox.container_id = started.id
                 sandbox.container_name = started.name

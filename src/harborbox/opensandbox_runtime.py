@@ -18,7 +18,7 @@ from opensandbox.exceptions import SandboxApiException, SandboxException
 from opensandbox.models.execd import Execution, ExecutionHandlers, RunCommandOpts
 from opensandbox.models.filesystem import DirectoryListEntry
 
-from harborbox.runtime import SandboxMemoryExceeded, SandboxUnavailable
+from harborbox.runtime import SandboxMemoryExceededError, SandboxUnavailableError
 from harborbox.runtime_protocol import StartedSandbox, WarmPoolReservation
 from harborbox.schemas import (
     AgentCommandRequest,
@@ -310,7 +310,7 @@ class OpenSandboxRuntime:
             # The type matters: several SDK exceptions stringify to nothing.
             f"{type(last).__name__}: {last}"
         )
-        raise SandboxUnavailable(message)
+        raise SandboxUnavailableError(message)
 
     async def execute_code(
         self, sandbox: Sandbox, request: AgentExecutionRequest
@@ -340,7 +340,7 @@ class OpenSandboxRuntime:
             return output.response(execution)
         except TimeoutError as exc:
             message = f"code execution exceeded {request.timeout_seconds} seconds"
-            raise SandboxUnavailable(message) from exc
+            raise SandboxUnavailableError(message) from exc
         except SandboxException as exc:
             self._raise_runtime_error(exc, sandbox)
 
@@ -447,7 +447,7 @@ class OpenSandboxRuntime:
                 size += len(chunk)
                 if size > self.settings.max_upload_bytes:
                     message = "file upload exceeds configured limit"
-                    raise SandboxUnavailable(message)
+                    raise SandboxUnavailableError(message)
                 upload.write(chunk)
             upload.seek(0)
             try:
@@ -512,7 +512,7 @@ class OpenSandboxRuntime:
                 ):
                     try:
                         await self._delete_snapshot(previous_snapshot_id)
-                    except SandboxUnavailable:
+                    except SandboxUnavailableError:
                         logger.warning(
                             "Could not delete replaced snapshot %s for sandbox %s",
                             previous_snapshot_id,
@@ -602,7 +602,7 @@ class OpenSandboxRuntime:
             return cached
         if not sandbox.container_id:
             message = "sandbox has no OpenSandbox runtime id"
-            raise SandboxUnavailable(message)
+            raise SandboxUnavailableError(message)
         try:
             handle = await OpenSandbox.connect(
                 sandbox.container_id,
@@ -637,12 +637,12 @@ class OpenSandboxRuntime:
             if state == "ready":
                 return
             if state == "failed":
-                raise SandboxUnavailable(
+                raise SandboxUnavailableError(
                     snapshot.status.message or "OpenSandbox snapshot failed"
                 )
             await asyncio.sleep(0.1)
         message = "OpenSandbox snapshot did not become ready"
-        raise SandboxUnavailable(message)
+        raise SandboxUnavailableError(message)
 
     async def _delete_snapshot(
         self, snapshot_id: str, *, ignore_missing: bool = False
@@ -651,7 +651,7 @@ class OpenSandboxRuntime:
             await (await self._get_manager()).delete_snapshot(snapshot_id)
         except SandboxApiException as exc:
             if not (ignore_missing and exc.status_code == 404):
-                raise SandboxUnavailable(str(exc)) from exc
+                raise SandboxUnavailableError(str(exc)) from exc
 
     @staticmethod
     def _runtime_metadata(sandbox: Sandbox) -> dict[str, str]:
@@ -668,5 +668,5 @@ class OpenSandboxRuntime:
         message = str(exc)
         lowered = message.lower()
         if "oom" in lowered or "out of memory" in lowered or "exit code 137" in lowered:
-            raise SandboxMemoryExceeded(sandbox.memory_mb) from exc
-        raise SandboxUnavailable(message) from exc
+            raise SandboxMemoryExceededError(sandbox.memory_mb) from exc
+        raise SandboxUnavailableError(message) from exc

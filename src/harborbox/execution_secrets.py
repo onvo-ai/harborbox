@@ -10,10 +10,10 @@ from cryptography.fernet import Fernet, InvalidToken
 if TYPE_CHECKING:
     from harborbox.config import Settings
 
-SECRET_ENVELOPE_KEY = "__harborbox_secret_environment"
+SECRET_ENVELOPE_KEY = "__harborbox_secret_environment"  # noqa: S105 -- dict key name, not a credential
 
 
-class InvalidSecretEnvelope(ValueError):
+class InvalidSecretEnvelopeError(ValueError):
     pass
 
 
@@ -54,13 +54,13 @@ def open_environment(
         secret = json.loads(decoded)
     except (InvalidToken, UnicodeError, json.JSONDecodeError) as exc:
         message = "invalid execution secret envelope"
-        raise InvalidSecretEnvelope(message) from exc
+        raise InvalidSecretEnvelopeError(message) from exc
     if not isinstance(secret, dict) or not all(
         isinstance(key, str) and isinstance(value, str)
         for key, value in secret.items()
     ):
         message = "invalid execution secret environment"
-        raise InvalidSecretEnvelope(message)
+        raise InvalidSecretEnvelopeError(message)
     return {**public, **secret}
 
 

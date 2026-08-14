@@ -35,7 +35,7 @@ from harborbox.opensandbox_compat import (
 )
 from harborbox.presenters import execution_response
 from harborbox.reaper import reaper_loop
-from harborbox.runtime import SandboxUnavailable
+from harborbox.runtime import SandboxUnavailableError
 from harborbox.runtime_factory import create_runtime
 from harborbox.scheduler import (
     ACTIVE_EXECUTION_STATES,
@@ -65,9 +65,9 @@ from harborbox.schemas import (
 from harborbox.security import require_api_key
 from harborbox.template_builder import TemplateBuilder
 from harborbox.templates import (
-    TemplateNotReady,
+    TemplateNotReadyError,
     TemplateSpecError,
-    UnknownTemplate,
+    UnknownTemplateError,
     list_derived_templates,
     mark_template_used,
     resolve_template,
@@ -400,9 +400,9 @@ async def create_sandbox(
     settings = settings_from(request)
     try:
         resolved = await resolve_template(session, settings, body.template)
-    except UnknownTemplate as exc:
+    except UnknownTemplateError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except TemplateNotReady as exc:
+    except TemplateNotReadyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     # An explicit request value always wins. The template row's sizing is a
@@ -591,7 +591,7 @@ async def resume_sandbox(
         await session.commit()
         await session.refresh(sandbox)
         await runtime_from(request).wait_until_ready(sandbox)
-    except SandboxUnavailable as exc:
+    except SandboxUnavailableError as exc:
         sandbox.status = "failed"
         await session.commit()
         raise HTTPException(status_code=503, detail=str(exc)) from exc
