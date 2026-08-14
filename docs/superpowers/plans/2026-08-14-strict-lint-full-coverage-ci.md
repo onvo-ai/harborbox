@@ -206,16 +206,44 @@ git commit -m "Pin Python 3.12 and make test results machine-readable"
 ### Task 2: Convert the E2E scripts to pytest
 
 **Files:**
+- Create: `tests/conftest.py`
 - Modify: `tests/e2e_smoke.py`, `tests/e2e_oom.py`, `tests/e2e_large_upload.py`, `tests/e2e_onvo_readiness.py`
 
 **Interfaces:**
 - Consumes: the `e2e` marker from Task 1.
-- Produces: `pytest -m e2e --json-report` emitting counts that Task 3 reads.
+- Produces: `tests/conftest.py` holding the shared `client` fixture, which Task 11 extends with the Docker and Postgres fixtures; `pytest -m e2e --json-report` emitting counts that Task 3 reads.
 
 The four files are standalone `__main__` scripts driven by `HARBORBOX_API_KEY`.
 They produce no machine-readable result, so the report cannot count them.
 
-- [ ] **Step 1: Convert `tests/e2e_smoke.py`**
+- [ ] **Step 1: Create `tests/conftest.py` with the shared client fixture**
+
+All four e2e modules need the same live-stack client. It goes in `conftest.py`
+from the start rather than being duplicated per file. Task 11 extends this same
+file with the Docker and Postgres fixtures.
+
+```python
+from __future__ import annotations
+
+import os
+from collections.abc import Iterator
+
+import pytest
+
+from harborbox_sdk import SandboxClient
+
+
+@pytest.fixture
+def client() -> Iterator[SandboxClient]:
+    """A live-stack SDK client. Only meaningful for tests marked `e2e`."""
+    api_key = os.environ.get("HARBORBOX_API_KEY")
+    if not api_key:
+        pytest.fail("HARBORBOX_API_KEY is required for e2e tests")
+    with SandboxClient(api_key=api_key) as live:
+        yield live
+```
+
+- [ ] **Step 2: Convert `tests/e2e_smoke.py`**
 
 Its current shape is a `def main() -> None:` reading `os.environ["HARBORBOX_API_KEY"]`
 with a trailing `if __name__ == "__main__": main()`. Convert to:
@@ -225,21 +253,11 @@ with a trailing `if __name__ == "__main__": main()`. Convert to:
 
 from __future__ import annotations
 
-import os
 import time
 
 import pytest
 
 from harborbox_sdk import SandboxClient
-
-
-@pytest.fixture
-def client() -> SandboxClient:
-    api_key = os.environ.get("HARBORBOX_API_KEY")
-    if not api_key:
-        pytest.fail("HARBORBOX_API_KEY is required for e2e tests")
-    with SandboxClient(api_key=api_key) as live:
-        yield live
 
 
 @pytest.mark.e2e
@@ -271,36 +289,35 @@ misconfigured runner reports a legible reason. Preserve every existing
 assertion and its message; do not weaken any of them. Keep the cleanup in a
 `finally` so a failing assertion still tears the sandboxes down.
 
-- [ ] **Step 2: Convert the other three the same way**
+- [ ] **Step 3: Convert the other three the same way**
 
 `e2e_oom.py`, `e2e_large_upload.py`, `e2e_onvo_readiness.py`. Same shape:
-module docstring, the `client` fixture (move it to `tests/conftest.py` in Task
-11 once that file exists — for now duplicate it, and remember to de-duplicate),
-`@pytest.mark.e2e` on each test, `__main__` block deleted, every original
-assertion preserved.
+module docstring, the `client` fixture taken from `conftest.py` (do not
+redefine it per file), `@pytest.mark.e2e` on each test, `__main__` block
+deleted, every original assertion preserved.
 
 Read each file before converting. Some have multiple logical phases in one
 `main()` — split those into separate `test_` functions, one per phase, so the
 report counts them individually and a failure names the phase.
 
-- [ ] **Step 3: Verify e2e is excluded from the default run**
+- [ ] **Step 4: Verify e2e is excluded from the default run**
 
 Run: `uv run pytest --collect-only -q | tail -3`
 Expected: the count is still 115. The e2e tests are collected but deselected
 by `-m 'not e2e'`.
 
-- [ ] **Step 4: Verify e2e is selectable and reports counts**
+- [ ] **Step 5: Verify e2e is selectable and reports counts**
 
 Run: `uv run pytest -m e2e --collect-only -q | tail -3`
 Expected: lists the converted e2e tests (at least 4). This only collects — it
 does not run them, because there is no live stack locally.
 
-- [ ] **Step 5: Verify lint and types still pass**
+- [ ] **Step 6: Verify lint and types still pass**
 
 Run: `uv run mypy && uv run ruff check .`
 Expected: both exit zero.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add tests/
@@ -1275,7 +1292,7 @@ the documented ignore list.
 Run: `uv run pytest && uv run mypy`
 Expected: 115 tests pass, mypy exits zero.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add .
@@ -1319,7 +1336,8 @@ git commit -m "Make the strict lint gate blocking"
 ### Task 11: Shared test fixtures — the Docker fake and real Postgres
 
 **Files:**
-- Create: `tests/conftest.py`, `tests/fakes/__init__.py`, `tests/fakes/docker.py`
+- Create: `tests/fakes/__init__.py`, `tests/fakes/docker.py`
+- Modify: `tests/conftest.py` (created in Task 2; extend it, keep the existing `client` fixture)
 
 **Interfaces:**
 - Consumes: nothing.
@@ -1474,23 +1492,29 @@ class FakeDockerClient:
 Adjust to match exactly what Step 1 printed. If Step 1 shows a method not
 listed here, add it; if it shows one of these is unused, delete it.
 
-- [ ] **Step 3: Write the conftest**
+- [ ] **Step 3: Extend the conftest**
 
-Create `tests/conftest.py`:
+`tests/conftest.py` already exists from Task 2 with the `client` fixture. Add
+the imports and the fixtures below to it; do not remove `client`.
 
 ```python
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 
+import docker
 import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from harborbox.config import Settings
 from harborbox.db import Base
+from harborbox.runtime import DockerRuntime
 from tests.fakes.docker import FakeDockerClient
+
+
+# The `client` fixture from Task 2 stays exactly as it is, above this point.
 
 
 @pytest.fixture
@@ -1504,20 +1528,19 @@ def settings() -> Settings:
 
 
 @pytest.fixture
-def docker_runtime(fake_docker: FakeDockerClient, settings: Settings, monkeypatch: pytest.MonkeyPatch):
+def docker_runtime(
+    fake_docker: FakeDockerClient,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> DockerRuntime:
     """A DockerRuntime whose SDK client is the fake.
 
     DockerRuntime.__init__ calls docker.DockerClient(...), which would try to
     reach a real daemon, so the constructor is patched rather than the attribute
     reassigned after the fact.
     """
-    import docker
-
-    from harborbox.runtime import DockerRuntime
-
     monkeypatch.setattr(docker, "DockerClient", lambda **_: fake_docker)
-    runtime = DockerRuntime(settings)
-    return runtime
+    return DockerRuntime(settings)
 
 
 @pytest_asyncio.fixture
@@ -1544,12 +1567,7 @@ async def pg_sessions() -> AsyncIterator[async_sessionmaker[AsyncSession]]:
         await engine.dispose()
 ```
 
-- [ ] **Step 4: Move the duplicated e2e `client` fixture here**
-
-Task 2 duplicated a `client` fixture across four e2e files. Move one copy into
-`tests/conftest.py` and delete the other four.
-
-- [ ] **Step 5: Document how to run the Postgres tests locally**
+- [ ] **Step 4: Document how to run the Postgres tests locally**
 
 Add to `README.md` under the existing development section:
 
@@ -1575,7 +1593,7 @@ uv run pytest
 ```
 ````
 
-- [ ] **Step 6: Write a smoke test proving both fixtures work**
+- [ ] **Step 5: Write a smoke test proving both fixtures work**
 
 Create `tests/test_fixtures.py`:
 
@@ -1613,24 +1631,24 @@ async def test_postgres_fixture_yields_a_working_session(
         assert (await session.execute(text("select 1"))).scalar_one() == 1
 ```
 
-- [ ] **Step 7: Run without Postgres**
+- [ ] **Step 6: Run without Postgres**
 
 Run: `uv run pytest tests/test_fixtures.py -v`
 Expected: two pass, the Postgres one skips with the configured reason.
 
-- [ ] **Step 8: Run with Postgres**
+- [ ] **Step 7: Run with Postgres**
 
-Start the container from Step 5, export the URL, then:
+Start the container from Step 4, export the URL, then:
 Run: `uv run pytest tests/test_fixtures.py -v`
 Expected: all three pass.
 
-- [ ] **Step 9: Verify lint and types**
+- [ ] **Step 8: Verify lint and types**
 
 Run: `uv run mypy && uv run ruff check .`
 Expected: both exit zero. This is new code under the strict gate from Task 10 —
 it must arrive clean.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add tests/ README.md
@@ -2168,7 +2186,14 @@ build — use the `fake_docker` fixture from Task 11.
 
 - [ ] **Step 3: Completion command**
 
-Run: `uv run pytest --cov --cov-fail-under=100`
+Postgres must be running and exported, or the Task 13 tests skip and the gate
+cannot reach 100%:
+
+```bash
+export HARBORBOX_TEST_DATABASE_URL=postgresql+asyncpg://harborbox:harborbox@127.0.0.1:5432/harborbox_test
+uv run pytest --cov --cov-fail-under=100
+```
+
 Expected: exit zero. This is the whole-repo gate, not a per-module one — after
 this task, coverage is 100% across `src/`.
 
