@@ -222,7 +222,8 @@ class Settings(BaseSettings):
 
     def image_for_template(self, template: str | None) -> str:
         if template is None:
-            raise KeyError("a registered sandbox template is required")
+            message = "a registered sandbox template is required"
+            raise KeyError(message)
         image = self.template_images.get(template)
         if image is not None:
             return image
@@ -266,7 +267,8 @@ class Settings(BaseSettings):
         only place allowed to read it.
         """
         if template is None:
-            raise KeyError("a registered sandbox template is required")
+            message = "a registered sandbox template is required"
+            raise KeyError(message)
         resources = self.template_resources.get(template)
         if resources is not None:
             return resources
@@ -279,11 +281,11 @@ class Settings(BaseSettings):
     def validate_warm_pool_budget(self) -> "Settings":
         for template, (memory_mb, cpu) in self.template_resources.items():
             if memory_mb > self.max_sandbox_memory_mb:
-                raise ValueError(
-                    f"{template} template memory exceeds max sandbox memory"
-                )
+                message = f"{template} template memory exceeds max sandbox memory"
+                raise ValueError(message)
             if cpu > self.max_sandbox_cpu:
-                raise ValueError(f"{template} template CPU exceeds max sandbox CPU")
+                message = f"{template} template CPU exceeds max sandbox CPU"
+                raise ValueError(message)
 
         warm_memory = sum(
             self.warm_pool_sizes[template] * resources[0]
@@ -297,9 +299,11 @@ class Settings(BaseSettings):
             self.sandbox_memory_budget_mb is not None
             and warm_memory > self.sandbox_memory_budget_mb
         ):
-            raise ValueError("warm pool exceeds the aggregate sandbox memory budget")
+            message = "warm pool exceeds the aggregate sandbox memory budget"
+            raise ValueError(message)
         if self.max_parallel_cpu is not None and warm_cpu > self.max_parallel_cpu:
-            raise ValueError("warm pool exceeds the aggregate sandbox CPU budget")
+            message = "warm pool exceeds the aggregate sandbox CPU budget"
+            raise ValueError(message)
 
         """
         A pool that fits is not the same as a pool that leaves room.
@@ -320,12 +324,13 @@ class Settings(BaseSettings):
             self.max_parallel_cpu is not None
             and warm_cpu + largest_template_cpu > self.max_parallel_cpu
         ):
-            raise ValueError(
+            message = (
                 f"warm pool leaves no CPU headroom: reserves {warm_cpu} of "
                 f"{self.max_parallel_cpu}, but the largest template needs "
                 f"{largest_template_cpu}. Raise max_parallel_cpu to at least "
                 f"{warm_cpu + largest_template_cpu} or shrink the pool."
             )
+            raise ValueError(message)
         return self
 
 

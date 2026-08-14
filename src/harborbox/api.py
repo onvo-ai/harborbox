@@ -586,11 +586,12 @@ async def resume_sandbox(
         await session.commit()
         await session.refresh(sandbox)
         await runtime_from(request).wait_until_ready(sandbox)
-        return sandbox
     except SandboxUnavailable as exc:
         sandbox.status = "failed"
         await session.commit()
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    else:
+        return sandbox
 
 
 @app.delete(
@@ -796,7 +797,8 @@ async def opensandbox_renew(
     sandbox = await get_sandbox_or_404(session, sandbox_id)
     expires_at = body.expires_at.astimezone(UTC)
     if expires_at <= utc_now():
-        raise opensandbox_error("expiresAt must be in the future")
+        message = "expiresAt must be in the future"
+        raise opensandbox_error(message)
     metadata = dict(sandbox.metadata_)
     metadata[f"{INTERNAL_PREFIX}expires_at"] = expires_at.isoformat()
     sandbox.metadata_ = metadata
@@ -821,7 +823,8 @@ async def opensandbox_patch_metadata(
     metadata = dict(sandbox.metadata_)
     for key, value in body.items():
         if key.startswith(INTERNAL_PREFIX):
-            raise opensandbox_error(f"metadata key {key} is reserved")
+            message = f"metadata key {key} is reserved"
+            raise opensandbox_error(message)
         if value is None:
             metadata.pop(key, None)
         else:

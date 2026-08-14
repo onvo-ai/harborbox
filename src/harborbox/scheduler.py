@@ -406,7 +406,8 @@ class Scheduler:
         async with session_factory() as session:
             sandbox = await session.get(Sandbox, sandbox_id)
             if sandbox is None:
-                raise SandboxUnavailable("sandbox does not exist")
+                message = "sandbox does not exist"
+                raise SandboxUnavailable(message)
             previous_status = sandbox.status
 
         if previous_status == "paused_memory":
@@ -416,13 +417,15 @@ class Scheduler:
         elif previous_status == "running":
             started = None
         else:
-            raise SandboxUnavailable(f"sandbox is {previous_status}")
+            message = f"sandbox is {previous_status}"
+            raise SandboxUnavailable(message)
         runtime_metadata = dict(sandbox.metadata_)
 
         async with session_factory() as session:
             sandbox = await session.get(Sandbox, sandbox_id)
             if sandbox is None:
-                raise SandboxUnavailable("sandbox does not exist")
+                message = "sandbox does not exist"
+                raise SandboxUnavailable(message)
             # The container exists now, so a sandbox killed while it was starting
             # must have its container removed here. Writing `running` over
             # `killed` is the write that used to strand it: DELETE's own
@@ -440,7 +443,8 @@ class Scheduler:
                             current.container_id = None
                             current.container_name = None
                             await cleanup.commit()
-                raise SandboxUnavailable(f"sandbox is {sandbox.status}")
+                message = f"sandbox is {sandbox.status}"
+                raise SandboxUnavailable(message)
             if started is not None:
                 sandbox.container_id = started.id
                 sandbox.container_name = started.name

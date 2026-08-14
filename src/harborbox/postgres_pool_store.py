@@ -35,11 +35,11 @@ class AsyncPostgresPoolStateStore:
         except (ValueError, PoolDestroyedException):
             raise
         except Exception as exc:
-            raise PoolStateStoreUnavailableException(
+            message = (
                 "PostgreSQL pool state store operation failed: "
-                f"operation={operation} pool_name={pool_name}",
-                exc,
-            ) from exc
+                f"operation={operation} pool_name={pool_name}"
+            )
+            raise PoolStateStoreUnavailableException(message, exc) from exc
 
     async def _locked_state(
         self, session: AsyncSession, pool_name: str
@@ -52,7 +52,8 @@ class AsyncPostgresPoolStateStore:
         )
         state = await session.get(WarmPoolState, pool_name, with_for_update=True)
         if state is None:  # pragma: no cover - protected by the upsert above
-            raise RuntimeError(f"could not initialize warm pool state: {pool_name}")
+            message = f"could not initialize warm pool state: {pool_name}"
+            raise RuntimeError(message)
         now = datetime.now(UTC)
         if (
             state.destroy_state == PoolDestroyState.DESTROYED.value
@@ -67,9 +68,8 @@ class AsyncPostgresPoolStateStore:
     @staticmethod
     def _require_active(state: WarmPoolState) -> None:
         if state.destroy_state != PoolDestroyState.ACTIVE.value:
-            raise PoolDestroyedException(
-                f"Pool namespace is {state.destroy_state}: pool_name={state.pool_name}"
-            )
+            message = f"Pool namespace is {state.destroy_state}: pool_name={state.pool_name}"
+            raise PoolDestroyedException(message)
 
     async def try_take_idle(self, pool_name: str) -> str | None:
         return (await self._take_idle(pool_name, timedelta(0))).sandbox_id
@@ -118,7 +118,8 @@ class AsyncPostgresPoolStateStore:
 
     async def put_idle(self, pool_name: str, sandbox_id: str) -> None:
         if not sandbox_id or not sandbox_id.strip():
-            raise ValueError("sandbox_id must not be blank")
+            message = "sandbox_id must not be blank"
+            raise ValueError(message)
         async with self._operation("put_idle", pool_name):
             async with self._sessions.begin() as session:
                 state = await self._locked_state(session, pool_name)
@@ -267,7 +268,8 @@ class AsyncPostgresPoolStateStore:
 
     async def set_max_idle(self, pool_name: str, max_idle: int) -> None:
         if max_idle < 0:
-            raise ValueError("max_idle must be >= 0")
+            message = "max_idle must be >= 0"
+            raise ValueError(message)
         async with self._operation("set_max_idle", pool_name):
             async with self._sessions.begin() as session:
                 state = await self._locked_state(session, pool_name)
@@ -276,7 +278,8 @@ class AsyncPostgresPoolStateStore:
 
     async def set_idle_entry_ttl(self, pool_name: str, idle_ttl: timedelta) -> None:
         if idle_ttl.total_seconds() <= 0:
-            raise ValueError("idle_ttl must be positive")
+            message = "idle_ttl must be positive"
+            raise ValueError(message)
         async with self._operation("set_idle_entry_ttl", pool_name):
             async with self._sessions.begin() as session:
                 state = await self._locked_state(session, pool_name)
@@ -295,9 +298,8 @@ class AsyncPostgresPoolStateStore:
             async with self._sessions.begin() as session:
                 state = await self._locked_state(session, pool_name)
                 if state.destroy_state == PoolDestroyState.DESTROYED.value:
-                    raise PoolDestroyedException(
-                        f"Pool namespace is already DESTROYED: pool_name={pool_name}"
-                    )
+                    message = f"Pool namespace is already DESTROYED: pool_name={pool_name}"
+                    raise PoolDestroyedException(message)
                 state.destroy_state = PoolDestroyState.DESTROYING.value
                 state.destroy_owner = owner_id
                 state.destroy_expires_at = None
@@ -321,7 +323,8 @@ class AsyncPostgresPoolStateStore:
     ) -> None:
         self._validate_owner(owner_id)
         if tombstone_ttl is not None and tombstone_ttl.total_seconds() <= 0:
-            raise ValueError("tombstone_ttl must be positive")
+            message = "tombstone_ttl must be positive"
+            raise ValueError(message)
         async with self._operation("mark_destroyed", pool_name):
             async with self._sessions.begin() as session:
                 state = await self._locked_state(session, pool_name)
@@ -336,15 +339,18 @@ class AsyncPostgresPoolStateStore:
     @staticmethod
     def _validate_pool_name(pool_name: str) -> None:
         if not pool_name or not pool_name.strip():
-            raise ValueError("pool_name must not be blank")
+            message = "pool_name must not be blank"
+            raise ValueError(message)
 
     @staticmethod
     def _validate_owner(owner_id: str) -> None:
         if not owner_id or not owner_id.strip():
-            raise ValueError("owner_id must not be blank")
+            message = "owner_id must not be blank"
+            raise ValueError(message)
 
     @classmethod
     def _validate_owner_ttl(cls, owner_id: str, ttl: timedelta) -> None:
         cls._validate_owner(owner_id)
         if ttl.total_seconds() <= 0:
-            raise ValueError("ttl must be positive")
+            message = "ttl must be positive"
+            raise ValueError(message)

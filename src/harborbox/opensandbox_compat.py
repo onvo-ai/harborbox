@@ -41,25 +41,25 @@ class OpenSandboxCreate(BaseModel):
     @model_validator(mode="after")
     def supported_startup_source(self) -> OpenSandboxCreate:
         if self.snapshot_id is not None:
-            raise ValueError("snapshot restore is not supported by the Docker provider")
+            message = "snapshot restore is not supported by the Docker provider"
+            raise ValueError(message)
         if self.image is None and not self.extensions.get("templateRef"):
-            raise ValueError("image or extensions.templateRef is required")
+            message = "image or extensions.templateRef is required"
+            raise ValueError(message)
         if self.env:
-            raise ValueError(
+            message = (
                 "persistent sandbox environment is not supported; pass secrets per execution"
             )
+            raise ValueError(message)
         if self.volumes:
-            raise ValueError(
-                "custom volumes are not supported; /workspace is managed automatically"
-            )
+            message = "custom volumes are not supported; /workspace is managed automatically"
+            raise ValueError(message)
         if self.network_policy is not None:
-            raise ValueError(
-                "networkPolicy requires an OpenSandbox or Kubernetes runtime provider"
-            )
+            message = "networkPolicy requires an OpenSandbox or Kubernetes runtime provider"
+            raise ValueError(message)
         if self.secure_access:
-            raise ValueError(
-                "secureAccess requires an OpenSandbox or Kubernetes runtime provider"
-            )
+            message = "secureAccess requires an OpenSandbox or Kubernetes runtime provider"
+            raise ValueError(message)
         return self
 
 
@@ -116,7 +116,8 @@ class OpenSandboxRenewResponse(BaseModel):
 def parse_memory_mb(value: str) -> int:
     match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KMGT]i?|)\s*", value, re.IGNORECASE)
     if not match:
-        raise ValueError(f"invalid memory resource limit: {value}")
+        message = f"invalid memory resource limit: {value}"
+        raise ValueError(message)
     amount = float(match.group(1))
     unit = match.group(2).lower()
     factors = {
@@ -146,15 +147,15 @@ def template_for(body: OpenSandboxCreate, settings: Settings) -> str:
         # Well-formedness only. Whether a derived template exists and is ready is
         # decided by the registry in `create_sandbox`.
         if not settings.is_known_template_name(requested):
-            raise ValueError(f"unknown sandbox template: {requested}")
+            message = f"unknown sandbox template: {requested}"
+            raise ValueError(message)
         return requested
     assert body.image is not None
     for template, image in settings.template_images.items():
         if body.image.uri == image:
             return template
-    raise ValueError(
-        "a registered Harborbox templateRef or template image is required"
-    )
+    message = "a registered Harborbox templateRef or template image is required"
+    raise ValueError(message)
 
 
 def create_metadata(
@@ -164,7 +165,8 @@ def create_metadata(
     now: datetime | None = None,
 ) -> dict[str, str]:
     if any(key.startswith(INTERNAL_PREFIX) for key in body.metadata):
-        raise ValueError(f"metadata keys beginning with {INTERNAL_PREFIX} are reserved")
+        message = f"metadata keys beginning with {INTERNAL_PREFIX} are reserved"
+        raise ValueError(message)
     created = now or utc_now()
     metadata = dict(body.metadata)
     metadata[f"{INTERNAL_PREFIX}image"] = body.image.uri if body.image else ""

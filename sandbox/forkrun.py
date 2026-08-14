@@ -63,7 +63,8 @@ def _recv_exact(sock: socket.socket, count: int) -> bytes:
     while count:
         chunk = sock.recv(count)
         if not chunk:
-            raise EOFError("forkrun daemon closed the connection")
+            message = "forkrun daemon closed the connection"
+            raise EOFError(message)
         chunks.append(chunk)
         count -= len(chunk)
     return b"".join(chunks)
@@ -175,9 +176,10 @@ def _connect() -> "socket.socket | None":
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.connect(SOCKET_PATH)
-            return sock
         except (FileNotFoundError, ConnectionRefusedError):
             pass
+        else:
+            return sock
 
         _spawn_daemon()
         deadline = time.time() + _READY_TIMEOUT_S
@@ -185,9 +187,10 @@ def _connect() -> "socket.socket | None":
             try:
                 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 sock.connect(SOCKET_PATH)
-                return sock
             except (FileNotFoundError, ConnectionRefusedError):
                 time.sleep(0.05)
+            else:
+                return sock
     return None
 
 

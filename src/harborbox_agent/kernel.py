@@ -21,6 +21,14 @@ class KernelExecution:
     truncated: bool = False
 
 
+def _remaining_time(deadline: float) -> float:
+    """Seconds left before `deadline`, or raise if it has already passed."""
+    remaining = deadline - monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    return remaining
+
+
 class KernelSession:
     def __init__(self, workspace: str) -> None:
         self.workspace = workspace
@@ -82,7 +90,8 @@ class KernelSession:
         max_output_bytes: int,
     ) -> KernelExecution:
         if self.client is None:
-            raise RuntimeError("kernel is not running")
+            message = "kernel is not running"
+            raise RuntimeError(message)
         async with self.lock:
             return await self._execute_locked(
                 code,
@@ -118,9 +127,7 @@ class KernelSession:
 
         try:
             while True:
-                remaining = deadline - monotonic()
-                if remaining <= 0:
-                    raise TimeoutError
+                remaining = _remaining_time(deadline)
                 message = await self.client.get_iopub_msg(timeout=remaining)
                 if message.get("parent_header", {}).get("msg_id") != message_id:
                     continue

@@ -51,12 +51,14 @@ def open_environment(
         decoded = _fernet(settings).decrypt(envelope.encode("ascii"))
         secret = json.loads(decoded)
     except (InvalidToken, UnicodeError, json.JSONDecodeError) as exc:
-        raise InvalidSecretEnvelope("invalid execution secret envelope") from exc
+        message = "invalid execution secret envelope"
+        raise InvalidSecretEnvelope(message) from exc
     if not isinstance(secret, dict) or not all(
         isinstance(key, str) and isinstance(value, str)
         for key, value in secret.items()
     ):
-        raise InvalidSecretEnvelope("invalid execution secret environment")
+        message = "invalid execution secret environment"
+        raise InvalidSecretEnvelope(message)
     return {**public, **secret}
 
 

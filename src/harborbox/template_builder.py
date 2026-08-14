@@ -129,14 +129,12 @@ class TemplateBuilder:
                 check=False,
             )
         except FileNotFoundError as exc:
-            raise TemplateBuildError(
-                "the docker CLI is not installed in the Harborbox API image"
-            ) from exc
+            message = "the docker CLI is not installed in the Harborbox API image"
+            raise TemplateBuildError(message) from exc
         except subprocess.TimeoutExpired as exc:
             timeout = self.settings.template_build_timeout_seconds
-            raise TemplateBuildError(
-                f"the image build exceeded {timeout:.0f} seconds"
-            ) from exc
+            message = f"the image build exceeded {timeout:.0f} seconds"
+            raise TemplateBuildError(message) from exc
         except OSError as exc:
             raise TemplateBuildError(str(exc)[:MAX_ERROR_LENGTH]) from exc
         output = f"{completed.stdout}\n{completed.stderr}"

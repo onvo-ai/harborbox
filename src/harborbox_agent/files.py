@@ -13,7 +13,8 @@ class UnsafePath(ValueError):
 
 
 class FileTooLarge(ValueError):
-    pass
+    def __init__(self, max_bytes: int) -> None:
+        super().__init__(f"file exceeds the {max_bytes} byte upload limit")
 
 
 def safe_path(
@@ -31,7 +32,8 @@ def safe_path(
         root = workspace_root
         relative = requested.removeprefix("/workspace").lstrip("/")
     elif requested.startswith("/"):
-        raise UnsafePath("absolute paths are limited to /workspace and /tmp")
+        message = "absolute paths are limited to /workspace and /tmp"
+        raise UnsafePath(message)
     else:
         root = workspace_root
         relative = requested
@@ -40,7 +42,8 @@ def safe_path(
     try:
         candidate.relative_to(root)
     except ValueError as exc:
-        raise UnsafePath("path escapes the sandbox workspace") from exc
+        message = "path escapes the sandbox workspace"
+        raise UnsafePath(message) from exc
     return candidate
 
 
@@ -88,7 +91,7 @@ async def write_file_stream(
             async for chunk in chunks:
                 size += len(chunk)
                 if size > max_bytes:
-                    raise FileTooLarge(f"file exceeds the {max_bytes} byte upload limit")
+                    raise FileTooLarge(max_bytes)
                 handle.write(chunk)
         staging.replace(path)
     finally:

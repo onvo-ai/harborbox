@@ -286,7 +286,6 @@ class OpenSandboxRuntime:
                     await interpreter.codes.run(
                         "pass", language=SupportedLanguage.PYTHON
                     )
-                return
             except Exception as exc:  # noqa: BLE001 - retried until the deadline
                 last = exc
                 logger.warning(
@@ -296,12 +295,15 @@ class OpenSandboxRuntime:
                     exc,
                 )
                 await asyncio.sleep(1.0)
-        raise SandboxUnavailable(
+            else:
+                return
+        message = (
             "sandbox started but its Python kernel never became available after "
             f"{self.settings.sandbox_python_ready_timeout_seconds}s: "
             # The type matters: several SDK exceptions stringify to nothing.
             f"{type(last).__name__}: {last}"
         )
+        raise SandboxUnavailable(message)
 
     async def execute_code(
         self, sandbox: Sandbox, request: AgentExecutionRequest
@@ -330,9 +332,8 @@ class OpenSandboxRuntime:
                 )
             return output.response(execution)
         except TimeoutError as exc:
-            raise SandboxUnavailable(
-                f"code execution exceeded {request.timeout_seconds} seconds"
-            ) from exc
+            message = f"code execution exceeded {request.timeout_seconds} seconds"
+            raise SandboxUnavailable(message) from exc
         except SandboxException as exc:
             self._raise_runtime_error(exc, sandbox)
 
@@ -438,7 +439,8 @@ class OpenSandboxRuntime:
             async for chunk in content:
                 size += len(chunk)
                 if size > self.settings.max_upload_bytes:
-                    raise SandboxUnavailable("file upload exceeds configured limit")
+                    message = "file upload exceeds configured limit"
+                    raise SandboxUnavailable(message)
                 upload.write(chunk)
             upload.seek(0)
             try:
@@ -592,7 +594,8 @@ class OpenSandboxRuntime:
         if cached is not None:
             return cached
         if not sandbox.container_id:
-            raise SandboxUnavailable("sandbox has no OpenSandbox runtime id")
+            message = "sandbox has no OpenSandbox runtime id"
+            raise SandboxUnavailable(message)
         try:
             handle = await OpenSandbox.connect(
                 sandbox.container_id,
@@ -631,7 +634,8 @@ class OpenSandboxRuntime:
                     snapshot.status.message or "OpenSandbox snapshot failed"
                 )
             await asyncio.sleep(0.1)
-        raise SandboxUnavailable("OpenSandbox snapshot did not become ready")
+        message = "OpenSandbox snapshot did not become ready"
+        raise SandboxUnavailable(message)
 
     async def _delete_snapshot(
         self, snapshot_id: str, *, ignore_missing: bool = False
@@ -657,7 +661,5 @@ class OpenSandboxRuntime:
         message = str(exc)
         lowered = message.lower()
         if "oom" in lowered or "out of memory" in lowered or "exit code 137" in lowered:
-            raise SandboxMemoryExceeded(
-                f"sandbox exceeded its {sandbox.memory_mb} MiB memory limit"
-            ) from exc
+            raise SandboxMemoryExceeded(sandbox.memory_mb) from exc
         raise SandboxUnavailable(message) from exc

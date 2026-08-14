@@ -186,5 +186,6 @@ async def reaper_loop(
 def _require(value: datetime | None) -> datetime:
     """`created_at` is NOT NULL in the schema; this narrows the type."""
     if value is None:  # pragma: no cover - defensive
-        raise ValueError("sandbox has no created_at")
+        message = "sandbox has no created_at"
+        raise ValueError(message)
     return value

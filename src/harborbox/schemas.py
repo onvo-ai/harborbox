@@ -250,5 +250,6 @@ class AgentExecutionResponse(BaseModel):
     @model_validator(mode="after")
     def error_and_exit_are_consistent(self) -> AgentExecutionResponse:
         if self.error is not None and self.exit_code == 0:
-            raise ValueError("an errored execution cannot have exit_code=0")
+            message = "an errored execution cannot have exit_code=0"
+            raise ValueError(message)
         return self

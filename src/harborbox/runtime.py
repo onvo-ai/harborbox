@@ -32,7 +32,8 @@ class SandboxUnavailable(RuntimeErrorBase):
 
 
 class SandboxMemoryExceeded(RuntimeErrorBase):
-    pass
+    def __init__(self, memory_mb: int) -> None:
+        super().__init__(f"sandbox exceeded its {memory_mb} MiB memory limit")
 
 
 class DockerRuntime:
@@ -85,7 +86,8 @@ class DockerRuntime:
         try:
             sandbox_image = self.settings.image_for_template(template)
         except KeyError as exc:
-            raise SandboxUnavailable(f"unknown sandbox template: {template}") from exc
+            message = f"unknown sandbox template: {template}"
+            raise SandboxUnavailable(message) from exc
         if self.settings.sandbox_runtime:
             runtime_options["runtime"] = self.settings.sandbox_runtime
 
@@ -203,7 +205,8 @@ class DockerRuntime:
                 pass
             await asyncio.sleep(0.05)
         await self._raise_container_failure(sandbox)
-        raise SandboxUnavailable("sandbox agent did not become ready")
+        message = "sandbox agent did not become ready"
+        raise SandboxUnavailable(message)
 
     async def execute_code(
         self, sandbox: Sandbox, request: AgentExecutionRequest
@@ -373,13 +376,12 @@ class DockerRuntime:
 
         state = await asyncio.to_thread(inspect)
         if state and (state[1] or state[0] == 137):
-            raise SandboxMemoryExceeded(
-                f"sandbox exceeded its {sandbox.memory_mb} MiB memory limit"
-            )
+            raise SandboxMemoryExceeded(sandbox.memory_mb)
 
     def _agent_url(self, sandbox: Sandbox, path: str) -> str:
         if not sandbox.container_name:
-            raise SandboxUnavailable("sandbox has no running container")
+            message = "sandbox has no running container"
+            raise SandboxUnavailable(message)
         return (
             f"http://{sandbox.container_name}:{self.settings.sandbox_agent_port}{path}"
         )

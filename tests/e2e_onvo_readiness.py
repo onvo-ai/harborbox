@@ -12,7 +12,8 @@ from harborbox_sdk import Sandbox, SandboxClient
 
 def timestamp(value: str | None) -> datetime:
     if value is None:
-        raise AssertionError("execution timestamp is missing")
+        message = "execution timestamp is missing"
+        raise AssertionError(message)
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 

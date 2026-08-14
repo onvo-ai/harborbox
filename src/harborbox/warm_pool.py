@@ -155,7 +155,6 @@ class OpenSandboxWarmPools:
             )
             self._renew_tasks.add(task)
             task.add_done_callback(self._renew_tasks.discard)
-            return sandbox
         except SandboxException:
             logger.debug(
                 "No ready warm sandbox for template %s; using direct creation",
@@ -163,6 +162,8 @@ class OpenSandboxWarmPools:
                 exc_info=True,
             )
             return None
+        else:
+            return sandbox
 
     async def _renew_acquired(self, sandbox: OpenSandbox) -> None:
         try:
@@ -205,9 +206,10 @@ class OpenSandboxWarmPools:
         while not self._stop.is_set():
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=interval)
-                return
             except TimeoutError:
                 pass
+            else:
+                return
             await self._scale_down_inactive()
 
     async def _scale_down_inactive(self) -> None:
