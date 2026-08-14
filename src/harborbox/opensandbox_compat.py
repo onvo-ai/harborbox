@@ -114,7 +114,7 @@ class OpenSandboxRenewResponse(BaseModel):
 
 
 def parse_memory_mb(value: str) -> int:
-    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KMGT]i?|)\s*", value, re.I)
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KMGT]i?|)\s*", value, re.IGNORECASE)
     if not match:
         raise ValueError(f"invalid memory resource limit: {value}")
     amount = float(match.group(1))

@@ -250,7 +250,7 @@ class Settings(BaseSettings):
     @property
     def warm_pool_sizes(self) -> dict[str, int]:
         if not self.warm_pool_enabled:
-            return {template: 0 for template in self.template_images}
+            return dict.fromkeys(self.template_images, 0)
         return {
             "relaydeck": self.warm_pool_relaydeck,
             "onvo-pro": self.warm_pool_onvo_pro,

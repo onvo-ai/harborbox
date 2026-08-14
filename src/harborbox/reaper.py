@@ -152,7 +152,6 @@ async def reap_once(
 
 def _aware(value: datetime | None) -> datetime | None:
     """Normalise to UTC-aware; the column may come back naive."""
-
     if value is None:
         return None
     return value if value.tzinfo else value.replace(tzinfo=UTC)

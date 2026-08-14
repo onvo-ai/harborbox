@@ -183,7 +183,7 @@ def test_onvo_pro_sizing_fits_the_configured_cpu_budget(settings: Settings) -> N
 
 
 def test_python_kernelspec_is_registered_under_the_language_name() -> None:
-    """execd looks a kernel up by the language it was asked for.
+    """Execd looks a kernel up by the language it was asked for.
 
     The SDK's default context language is `python`, and execd resolves that
     against Jupyter's kernelspec *names*. `ipykernel install` registers
@@ -204,7 +204,7 @@ def test_python_kernelspec_is_registered_under_the_language_name() -> None:
 
 
 def test_jupyter_flags_live_in_the_entrypoint_not_only_the_image() -> None:
-    """opensandbox discards the image CMD and runs the create request's list.
+    """Opensandbox discards the image CMD and runs the create request's list.
 
     Flags added to the Dockerfile alone silently do nothing, which cost an
     afternoon: token auth stayed on because `--IdentityProvider.token=` was in

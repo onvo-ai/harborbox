@@ -34,7 +34,7 @@ def sandbox(client: SandboxClient) -> Iterator[Sandbox]:
 @pytest.mark.e2e
 def test_onvo_sandbox_has_required_python_packages(sandbox: Sandbox) -> None:
     imports = sandbox.commands.run(
-        "python -c \"import duckdb,pandas,numpy,pymysql,sqlalchemy,psycopg2,"
+        'python -c "import duckdb,pandas,numpy,pymysql,sqlalchemy,psycopg2,'
         "pymongo,pymssql,clickhouse_connect,snowflake.connector,openpyxl,"
         "gspread,google.auth; print('imports-ok')\"",
         timeout=60,
@@ -48,7 +48,7 @@ def test_onvo_sandbox_persists_binary_files(sandbox: Sandbox) -> None:
     payload = b"onvo\x00binary\xffpayload"
     assert sandbox.files.write_bytes("/tmp/onvo.bin", payload) == len(payload)
     binary_check = sandbox.commands.run(
-        "python -c \"from pathlib import Path; "
+        'python -c "from pathlib import Path; '
         "print(Path('/tmp/onvo.bin').read_bytes().hex())\"",
     )
     assert binary_check.status == "succeeded", binary_check.error
@@ -62,13 +62,13 @@ def test_onvo_sandbox_runs_duckdb_transform(sandbox: Sandbox) -> None:
         csv_payload
     )
     transform = sandbox.commands.run(
-        "python -c \"import duckdb,json; "
+        'python -c "import duckdb,json; '
         "duckdb.execute(\\\"SET memory_limit='400MB'\\\"); "
-        "duckdb.execute(\\\"CREATE TABLE data AS SELECT * FROM "
+        'duckdb.execute(\\"CREATE TABLE data AS SELECT * FROM '
         "read_csv_auto('/tmp/data_probe.csv')\\\"); "
-        "rows=duckdb.execute(\\\"SELECT region, SUM(revenue) total "
-        "FROM data GROUP BY region ORDER BY region\\\").fetchall(); "
-        "print(json.dumps(rows))\"",
+        'rows=duckdb.execute(\\"SELECT region, SUM(revenue) total '
+        'FROM data GROUP BY region ORDER BY region\\").fetchall(); '
+        'print(json.dumps(rows))"',
         timeout=30,
     )
     assert transform.status == "succeeded", transform.error
@@ -78,7 +78,7 @@ def test_onvo_sandbox_runs_duckdb_transform(sandbox: Sandbox) -> None:
 @pytest.mark.e2e
 def test_onvo_sandbox_has_network_egress(sandbox: Sandbox) -> None:
     network = sandbox.commands.run(
-        "python -c \"import socket; "
+        'python -c "import socket; '
         "ip=socket.gethostbyname('example.com'); "
         "s=socket.create_connection((ip,443),5); s.close(); print('egress-ok')\"",
         timeout=10,

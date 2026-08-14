@@ -57,11 +57,33 @@ line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "ASYNC"]
+# Inverted default: everything is on, and each exemption below is a decision on
+# record rather than an unexamined omission. New ruff rules arrive enabled.
+select = ["ALL"]
 ignore = [
-  "ASYNC240", # The sandbox agent intentionally performs tiny local filesystem calls.
+  "D100",     # Docstring-on-every-module is not this repo's convention.
+  "D101",     # ...nor on every class.
+  "D102",     # ...nor on every method.
+  "D103",     # ...nor on every function.
+  "D104",     # ...nor on every package.
+  "D105",     # ...nor on every magic method.
+  "D107",     # ...nor on every __init__.
+  "D203",     # Incompatible with D211, which ruff prefers.
+  "D213",     # Incompatible with D212, which ruff prefers.
+  "CPY001",   # This repo carries no copyright headers.
+  "COM812",   # Conflicts with the formatter's trailing-comma handling.
   "B008",     # FastAPI's Depends/Query call defaults are framework conventions.
+  "FAST002",  # Same: FastAPI's non-annotated dependency style is intentional.
+  "ASYNC240", # The sandbox agent intentionally performs tiny local filesystem calls.
 ]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+  "S101",     # assert is pytest's idiom.
+  "INP001",   # tests/ is intentionally not an importable package.
+  "SLF001",   # Tests reach into private state to set up fixtures; see test_warm_pool.py.
+]
+"scripts/**" = ["INP001"]  # scripts/ is intentionally not an importable package.
 
 [tool.mypy]
 python_version = "3.12"
