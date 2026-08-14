@@ -808,6 +808,8 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
 
       - name: Download unit reports
         continue-on-error: true
