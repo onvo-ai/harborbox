@@ -1,0 +1,190 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Unit tests
+    # Self-hosted for the reason onvo's ci.yml documents: the org's Actions
+    # spend is blocked, so every GitHub-hosted job fails in ~2s with "recent
+    # account payments have failed". Self-hosted runners are not billed.
+    runs-on: [self-hosted, onvo-ci]
+    permissions:
+      contents: read
+
+    # postgres_pool_store.py uses dialects.postgresql.insert and
+    # with_for_update(skip_locked=True). SQLite cannot execute either, so its
+    # tests need the real thing rather than a fake session.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: harborbox
+          POSTGRES_PASSWORD: harborbox
+          POSTGRES_DB: harborbox_test
+        options: >-
+          --health-cmd "pg_isready -U harborbox"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+        ports: ["5432:5432"]
+
+    env:
+      HARBORBOX_TEST_DATABASE_URL: postgresql+asyncpg://harborbox:harborbox@127.0.0.1:5432/harborbox_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      # Blocking from Task 20. Until the 444-finding backlog is cleared this
+      # reports without failing the build.
+      - name: Lint
+        continue-on-error: true
+        run: uv run ruff check .
+
+      - name: Typecheck
+        run: uv run mypy
+
+      # Blocking from Task 20, when fail_under = 100 is added.
+      - name: Tests and coverage
+        continue-on-error: true
+        run: >-
+          uv run pytest --cov --cov-report=json --cov-report=term-missing
+          --json-report --json-report-file=unit-results.json
+
+      # The backlog behind the ignore list, printed on every run rather than
+      # discovered by someone going looking. Expected to be non-zero: it is the
+      # docstring, copyright and formatter-conflict families, by design.
+      - name: Lint backlog (non-blocking)
+        if: always()
+        run: uv run ruff check --select ALL --output-format=json -o ruff-strict.json . || true
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-reports
+          path: |
+            coverage.json
+            unit-results.json
+            ruff-strict.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  e2e:
+    name: E2E (Compose)
+    runs-on: [self-hosted, onvo-ci]
+    timeout-minutes: 40
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Build the stack
+        run: docker compose build
+
+      - name: Start the stack
+        run: docker compose up -d --wait
+
+      - name: Run the e2e suites
+        env:
+          HARBORBOX_API_KEY: ${{ secrets.HARBORBOX_E2E_API_KEY }}
+        run: uv run pytest -m e2e --json-report --json-report-file=e2e-results.json
+
+      - name: Stack logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail 300
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+      - name: Upload e2e results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-reports
+          path: e2e-results.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  report:
+    name: Results report
+    if: always()
+    needs: [test, e2e]
+    runs-on: [self-hosted, onvo-ci]
+    # pull-requests: write is only for the sticky comment. The default token is
+    # read-only here, so without it the comment step 403s while every other step
+    # passes — which reads as "the comment is broken" rather than "missing scope".
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Download unit reports
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: unit-reports
+          path: .
+
+      - name: Download e2e reports
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: e2e-reports
+          path: .
+
+      - name: Build the report
+        run: |
+          uv run python scripts/ci_report.py > ci-report.md
+          cat ci-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment on the PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- harborbox-ci-report -->';
+            const body = marker + '\n' + fs.readFileSync('ci-report.md', 'utf8');
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+
+            // Update in place rather than appending a comment per push, so a
+            // long-lived PR does not accumulate a dozen stale tables. The HTML
+            // marker is how we find our own comment again.
+            const existing = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number, per_page: 100 },
+            );
+            const mine = existing.find((c) => c.body?.startsWith(marker));
+
+            if (mine) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
