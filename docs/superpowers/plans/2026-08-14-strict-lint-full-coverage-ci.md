@@ -714,8 +714,13 @@ jobs:
       - name: Typecheck
         run: uv run mypy
 
+      # `if: always()` because Typecheck above is a blocking gate with no guard:
+      # without this, a mypy failure skips this step entirely, coverage.json is
+      # never written, and the PR comment renders "—" for tests and coverage —
+      # a missing row that reads as "fine" when it means the step never ran.
       # Blocking from Task 20, when fail_under = 100 is added.
       - name: Tests and coverage
+        if: always()
         continue-on-error: true
         run: >-
           uv run pytest --cov --cov-report=json --cov-report=term-missing
