@@ -23,6 +23,8 @@ dev = [
   "mypy>=1.17.0",
   "pytest>=8.4.0",
   "pytest-asyncio>=1.1.0",
+  "pytest-cov>=6.0.0",
+  "pytest-json-report>=1.5.0",
   "ruff>=0.12.0",
 ]
 
@@ -34,9 +36,15 @@ build-backend = "hatchling.build"
 packages = ["src/harborbox", "src/harborbox_sdk"]
 
 [tool.pytest.ini_options]
-addopts = "-q"
+# -m "not e2e" keeps the live-stack suites out of the default and CI unit runs.
+# The e2e job opts back in with `pytest -m e2e`.
+addopts = "-q -m 'not e2e'"
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+  "e2e: requires a live Compose stack (postgres, opensandbox, harborbox-api)",
+  "postgres: requires a real Postgres; SQLite cannot run the pg-dialect SQL under test",
+]
 
 [tool.ruff]
 line-length = 100
@@ -57,3 +65,16 @@ packages = ["harborbox", "harborbox_sdk"]
 [[tool.mypy.overrides]]
 module = ["docker", "docker.*"]
 ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["src"]
+branch = false
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",              # import-time-only; never executes at runtime
+  "raise NotImplementedError",      # runtime_protocol.py stubs, by definition unreachable
+  "if __name__ == \"__main__\":",   # uvicorn and agent entrypoints, not unit-testable
+]
