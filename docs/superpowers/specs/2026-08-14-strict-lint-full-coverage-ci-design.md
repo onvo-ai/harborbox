@@ -89,15 +89,34 @@ that each carry a reason:
 - `if __name__ == "__main__":` — uvicorn/agent entrypoints.
 
 Nothing else is excluded. `harborbox_agent/main.py` and `kernel.py`, both at 0%
-today, are covered by real tests rather than omitted.
+today, are covered by real tests rather than omitted. `main.py` is a FastAPI
+app and yields to `TestClient`. `kernel.py` imports `jupyter_client` only under
+`if TYPE_CHECKING:` — the package is not a harborbox dependency at all, it ships
+inside the sandbox image — so its manager and client are duck-typed at runtime
+and a fake substitutes cleanly without adding the dependency.
 
-For the two wrapper modules — `runtime.py` over the Docker SDK and
-`postgres_pool_store.py` over asyncpg, 334 uncovered statements between them —
-coverage comes from **hand-written fakes** shared through `conftest.py`
-fixtures: a fake Docker client and a fake asyncpg pool/connection. The
+`runtime.py`, 174 uncovered statements over the Docker SDK, is covered by a
+**hand-written fake Docker client** shared through a `conftest.py` fixture. The
 alternative, per-test `unittest.mock`, reaches the same number while mostly
-asserting that the code calls the library the way it already calls it; fakes
-let the tests assert behaviour and survive refactoring.
+asserting that the code calls the library the way it already calls it; a fake
+lets the tests assert behaviour and survive refactoring. The repo already
+works this way — `tests/test_warm_pool.py` hand-rolls `FakePool` and
+`FakeWarmHandle`.
+
+`postgres_pool_store.py`, 160 uncovered statements, is **not** asyncpg, as an
+earlier draft of this document claimed. It is SQLAlchemy over an
+`async_sessionmaker[AsyncSession]`, and it uses Postgres-only constructs:
+`sqlalchemy.dialects.postgresql.insert` for ON CONFLICT, and
+`with_for_update(skip_locked=True)` at four call sites. SQLite cannot execute
+those, so `sqlite+aiosqlite` — which `tests/test_template_registry.py` already
+uses — is not an option here, and a fake `AsyncSession` would assert statement
+construction rather than behaviour.
+
+It is therefore covered against **real Postgres**: a `postgres:17-alpine`
+service container in the CI job, and a local Docker container for development.
+These tests stay inside the unit run and inside the 100% gate. The module's
+entire purpose is FOR UPDATE SKIP LOCKED concurrency, which is exactly what a
+fake cannot prove.
 
 ### E2E becomes pytest
 
@@ -143,7 +162,8 @@ and hosted jobs fail in about two seconds.
 - **`test`** — `uv sync --extra dev`, then `ruff check .`, `mypy`, and
   `pytest --cov --cov-report=json --json-report`, all blocking. Then the
   non-blocking `ruff --select ALL` backlog step. Uploads coverage, results and
-  lint JSON.
+  lint JSON. Carries a `postgres:17-alpine` service container, because the
+  `postgres_pool_store.py` tests need real Postgres (see above).
 - **`e2e`** — `docker compose build` and `up`, then `pytest -m e2e`. Uploads
   results. Blocking, per the decision to run E2E for real.
 - **`report`** — `if: always()`, `needs: [test, e2e]`. Downloads both artifact
