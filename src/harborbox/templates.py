@@ -227,9 +227,9 @@ def validate_template_spec(
 
 
 def dockerfile_value(value: str) -> str:
-    """Quote an env value for a Dockerfile `ENV` instruction.
+    r"""Quote an env value for a Dockerfile `ENV` instruction.
 
-    JSON quoting handles `"` and `\\`; `$` is then escaped so the Dockerfile
+    JSON quoting handles `"` and `\`; `$` is then escaped so the Dockerfile
     parser does not expand it into a build argument at image build time.
     """
     return json.dumps(value).replace("$", "\\$")
@@ -251,8 +251,9 @@ def render_dockerfile(*, base_image: str, spec: TemplateSpec) -> str:
     preferable.
     """
     lines = [f"FROM {base_image}", "USER root"]
-    for name in sorted(spec.env):
-        lines.append(f"ENV {name}={dockerfile_value(spec.env[name])}")
+    lines.extend(
+        f"ENV {name}={dockerfile_value(spec.env[name])}" for name in sorted(spec.env)
+    )
     if spec.apt:
         packages = " \\\n      ".join(spec.apt)
         lines.append(

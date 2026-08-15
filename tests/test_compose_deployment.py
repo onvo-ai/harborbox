@@ -15,6 +15,7 @@ between them: feed the compose file's own environment into `Settings` and assert
 the resulting behaviour matches what the host can actually provide.
 """
 
+import inspect
 import re
 from pathlib import Path
 
@@ -22,6 +23,8 @@ import pytest
 import yaml
 
 from harborbox.config import Settings
+from harborbox.opensandbox_runtime import OpenSandboxRuntime
+from harborbox.schemas import SandboxCreate
 
 COMPOSE = Path(__file__).resolve().parent.parent / "compose.internal-tools.yaml"
 
@@ -162,8 +165,6 @@ def test_egress_is_opt_in_so_an_empty_network_is_safe() -> None:
     default-on, an empty network here would quietly mean "no egress" for
     callers that believe they have it.
     """
-    from harborbox.schemas import SandboxCreate
-
     assert SandboxCreate.model_fields["egress"].default is False
 
 
@@ -175,10 +176,11 @@ def test_onvo_pro_sizing_fits_the_configured_cpu_budget(settings: Settings) -> N
     """
     per_sandbox = settings.onvo_pro_template_cpu
     budget = settings.max_parallel_cpu or 0
+    min_concurrency = 8  # this host has run 8 onvo-pro widgets at once.
 
-    assert budget / per_sandbox >= 8, (
+    assert budget / per_sandbox >= min_concurrency, (
         f"{budget} CPU budget at {per_sandbox} per onvo-pro sandbox allows only "
-        f"{budget / per_sandbox:.0f} concurrent; this host has run 8."
+        f"{budget / per_sandbox:.0f} concurrent; this host has run {min_concurrency}."
     )
 
 
@@ -210,8 +212,6 @@ def test_jupyter_flags_live_in_the_entrypoint_not_only_the_image() -> None:
     afternoon: token auth stayed on because `--IdentityProvider.token=` was in
     the CMD and not in what actually ran.
     """
-    from harborbox.config import Settings
-
     entrypoint = Settings().entrypoint_for_template("onvo-pro")
 
     assert entrypoint[0].endswith("jupyter")
@@ -231,10 +231,6 @@ def test_sandbox_readiness_does_not_wait_for_a_jupyter_kernel() -> None:
     `execute_code` still waits, so callers that do run Python through a kernel
     get a clear failure rather than a race.
     """
-    import inspect
-
-    from harborbox.opensandbox_runtime import OpenSandboxRuntime
-
     ready = inspect.getsource(OpenSandboxRuntime.wait_until_ready)
     execute = inspect.getsource(OpenSandboxRuntime.execute_code)
 

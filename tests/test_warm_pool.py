@@ -89,8 +89,11 @@ def test_configured_pool_is_included_in_admission_reservation() -> None:
 
     reservation = pools.reservation()
 
-    assert reservation.memory_mb == 1536
+    expected_memory_mb = 1536
     # relaydeck 2x0.5 + onvo-pro 1x1.0. Was 3.0 when the onvo templates
     # defaulted to 2.0 CPU each.
-    assert reservation.cpu == 2.0
-    assert reservation.sandboxes == 3
+    expected_cpu = 2.0
+    expected_sandboxes = 3
+    assert reservation.memory_mb == expected_memory_mb
+    assert reservation.cpu == expected_cpu
+    assert reservation.sandboxes == expected_sandboxes

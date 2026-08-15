@@ -17,7 +17,8 @@ def timestamp(value: str | None) -> datetime:
     if value is None:
         message = "execution timestamp is missing"
         raise AssertionError(message)
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    # datetime.fromisoformat has accepted a trailing "Z" since Python 3.11.
+    return datetime.fromisoformat(value)
 
 
 @pytest.fixture
@@ -109,6 +110,7 @@ def test_onvo_sandbox_runs_commands_in_parallel(sandbox: Sandbox) -> None:
 
 @pytest.mark.e2e
 def test_onvo_sandbox_idle_timeout_is_configurable(sandbox: Sandbox) -> None:
-    sandbox.set_timeout(180_000)
-    assert sandbox.idle_timeout_seconds == 180
+    timeout_seconds = 180
+    sandbox.set_timeout(timeout_seconds * 1000)
+    assert sandbox.idle_timeout_seconds == timeout_seconds
     assert sandbox.refresh().status == "running"

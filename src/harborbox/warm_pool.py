@@ -21,6 +21,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Tolerance for comparing a requested CPU allotment to a template's configured
+# CPU: both are floats derived from the same settings, so this only absorbs
+# floating-point round-trip noise, not any real difference.
+_CPU_COMPARISON_EPSILON = 0.000_001
+
 
 class OpenSandboxWarmPools:
     """Adaptive, PostgreSQL-coordinated pools of disposable template sandboxes."""
@@ -138,7 +143,10 @@ class OpenSandboxWarmPools:
                 )
             return None
         expected_memory, expected_cpu = self.settings.resources_for_template(template)
-        if memory_mb != expected_memory or abs(cpu - expected_cpu) > 0.000_001:
+        if (
+            memory_mb != expected_memory
+            or abs(cpu - expected_cpu) > _CPU_COMPARISON_EPSILON
+        ):
             return None
 
         pool = self._pools[template]

@@ -44,17 +44,19 @@ class TestCpuHeadroom:
 
     def test_accepts_a_pool_that_leaves_room(self) -> None:
         # 3.0 reserved + 2.0 largest template = 5.0 <= 6.0.
-        settings = make_settings(max_parallel_cpu=6.0)
-        assert settings.max_parallel_cpu == 6.0
+        max_parallel_cpu = 6.0
+        settings = make_settings(max_parallel_cpu=max_parallel_cpu)
+        assert settings.max_parallel_cpu == max_parallel_cpu
 
     def test_boundary_is_inclusive(self) -> None:
         """Exactly enough is enough — 3.0 + 2.0 == 5.0 must pass."""
-        settings = make_settings(max_parallel_cpu=5.0)
-        assert settings.max_parallel_cpu == 5.0
+        max_parallel_cpu = 5.0
+        settings = make_settings(max_parallel_cpu=max_parallel_cpu)
+        assert settings.max_parallel_cpu == max_parallel_cpu
 
     def test_still_rejects_a_pool_larger_than_the_whole_budget(self) -> None:
         """The original check must keep working."""
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="aggregate sandbox CPU budget"):
             make_settings(max_parallel_cpu=2.0)
 
     def test_no_ceiling_configured_is_left_alone(self) -> None:
@@ -63,9 +65,10 @@ class TestCpuHeadroom:
         assert settings.max_parallel_cpu is None
 
     def test_a_pool_of_zero_needs_only_the_largest_template(self) -> None:
+        max_parallel_cpu = 2.0
         settings = make_settings(
             warm_pool_relaydeck=0,
             warm_pool_onvo_pro=0,
-            max_parallel_cpu=2.0,
+            max_parallel_cpu=max_parallel_cpu,
         )
-        assert settings.max_parallel_cpu == 2.0
+        assert settings.max_parallel_cpu == max_parallel_cpu

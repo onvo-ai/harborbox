@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, timedelta
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -8,6 +9,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from harborbox import scheduler as scheduler_module
 from harborbox import template_builder as builder_module
 from harborbox.api import app
 from harborbox.config import Settings
@@ -25,6 +27,9 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
 Sessions = async_sessionmaker[AsyncSession]
+
+# Settings()'s default warm pool size for the static relaydeck template.
+RELAYDECK_WARM_POOL = 2
 
 
 class FakeTemplateBuilder:
@@ -190,12 +195,12 @@ async def test_an_empty_spec_returns_the_base_template_unbuilt(
 ) -> None:
     response = await client.post("/v1/templates", json={"base": "relaydeck"})
 
-    assert response.status_code == 200
+    assert response.status_code == HTTPStatus.OK
     assert response.json()["name"] == "relaydeck"
     assert response.json()["status"] == "ready"
     assert response.json()["image"] == "harborbox-sandbox-relaydeck:local"
     # The base template keeps its warm pool.
-    assert response.json()["warm_pool"] == 2
+    assert response.json()["warm_pool"] == RELAYDECK_WARM_POOL
     assert builder.scheduled == []
 
 
@@ -209,7 +214,7 @@ async def test_a_failed_template_is_rebuilt(
         "/v1/templates", json={"base": "relaydeck", "apt": ["chromium"]}
     )
 
-    assert response.status_code == 201
+    assert response.status_code == HTTPStatus.CREATED
     assert response.json()["status"] == "building"
     assert response.json()["error"] is None
     assert builder.scheduled == [response.json()["name"]]
@@ -226,9 +231,9 @@ async def test_hostile_package_names_are_rejected_by_the_endpoint(
         "/v1/templates", json={"base": "relaydeck", "npm": ["left-pad@1.3.0"]}
     )
 
-    assert injected.status_code == 422
+    assert injected.status_code == HTTPStatus.UNPROCESSABLE_ENTITY
     assert "forbidden character" in injected.json()["detail"]
-    assert unlisted.status_code == 422
+    assert unlisted.status_code == HTTPStatus.UNPROCESSABLE_ENTITY
     assert "not allowlisted" in unlisted.json()["detail"]
     assert builder.scheduled == []
 
@@ -251,10 +256,10 @@ async def test_templates_are_listed_and_fetched(
         "relaydeck",
         template.name,
     ]
-    assert fetched.status_code == 200
+    assert fetched.status_code == HTTPStatus.OK
     assert fetched.json()["spec_hash"] == template.spec_hash
-    assert static.json()["warm_pool"] == 2
-    assert missing.status_code == 404
+    assert static.json()["warm_pool"] == RELAYDECK_WARM_POOL
+    assert missing.status_code == HTTPStatus.NOT_FOUND
 
 
 async def test_deleting_a_template_refuses_static_names(
@@ -267,10 +272,10 @@ async def test_deleting_a_template_refuses_static_names(
     static = await client.delete("/v1/templates/relaydeck")
     derived = await client.delete(f"/v1/templates/{template.name}")
 
-    assert static.status_code == 409
-    assert derived.status_code == 204
+    assert static.status_code == HTTPStatus.CONFLICT
+    assert derived.status_code == HTTPStatus.NO_CONTENT
     assert builder.removed == [template.image]
-    assert (await client.get(f"/v1/templates/{template.name}")).status_code == 404
+    assert (await client.get(f"/v1/templates/{template.name}")).status_code == HTTPStatus.NOT_FOUND
 
 
 async def test_creating_a_sandbox_resolves_against_the_registry(
@@ -286,13 +291,16 @@ async def test_creating_a_sandbox_resolves_against_the_registry(
         "/v1/sandboxes", json={"template": "relaydeck-000000000000"}
     )
 
-    assert created.status_code == 201
-    assert created.json()["memory_mb"] == 512
-    assert created.json()["cpu"] == 1.0
+    # derived_row()'s default sizing.
+    default_memory_mb = 512
+    default_cpu = 1.0
+    assert created.status_code == HTTPStatus.CREATED
+    assert created.json()["memory_mb"] == default_memory_mb
+    assert created.json()["cpu"] == default_cpu
     assert created.json()["metadata"]["template"] == template.name
     assert created.json()["metadata"]["template_base"] == "relaydeck"
     assert created.json()["metadata"]["template_spec_hash"] == template.spec_hash
-    assert unknown.status_code == 422
+    assert unknown.status_code == HTTPStatus.UNPROCESSABLE_ENTITY
 
     await session.refresh(template)
     # SQLite drops the offset on read-back; production runs on PostgreSQL.
@@ -327,22 +335,20 @@ async def test_creating_a_sandbox_on_an_unbuilt_template_conflicts(
 
     response = await client.post("/v1/sandboxes", json={"template": template.name})
 
-    assert response.status_code == 409
+    assert response.status_code == HTTPStatus.CONFLICT
     assert "building" in response.json()["detail"]
 
 
 def test_a_failed_build_records_the_log_tail_not_a_traceback() -> None:
     # Real BuildKit output for a package that does not resolve.
-    output = "\n".join(
-        [
-            "#4 [1/2] FROM docker.io/library/harborbox-sandbox-relaydeck:local",
-            "#4 CACHED",
-            "",
-            "#5 [2/2] RUN apt-get install -y nosuchpackage-xyz",
-            "#5 0.113 E: Unable to locate package nosuchpackage-xyz",
-            "#5 ERROR: process did not complete successfully: exit code: 100",
-            "ERROR: failed to build: failed to solve: exit code: 100",
-        ]
+    output = (
+        "#4 [1/2] FROM docker.io/library/harborbox-sandbox-relaydeck:local\n"
+        "#4 CACHED\n"
+        "\n"
+        "#5 [2/2] RUN apt-get install -y nosuchpackage-xyz\n"
+        "#5 0.113 E: Unable to locate package nosuchpackage-xyz\n"
+        "#5 ERROR: process did not complete successfully: exit code: 100\n"
+        "ERROR: failed to build: failed to solve: exit code: 100"
     )
 
     tail = builder_module.build_log_tail(output)
@@ -373,7 +379,7 @@ def test_a_build_log_tail_is_bounded_and_never_empty() -> None:
 def test_a_missing_docker_cli_is_reported_as_a_build_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def missing(*args: object, **kwargs: object) -> None:
+    def missing(*_args: object, **_kwargs: object) -> None:
         raise FileNotFoundError(2, "No such file or directory", "docker")
 
     monkeypatch.setattr(builder_module.subprocess, "run", missing)
@@ -386,8 +392,6 @@ def test_a_missing_docker_cli_is_reported_as_a_build_error(
 async def test_a_build_interrupted_by_a_restart_becomes_rebuildable(
     sessions: Sessions, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from harborbox import scheduler as scheduler_module
-
     template = derived_row(status="building")
     async with sessions() as session:
         session.add(template)
