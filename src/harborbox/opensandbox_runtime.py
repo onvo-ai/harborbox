@@ -721,16 +721,32 @@ class OpenSandboxRuntime:
         check: OpenSandbox's public exception taxonomy simply does not
         distinguish "died of OOM" from "died of anything else" or "is merely
         slow," and this is the best available signal short of that changing.
+
+        This is a diagnostic on the error path of all 14 call sites of
+        `_raise_runtime_error`, one of them (`execute_code`'s own timeout
+        branch) already reached by a caller who has been waiting. Without an
+        explicit short bound it would inherit
+        `ConnectionConfig.request_timeout`
+        (`opensandbox_ready_timeout_seconds`, 30s by default), turning a
+        30s script timeout into up to 60s while still holding the
+        execution's CPU reservation -- worst exactly when the control plane
+        is degraded enough to be slow to answer this in the first place.
+        `oom_diagnostic_timeout_seconds` (3s default) bounds it instead, and
+        any failure here -- including that bound itself firing as a
+        `TimeoutError`, not a `SandboxException` -- falls back to `False`
+        rather than ever stalling or escaping as its own, unrelated error.
         """
         if not sandbox.container_id:
             return False
         try:
-            info = await (await self._get_manager()).get_sandbox_info(
-                sandbox.container_id
-            )
-        except SandboxException:
-            # A failed diagnostic lookup says nothing about why the original
-            # call failed; do not let it mask that error with a worse one.
+            async with asyncio.timeout(self.settings.oom_diagnostic_timeout_seconds):
+                info = await (await self._get_manager()).get_sandbox_info(
+                    sandbox.container_id
+                )
+        except Exception:  # noqa: BLE001 - a diagnostic must never fail loud
+            # A failed (or too-slow) diagnostic lookup says nothing about why
+            # the original call failed; do not let it mask that error with a
+            # worse one, or stall it further.
             return False
         if info.status.state.lower() == "running":
             # Still alive: whatever failed was not the container dying.
