@@ -5,7 +5,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import selectinload
@@ -15,7 +15,11 @@ from harborbox.db import session_factory
 from harborbox.execution_secrets import open_environment, scrub_environment
 from harborbox.models import Execution, Sandbox, SandboxTemplate, utc_now
 from harborbox.opensandbox_compat import expiration
-from harborbox.runtime import SandboxMemoryExceededError, SandboxUnavailableError
+from harborbox.runtime import (
+    SandboxMemoryExceededError,
+    SandboxStartTimeoutError,
+    SandboxUnavailableError,
+)
 from harborbox.schemas import (
     AgentCommandRequest,
     AgentExecutionRequest,
@@ -55,7 +59,35 @@ RESERVED_SANDBOX_STATES = (
 # to track a future class rename without a coordinated API change.
 ERROR_NAME_SANDBOX_UNAVAILABLE = "SandboxUnavailable"
 
+# Same wire-contract reasoning as ERROR_NAME_SANDBOX_UNAVAILABLE above: this is
+# what `execution.error.name` carries over the API, kept as an explicit
+# constant rather than a literal scattered across `_run_execution` so the two
+# never drift independently of each other again.
+ERROR_NAME_MEMORY_LIMIT_EXCEEDED = "MemoryLimitExceeded"
+
 TERMINAL_EXECUTION_STATES = ("succeeded", "failed", "cancelled")
+
+
+def lazy_start_action(status: str) -> Literal["ready", "start", "unavailable"]:
+    """Whether a request needing a running sandbox should proceed, start, or fail.
+
+    Used by API endpoints that touch the runtime directly -- file I/O and the
+    status-configuring PATCH -- which used to hard-require `running` and 409
+    otherwise. Nothing but `create_execution`/`create_command`/`create_process`
+    ever started a sandbox, so a sandbox whose first call was a file write
+    (Onvo's own pattern: create, upload, transform) 409'd every time, even
+    though `_ensure_running` already knows how to bring one up.
+
+    Mirrors `may_start_execution`'s terminal check: `killed`/`failed`
+    sandboxes never come back, so nothing should try to start one. Every
+    other non-running status (`created`, `starting`, `paused_cold`,
+    `paused_memory`) is exactly what `_ensure_running_locked` handles.
+    """
+    if status == "running":
+        return "ready"
+    if status in {"killed", "failed"}:
+        return "unavailable"
+    return "start"
 
 
 def may_start_execution(
@@ -142,6 +174,12 @@ class Scheduler:
         self._reaper_task: asyncio.Task[None] | None = None
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._sandbox_start_locks: dict[str, asyncio.Lock] = {}
+        # Keyed by sandbox_id, tracks a lazy start triggered outside the
+        # execution path (see `ensure_sandbox_ready`) so a second concurrent
+        # caller reattaches to the same in-flight start instead of racing
+        # `_ensure_running`'s lock to spawn a duplicate task, and so the task
+        # is not garbage-collected while nothing else holds a reference to it.
+        self._pending_starts: dict[str, asyncio.Task[None]] = {}
         self._last_template_sweep: float | None = None
 
     async def start(self) -> None:
@@ -162,6 +200,8 @@ class Scheduler:
             await asyncio.gather(*tasks, return_exceptions=True)
         if self._running_tasks:
             await asyncio.gather(*self._running_tasks.values(), return_exceptions=True)
+        if self._pending_starts:
+            await asyncio.gather(*self._pending_starts.values(), return_exceptions=True)
 
     async def capacity(self) -> Capacity:
         total_memory_mb = await self.runtime.total_memory_mb()
@@ -364,7 +404,9 @@ class Scheduler:
             response = await self._execute_request(sandbox, execution, environment)
             await self._record_result(execution_id, response)
         except SandboxMemoryExceededError as exc:
-            await self._fail_execution(execution_id, "MemoryLimitExceeded", str(exc))
+            await self._fail_execution(
+                execution_id, ERROR_NAME_MEMORY_LIMIT_EXCEEDED, str(exc)
+            )
         except SandboxUnavailableError as exc:
             await self._fail_execution(
                 execution_id, ERROR_NAME_SANDBOX_UNAVAILABLE, str(exc)
@@ -495,6 +537,56 @@ class Scheduler:
             if current_sandbox is not None:
                 current_sandbox.last_activity_at = utc_now()
             await session.commit()
+
+    async def ensure_sandbox_ready(
+        self, sandbox_id: str, *, timeout_seconds: float
+    ) -> None:
+        """Lazily bring `sandbox_id` to `running`, bounded by `timeout_seconds`.
+
+        The entry point for callers outside the execution path -- see
+        `lazy_start_action` -- that need a running sandbox right now rather
+        than queueing an execution for one. Goes through `_ensure_running`,
+        the same per-sandbox lock `_run_execution` uses, so a request that
+        lands on a `created` sandbox at the same moment a queued execution
+        admits it can never produce two containers for one sandbox: both
+        wait on the same lock, and whichever loses re-reads `running` from
+        the database and does nothing.
+
+        A second concurrent caller for the same sandbox reattaches to the one
+        in-flight task via `_pending_starts` rather than spawning another —
+        belt-and-suspenders alongside the lock, and what keeps a start alive
+        against garbage collection while it runs in the background (see
+        below).
+
+        On timeout, the underlying start is not cancelled: `asyncio.shield`
+        keeps `_ensure_running` running in `_pending_starts` after this call
+        raises, because aborting it mid-`start_sandbox` would strand a
+        container the sandbox row never learns about. The caller gets a
+        clear, bounded error and can retry; the retry either finds `running`
+        already or reattaches to the same task.
+        """
+        task = self._pending_starts.get(sandbox_id)
+        if task is None or task.done():
+            task = asyncio.create_task(self._ensure_running(sandbox_id))
+            self._pending_starts[sandbox_id] = task
+            task.add_done_callback(self._clear_pending_start(sandbox_id, task))
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
+        except TimeoutError as exc:
+            message = (
+                f"sandbox did not become ready within {timeout_seconds:.0f}s "
+                "(the start is continuing in the background; retry)"
+            )
+            raise SandboxStartTimeoutError(message) from exc
+
+    def _clear_pending_start(
+        self, sandbox_id: str, task: asyncio.Task[None]
+    ) -> Callable[[asyncio.Task[None]], None]:
+        def callback(_done: asyncio.Task[None]) -> None:
+            if self._pending_starts.get(sandbox_id) is task:
+                self._pending_starts.pop(sandbox_id, None)
+
+        return callback
 
     async def _ensure_running(self, sandbox_id: str) -> None:
         lock = self._sandbox_start_locks.setdefault(sandbox_id, asyncio.Lock())

@@ -138,6 +138,14 @@ class Settings(BaseSettings):
     default_execution_timeout_seconds: int = Field(default=30, ge=1)
     max_execution_timeout_seconds: int = Field(default=600, ge=1)
     default_idle_timeout_seconds: int = Field(default=300, ge=0)
+    # Budget for an HTTP request (a file operation, or a PATCH that touches the
+    # sandbox) that lands on a not-yet-running sandbox and triggers the same
+    # lazy start `create_execution` has always benefited from. Sized to match
+    # the full cold-start budget a first execution gets end to end (container
+    # create + agent health), not the much larger kernel-ready budget below --
+    # these callers never touch the kernel. If it elapses the start is not
+    # aborted, only the caller's wait: see `Scheduler.ensure_sandbox_ready`.
+    lazy_start_wait_timeout_seconds: float = Field(default=60.0, gt=0)
     reaper_poll_seconds: float = Field(default=5.0, gt=0)
     # How many started-but-unassigned sandboxes to keep ready. 0 disables the
     # pool entirely, which is the old behaviour: every caller pays the container
