@@ -156,6 +156,44 @@ jobs:
         if: failure()
         run: docker compose logs --no-color --tail 300
 
+      # `docker compose logs` above only covers this compose project's own
+      # services (postgres, opensandbox, api). The actual sandbox containers
+      # -- where a template's entrypoint, including the Jupyter server, runs
+      # -- are spawned by the opensandbox server directly against the host
+      # Docker socket (compose.yaml mounts it into the opensandbox service),
+      # so they are not part of this compose project and were invisible to
+      # that step. That is exactly why the unexplained
+      # e2e_smoke::test_two_sandboxes_run_code_in_parallel failure (task 21:
+      # a snapshot-restored sandbox's Jupyter kernel never answers readiness
+      # probes, cause unconfirmed) has stayed undiagnosable from CI logs
+      # alone -- nothing ever captured what Jupyter itself logged inside the
+      # sandbox. `docker ps -a` lists every container on the runner,
+      # including already-exited ones; anything that is not one of this
+      # compose project's three named services is a sandbox container
+      # opensandbox spawned, named with its own OpenSandbox UUID (not the
+      # `harborbox-{sandbox.id}` form, which is the Docker-runtime backend's
+      # naming and is not what this job's HARBORBOX_RUNTIME_PROVIDER=opensandbox
+      # config uses). `--tail` bounds each container's output so one stuck
+      # or noisy sandbox cannot flood the job log.
+      - name: Sandbox container logs on failure
+        if: failure()
+        run: |
+          set -uo pipefail
+          echo "All containers on the runner:"
+          docker ps -a --format '{{.Names}}\t{{.Status}}\t{{.Image}}'
+          sandbox_containers=$(docker ps -a --format '{{.Names}}' \
+            | grep -Ev '^harborbox-(postgres|opensandbox|api)-[0-9]+$' || true)
+          if [ -z "$sandbox_containers" ]; then
+            echo "No sandbox containers found on the runner."
+            exit 0
+          fi
+          for name in $sandbox_containers; do
+            echo "::group::docker logs $name"
+            docker logs --timestamps --tail 500 "$name" 2>&1 \
+              || echo "(could not fetch logs for $name)"
+            echo "::endgroup::"
+          done
+
       - name: Tear down
         if: always()
         run: docker compose down -v
