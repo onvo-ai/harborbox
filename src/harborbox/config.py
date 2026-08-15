@@ -45,6 +45,14 @@ class Settings(BaseSettings):
     opensandbox_api_key: SecretStr = SecretStr("change-me-opensandbox")
     opensandbox_use_server_proxy: bool = True
     opensandbox_ready_timeout_seconds: float = Field(default=30.0, gt=0)
+    # Bounds the live get_sandbox_info() lookup _detect_memory_exceeded makes
+    # on every runtime error (14 call sites) to work out whether a failure was
+    # an OOM kill. It is a diagnostic, not a critical path: without its own
+    # short bound it inherits ConnectionConfig.request_timeout
+    # (opensandbox_ready_timeout_seconds, 30s by default), which would let a
+    # degraded control plane add up to another 30s on top of every error --
+    # worst exactly when callers can least afford to wait longer.
+    oom_diagnostic_timeout_seconds: float = Field(default=3.0, gt=0)
     opensandbox_snapshot_timeout_seconds: float = Field(default=300.0, gt=0)
     docker_base_url: str | None = None
     sandbox_image: str = "harborbox-sandbox:local"
@@ -92,6 +100,16 @@ class Settings(BaseSettings):
     # A sandbox starts lazily on its first execution, so `created` is normal
     # briefly. Fifteen minutes is far longer than any legitimate start.
     reaper_stuck_created_after_seconds: int = Field(default=900, ge=60)
+    # `starting` is a RESERVED_SANDBOX_STATES member, so a start that gets
+    # abandoned there -- rather than the primary fix in
+    # `Scheduler._ensure_running` catching it -- holds real capacity, unlike
+    # a stuck `created` row. Shorter than reaper_stuck_created_after_seconds
+    # on purpose: five minutes is generous over every start budget that
+    # feeds into it (opensandbox_ready_timeout_seconds,
+    # lazy_start_wait_timeout_seconds, sandbox_python_ready_timeout_seconds
+    # combined tops out well under this), so anything still `starting` this
+    # long is abandoned, not slow. Defence in depth, not the primary fix.
+    reaper_stuck_starting_after_seconds: int = Field(default=300, ge=30)
     # Long enough that a failure is still there when someone comes to look.
     reaper_failed_retention_hours: int = Field(default=24, ge=1)
 

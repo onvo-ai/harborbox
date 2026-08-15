@@ -79,13 +79,19 @@ def lazy_start_action(status: str) -> Literal["ready", "start", "unavailable"]:
     though `_ensure_running` already knows how to bring one up.
 
     Mirrors `may_start_execution`'s terminal check: `killed`/`failed`
-    sandboxes never come back, so nothing should try to start one. Every
-    other non-running status (`created`, `starting`, `paused_cold`,
+    sandboxes never come back, so nothing should try to start one. `pooled`/
+    `pooling` are unavailable too, but for a different reason: those rows
+    are warm-pool internals, not yet adopted by any caller, and
+    `_ensure_running_locked` has no branch for them -- it would raise
+    `SandboxUnavailableError("sandbox is pooled")`, and with it a warm-pool
+    row would get marked `failed` by `_ensure_running`'s own cleanup,
+    destroying it for a request that has no business touching it at all.
+    Every other non-running status (`created`, `starting`, `paused_cold`,
     `paused_memory`) is exactly what `_ensure_running_locked` handles.
     """
     if status == "running":
         return "ready"
-    if status in {"killed", "failed"}:
+    if status in {"killed", "failed", "pooled", "pooling"}:
         return "unavailable"
     return "start"
 
@@ -160,6 +166,22 @@ def _reject_ineligible(execution: Execution, sandbox: Sandbox, now: datetime) ->
 
 
 class Scheduler:
+    """Owns admission, lazy start, and the idle/reap sweeps for one process.
+
+    The whole mutual-exclusion story here -- `_sandbox_start_locks`,
+    `_pending_starts`, the single-start guarantee `ensure_sandbox_ready`
+    documents -- is an in-process `asyncio.Lock`/task-dedup scheme. That is
+    only sufficient because deployment runs exactly one of this process per
+    Postgres database (`Dockerfile.api`'s `uvicorn` has no `--workers`, and
+    there is no multi-replica story yet). A second replica, or a second
+    worker process, sharing the same database would race two `Scheduler`
+    instances with two independent, unrelated lock dicts against the same
+    sandbox row and could produce two containers for one sandbox. Scaling
+    beyond one process needs a database-level lock (e.g. `SELECT ... FOR
+    UPDATE` on the sandbox row, the same pattern `_admit_available_jobs`
+    already uses for admission) in place of, or alongside, this.
+    """
+
     def __init__(
         self,
         settings: Settings,
@@ -591,7 +613,48 @@ class Scheduler:
     async def _ensure_running(self, sandbox_id: str) -> None:
         lock = self._sandbox_start_locks.setdefault(sandbox_id, asyncio.Lock())
         async with lock:
-            await self._ensure_running_locked(sandbox_id)
+            try:
+                await self._ensure_running_locked(sandbox_id)
+            except Exception:
+                # Must be recorded here, not left to the caller: a caller
+                # reached through `ensure_sandbox_ready` may already be gone
+                # (a 503 was returned on timeout while this kept running in
+                # the background via `asyncio.shield`), and nothing else
+                # would ever notice `starting` -- which reserves capacity in
+                # `RESERVED_SANDBOX_STATES` -- was never going anywhere.
+                logger.exception(
+                    "sandbox %s failed to start or become ready", sandbox_id
+                )
+                await self._mark_start_failed(sandbox_id)
+                raise
+
+    async def _mark_start_failed(self, sandbox_id: str) -> None:
+        """Best-effort: mark a sandbox `failed` after its start blew up.
+
+        Mirrors `_fail_execution`'s own check rather than assuming the
+        error means the container is dead -- `wait_until_ready` can fail on
+        an otherwise-healthy, already-`running` sandbox (a transient network
+        blip against one mid-execution), and that must not be reported as a
+        dead sandbox. Only a runtime-confirmed dead/missing container earns
+        the write. Deliberately swallows its own failures: this already runs
+        inside an `except` block, and losing capacity-leak protection to a
+        second, unrelated error here would be worse than logging and moving
+        on -- the reaper's `starting` sweep is the backstop if this can't
+        complete either.
+        """
+        try:
+            async with session_factory() as session:
+                sandbox = await session.get(Sandbox, sandbox_id)
+                if sandbox is None or sandbox.status in {"killed", "failed"}:
+                    return
+                container_status = await self.runtime.container_status(sandbox)
+                if container_status in {None, "dead", "exited"}:
+                    sandbox.status = "failed"
+                    await session.commit()
+        except Exception:
+            logger.exception(
+                "sandbox %s: could not record its own start failure", sandbox_id
+            )
 
     async def _ensure_running_locked(self, sandbox_id: str) -> None:
         async with session_factory() as session:

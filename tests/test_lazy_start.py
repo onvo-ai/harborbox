@@ -94,10 +94,13 @@ class FakeRuntime:
 
     async def start_sandbox(self, sandbox: Sandbox) -> StartedSandbox:
         self.start_calls.append(sandbox.id)
-        if self.start_error is not None:
-            raise self.start_error
+        # Delay before the error, not after: a runtime that is merely slow
+        # and then fails (the CRITICAL scenario) needs the delay to run
+        # first so a caller's timeout can elapse before the failure does.
         if self.start_delay:
             await asyncio.sleep(self.start_delay)
+        if self.start_error is not None:
+            raise self.start_error
         return StartedSandbox(id=f"c-{sandbox.id}", name=f"c-{sandbox.id}")
 
     async def wait_until_ready(self, sandbox: Sandbox) -> None:
@@ -110,7 +113,9 @@ class FakeRuntime:
         return None
 
     async def container_status(self, _sandbox: Sandbox) -> str | None:
-        return "running"
+        # A start that raised never persisted a container_id, so a real
+        # runtime's own status lookup would find nothing either.
+        return None if self.start_error is not None else "running"
 
     async def read_file(self, _sandbox: Sandbox, path: str) -> FileReadResponse:
         return FileReadResponse(path=path, content="hi", encoding="utf-8")
@@ -147,6 +152,17 @@ class TestLazyStartAction:
     def test_dead_sandboxes_are_unavailable(self) -> None:
         assert scheduler_module.lazy_start_action("killed") == "unavailable"
         assert scheduler_module.lazy_start_action("failed") == "unavailable"
+
+    def test_warm_pool_rows_are_unavailable(self) -> None:
+        """Regression test: these used to fall into `"start"`.
+
+        `_ensure_running_locked` has no branch for `pooled`/`pooling` and
+        would raise, and with the capacity-leak fix that failure now marks
+        the sandbox `failed` -- destroying a warm-pool row a request has no
+        business touching at all.
+        """
+        assert scheduler_module.lazy_start_action("pooled") == "unavailable"
+        assert scheduler_module.lazy_start_action("pooling") == "unavailable"
 
     def test_every_other_status_lazily_starts(self) -> None:
         for status in ("created", "starting", "paused_cold", "paused_memory"):
@@ -257,6 +273,45 @@ async def test_ensure_sandbox_ready_propagates_a_dead_sandbox(
         await scheduler.ensure_sandbox_ready("sbx-4", timeout_seconds=5)
 
 
+async def test_a_background_start_failure_after_timeout_is_still_recorded(
+    sessions: Sessions, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The critical gap: timeout now, background failure later.
+
+    A caller that already gave up with `SandboxStartTimeoutError` is not
+    around to notice the shielded background task then errors --
+    `asyncio.shield`'s own machinery does not surface that to anyone by
+    itself. `_ensure_running` must record the failure from inside itself, or
+    the sandbox stays `starting` -- reserving capacity -- forever. This is
+    the scenario `test_a_failed_lazy_start_reports_503_and_does_not_strand_starting`
+    does not cover: that one fails synchronously, before any timeout.
+    """
+    async with sessions() as session:
+        session.add(sandbox_row(id="sbx-5", status="created"))
+        await session.commit()
+    monkeypatch.setattr(scheduler_module, "session_factory", sessions)
+    runtime = FakeRuntime(
+        start_delay=0.05, start_error=SandboxUnavailableError("opensandbox boom")
+    )
+    scheduler = scheduler_module.Scheduler(Settings(), runtime)
+
+    with pytest.raises(scheduler_module.SandboxStartTimeoutError):
+        await scheduler.ensure_sandbox_ready("sbx-5", timeout_seconds=0.01)
+
+    # Confirm the background task is the one that later fails -- i.e. this
+    # genuinely exercises timeout-then-background-failure, not just a
+    # not-yet-finished task.
+    pending = scheduler._pending_starts.get("sbx-5")
+    assert pending is not None
+    with pytest.raises(SandboxUnavailableError):
+        await pending
+
+    async with sessions() as session:
+        sandbox = await session.get(Sandbox, "sbx-5")
+    assert sandbox is not None
+    assert sandbox.status == "failed"
+
+
 # --- API layer: ensure_ready wired into the file/status endpoints -----------
 
 
@@ -337,6 +392,35 @@ async def test_configuring_idle_timeout_lazily_starts_a_created_sandbox(
     assert response.json()["status"] == "running"
     assert response.json()["idle_timeout_seconds"] == new_idle_timeout_seconds
     assert runtime.start_calls == ["sbx-patch"]
+
+
+@pytest.mark.parametrize("paused_status", ["paused_cold", "paused_memory"])
+async def test_configuring_idle_timeout_does_not_revive_a_paused_sandbox(
+    client: httpx.AsyncClient,
+    runtime: FakeRuntime,
+    sessions: Sessions,
+    paused_status: str,
+) -> None:
+    """A metadata PATCH must not have the side effect of waking a sandbox.
+
+    Unlike a never-started sandbox (the case above), one the caller
+    explicitly paused stays paused: reviving it and restarting idle
+    accounting is not something a `set_timeout` call should ever trigger.
+    """
+    async with sessions() as session:
+        session.add(sandbox_row(id="sbx-paused", status=paused_status))
+        await session.commit()
+
+    new_idle_timeout_seconds = 180
+    response = await client.patch(
+        "/v1/sandboxes/sbx-paused",
+        json={"idle_timeout_seconds": new_idle_timeout_seconds},
+    )
+
+    assert response.status_code == httpx.codes.OK
+    assert response.json()["status"] == paused_status
+    assert response.json()["idle_timeout_seconds"] == new_idle_timeout_seconds
+    assert runtime.start_calls == []
 
 
 async def test_file_endpoints_still_refuse_a_dead_sandbox(

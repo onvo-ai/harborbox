@@ -70,6 +70,9 @@ class FakeManager:
         # Tests that care set this before triggering the call.
         self.sandbox_info: SimpleNamespace | None = None
         self.sandbox_info_error: Exception | None = None
+        # How long get_sandbox_info() takes before returning/raising --
+        # exercises _detect_memory_exceeded's own bound.
+        self.sandbox_info_delay: float = 0.0
 
     async def get_snapshot(self, snapshot_id: str) -> SimpleNamespace:
         assert snapshot_id == "snap-test"
@@ -81,6 +84,8 @@ class FakeManager:
         self.deleted.append(snapshot_id)
 
     async def get_sandbox_info(self, sandbox_id: str) -> SimpleNamespace:  # noqa: ARG002
+        if self.sandbox_info_delay:
+            await asyncio.sleep(self.sandbox_info_delay)
         if self.sandbox_info_error is not None:
             raise self.sandbox_info_error
         assert self.sandbox_info is not None, "test must set sandbox_info first"
@@ -237,8 +242,10 @@ async def test_output_collector_enforces_byte_limit() -> None:
 
 
 class TestDetectMemoryExceeded:
-    async def _runtime(self, manager: FakeManager) -> OpenSandboxRuntime:
-        runtime = OpenSandboxRuntime(Settings())
+    async def _runtime(
+        self, manager: FakeManager, settings: Settings | None = None
+    ) -> OpenSandboxRuntime:
+        runtime = OpenSandboxRuntime(settings or Settings())
         runtime._manager = manager  # type: ignore[assignment]
         return runtime
 
@@ -268,6 +275,44 @@ class TestDetectMemoryExceeded:
         sandbox = sandbox_record(container_id="osb-x")
 
         assert await runtime._detect_memory_exceeded(sandbox) is False
+
+    @pytest.mark.asyncio
+    async def test_an_unexpected_exception_type_does_not_claim_oom_either(self) -> None:
+        """The diagnostic lookup used to only catch `SandboxException`.
+
+        A bare `RuntimeError` (or, as in production, the `TimeoutError` the
+        bound below raises) must be swallowed the same way, not escape and
+        replace the caller's real error.
+        """
+        manager = FakeManager()
+        manager.sandbox_info_error = RuntimeError("transport blew up")
+        runtime = await self._runtime(manager)
+        sandbox = sandbox_record(container_id="osb-x")
+
+        assert await runtime._detect_memory_exceeded(sandbox) is False
+
+    @pytest.mark.asyncio
+    async def test_a_slow_diagnostic_lookup_is_bounded_and_falls_back(self) -> None:
+        """IMPORTANT 2: the lookup must not inherit the 30s connection timeout.
+
+        A control plane slow enough to blow `oom_diagnostic_timeout_seconds`
+        must not add that latency on top of every one of the 14 error sites
+        this feeds -- it times out on its own short bound and reports "not
+        OOM" rather than stalling the caller further.
+        """
+        manager = FakeManager()
+        manager.sandbox_info_delay = 0.1
+        manager.sandbox_info = sandbox_info(state="terminated", reason="OOMKilled")
+        settings = Settings(oom_diagnostic_timeout_seconds=0.01)
+        runtime = await self._runtime(manager, settings)
+        sandbox = sandbox_record(container_id="osb-x")
+
+        started = asyncio.get_running_loop().time()
+        result = await runtime._detect_memory_exceeded(sandbox)
+        elapsed = asyncio.get_running_loop().time() - started
+
+        assert result is False
+        assert elapsed < manager.sandbox_info_delay
 
     @pytest.mark.asyncio
     async def test_a_dead_sandbox_with_no_reason_is_not_treated_as_oom(self) -> None:
