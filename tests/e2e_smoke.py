@@ -60,7 +60,17 @@ def test_two_sandboxes_run_code_in_parallel(client: SandboxClient) -> None:
         first.pause(memory=False)
         first.resume()
         assert first.files.read("state.txt") == "preserved"
-        cold_state = first.run_code("first_value", wait=True, wait_timeout=30)
+        # `pause(memory=False)` discards the container; `resume()` only flips
+        # status back to `running` and the actual restart happens lazily on
+        # this next call, through the exact same path
+        # (Scheduler._ensure_running_locked) as the very first execution
+        # above -- a full cold container create plus kernel-ready wait. That
+        # first cold start gets a 60s budget (`first_job.wait(timeout=60)`);
+        # giving this structurally identical cold restart only 30s was an
+        # inconsistent budget for the same amount of work, not a slower
+        # product path -- 60s here matches what the product already proved
+        # sufficient for a cold start earlier in this same test.
+        cold_state = first.run_code("first_value", wait=True, wait_timeout=60)
         assert cold_state.status == "failed"
         assert cold_state.error
         assert cold_state.error.name == "NameError"
