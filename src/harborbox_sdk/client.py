@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
+from http import HTTPStatus
+from typing import Any, Self
 
 import httpx
 
@@ -22,7 +23,7 @@ class Sandboxes:
     ) -> Sandbox:
         return Sandbox(
             self._client,
-            self._client._request(
+            self._client.request(
                 "POST",
                 "/v1/sandboxes",
                 json={
@@ -38,13 +39,13 @@ class Sandboxes:
     def get(self, sandbox_id: str) -> Sandbox:
         return Sandbox(
             self._client,
-            self._client._request("GET", f"/v1/sandboxes/{sandbox_id}"),
+            self._client.request("GET", f"/v1/sandboxes/{sandbox_id}"),
         )
 
     def list(self) -> list[Sandbox]:
         return [
             Sandbox(self._client, payload)
-            for payload in self._client._request("GET", "/v1/sandboxes")
+            for payload in self._client.request("GET", "/v1/sandboxes")
         ]
 
 
@@ -65,20 +66,24 @@ class SandboxClient:
 
     # Forwards arbitrary httpx.request kwargs (json, params, headers, ...) and
     # httpx.Response.json() itself is typed to return Any, so both are genuine.
-    def _request(self, method: str, path: str, **kwargs: Any) -> Any:  # noqa: ANN401
+    #
+    # Public, not `_request`: Sandboxes, Sandbox, Execution, Commands and Files
+    # below all call this to reach the wire, so it is this SDK's own internal
+    # transport API rather than a SandboxClient implementation detail.
+    def request(self, method: str, path: str, **kwargs: Any) -> Any:  # noqa: ANN401
         response = self._http.request(method, path, **kwargs)
         response.raise_for_status()
-        if response.status_code == 204:
+        if response.status_code == HTTPStatus.NO_CONTENT:
             return None
         return response.json()
 
     def capacity(self) -> dict[str, Any]:
-        return dict(self._request("GET", "/v1/capacity"))
+        return dict(self.request("GET", "/v1/capacity"))
 
     def close(self) -> None:
         self._http.close()
 
-    def __enter__(self) -> SandboxClient:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_: object) -> None:
