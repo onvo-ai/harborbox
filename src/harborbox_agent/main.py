@@ -17,6 +17,7 @@ from harborbox_agent.files import (
     list_files,
     read_file,
     remove_file,
+    safe_path,
     write_file,
     write_file_stream,
 )
@@ -118,6 +119,14 @@ async def execute(body: ExecuteRequest, request: Request) -> dict[str, Any]:
     }
 
 
+def _require_piped[T](value: T | None, what: str) -> T:
+    """Narrow an Optional stream that is guaranteed set because PIPE was requested."""
+    if value is None:
+        message = f"subprocess {what} was not piped"
+        raise RuntimeError(message)
+    return value
+
+
 async def drain_stream(
     stream: asyncio.StreamReader,
     budget: OutputBudget,
@@ -136,8 +145,6 @@ async def drain_stream(
 async def command(body: CommandRequest) -> dict[str, Any]:
     cwd = str(WORKSPACE)
     if body.cwd:
-        from harborbox_agent.files import safe_path
-
         cwd = str(safe_path(WORKSPACE, body.cwd))
     environment = {**os.environ, **body.env}
     process = await asyncio.create_subprocess_shell(
@@ -148,14 +155,14 @@ async def command(body: CommandRequest) -> dict[str, Any]:
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
     )
-    assert process.stdout is not None
-    assert process.stderr is not None
+    process_stdout = _require_piped(process.stdout, "stdout")
+    process_stderr = _require_piped(process.stderr, "stderr")
     budget = OutputBudget(body.max_output_bytes)
     stdout: list[str] = []
     stderr: list[str] = []
     readers = [
-        asyncio.create_task(drain_stream(process.stdout, budget, stdout)),
-        asyncio.create_task(drain_stream(process.stderr, budget, stderr)),
+        asyncio.create_task(drain_stream(process_stdout, budget, stdout)),
+        asyncio.create_task(drain_stream(process_stderr, budget, stderr)),
     ]
     error: dict[str, Any] | None = None
     try:
@@ -186,8 +193,6 @@ async def command(body: CommandRequest) -> dict[str, Any]:
 async def process(body: ProcessRequest) -> dict[str, Any]:
     cwd = str(WORKSPACE)
     if body.cwd:
-        from harborbox_agent.files import safe_path
-
         cwd = str(safe_path(WORKSPACE, body.cwd))
     environment = {**os.environ, **body.env}
     child = await asyncio.create_subprocess_exec(
@@ -200,21 +205,21 @@ async def process(body: ProcessRequest) -> dict[str, Any]:
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
     )
-    assert child.stdin is not None
-    assert child.stdout is not None
-    assert child.stderr is not None
+    child_stdin = _require_piped(child.stdin, "stdin")
+    child_stdout = _require_piped(child.stdout, "stdout")
+    child_stderr = _require_piped(child.stderr, "stderr")
     budget = OutputBudget(body.max_output_bytes)
     stdout: list[str] = []
     stderr: list[str] = []
     readers = [
-        asyncio.create_task(drain_stream(child.stdout, budget, stdout)),
-        asyncio.create_task(drain_stream(child.stderr, budget, stderr)),
+        asyncio.create_task(drain_stream(child_stdout, budget, stdout)),
+        asyncio.create_task(drain_stream(child_stderr, budget, stderr)),
     ]
     if body.stdin is not None:
-        child.stdin.write(body.stdin.encode("utf-8"))
-        await child.stdin.drain()
-    child.stdin.close()
-    await child.stdin.wait_closed()
+        child_stdin.write(body.stdin.encode("utf-8"))
+        await child_stdin.drain()
+    child_stdin.close()
+    await child_stdin.wait_closed()
     error: dict[str, Any] | None = None
     try:
         async with asyncio.timeout(body.timeout_seconds):

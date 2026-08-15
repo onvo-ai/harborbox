@@ -39,7 +39,7 @@ class KernelSession:
         self._started = False
 
     async def ensure_started(self) -> None:
-        """Starts the kernel on first use, at most once.
+        """Start the kernel on first use, at most once.
 
         Starting it eagerly cost every sandbox 3.5s before it would answer a
         single request — measured as the gap between uvicorn's "Waiting for
@@ -59,14 +59,14 @@ class KernelSession:
             self._started = True
 
     async def start(self) -> None:
-        """Imports jupyter_client here, not at module scope.
+        """Import jupyter_client here, not at module scope.
 
         It costs ~1.2s to import on a sandbox's single core, and it was being
         paid by every sandbox before the agent would answer anything — including
         the majority that only ever run /v1/commands and never touch a kernel.
         Deferring the *start* was not enough while the import stayed eager.
         """
-        from jupyter_client import AsyncKernelManager
+        from jupyter_client import AsyncKernelManager  # noqa: PLC0415
 
         self.manager = AsyncKernelManager(kernel_name="python3")
         await self.manager.start_kernel(cwd=self.workspace)
@@ -100,6 +100,17 @@ class KernelSession:
                 max_output_bytes=max_output_bytes,
             )
 
+    def _require_client(self) -> AsyncKernelClient:
+        """Return the running client, narrowing the Optional for callers.
+
+        Split out of `_execute_locked` to keep that method's branch count under
+        the complexity threshold rather than adding another `if` to it.
+        """
+        if self.client is None:
+            message = "kernel is not running"
+            raise RuntimeError(message)
+        return self.client
+
     async def _execute_locked(
         self,
         code: str,
@@ -108,7 +119,7 @@ class KernelSession:
         timeout_seconds: int,
         max_output_bytes: int,
     ) -> KernelExecution:
-        assert self.client is not None
+        client = self._require_client()
         if env:
             env_setup = (
                 "import os as __harborbox_os\n"
@@ -118,7 +129,7 @@ class KernelSession:
 
         execution = KernelExecution()
         budget = OutputBudget(max_output_bytes)
-        message_id = self.client.execute(
+        message_id = client.execute(
             code,
             allow_stdin=False,
             stop_on_error=True,
@@ -128,7 +139,7 @@ class KernelSession:
         try:
             while True:
                 remaining = _remaining_time(deadline)
-                message = await self.client.get_iopub_msg(timeout=remaining)
+                message = await client.get_iopub_msg(timeout=remaining)
                 if message.get("parent_header", {}).get("msg_id") != message_id:
                     continue
                 message_type = message.get("msg_type")

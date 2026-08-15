@@ -24,17 +24,23 @@ is guarded in `Settings.validate_warm_pool_budget`.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    import asyncio
+from sqlalchemy import select
 
+from harborbox.models import Sandbox
+
+if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
     from harborbox.config import Settings
     from harborbox.runtime_protocol import SandboxRuntime
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -98,13 +104,6 @@ async def reap_once(
     settings: Settings,
 ) -> ReapPlan:
     """Run one sweep. Returns what it acted on, for logging and tests."""
-    import logging
-
-    from sqlalchemy import select
-
-    from .models import Sandbox
-
-    log = logging.getLogger(__name__)
     now = datetime.now(UTC)
 
     async with session_factory() as session:
@@ -179,10 +178,6 @@ async def reaper_loop(
     leak protection with it, and every condition it hits is transient by nature
     (a database blip, a runtime that is restarting).
     """
-    import asyncio
-    import logging
-
-    log = logging.getLogger(__name__)
     while not stop.is_set():
         try:
             await reap_once(session_factory, runtime, settings)
