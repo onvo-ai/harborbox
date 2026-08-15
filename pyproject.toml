@@ -87,6 +87,12 @@ ignore = [
 # sandbox/ ships standalone scripts run inside the sandbox container via
 # `python forkrun.py`, not imported as a package.
 "sandbox/**" = ["INP001"]
+# harborbox_sdk is a shipped public package (see __init__.py's __all__ and the
+# README), so its underscore-prefixed names are not implementation details to
+# be widened into public API -- they mark package-internal cooperation between
+# Sandbox/Execution/Commands/Files and SandboxClient, deliberately kept off
+# the public surface. Same reasoning as the tests/** SLF001 entry above.
+"src/harborbox_sdk/**" = ["SLF001"]
 
 [tool.mypy]
 python_version = "3.12"

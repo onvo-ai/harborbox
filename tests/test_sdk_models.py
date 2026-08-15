@@ -7,7 +7,7 @@ class FakeClient:
     def __init__(self, responses: list[dict[str, Any]]) -> None:
         self.responses = responses
 
-    def request(self, *_: object, **__: object) -> dict[str, Any]:
+    def _request(self, *_: object, **__: object) -> dict[str, Any]:
         return self.responses.pop(0)
 
 

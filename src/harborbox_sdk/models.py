@@ -39,7 +39,7 @@ class ExecutionError:
 
 class Execution:
     def __init__(self, client: SandboxClient, payload: dict[str, Any]) -> None:
-        self.client = client
+        self._client = client
         self._apply(payload)
 
     def _apply(self, payload: dict[str, Any]) -> None:
@@ -93,7 +93,7 @@ class Execution:
         return None
 
     def refresh(self) -> Execution:
-        self._apply(self.client.request("GET", f"/v1/executions/{self.id}"))
+        self._apply(self._client._request("GET", f"/v1/executions/{self.id}"))
         return self
 
     def wait(
@@ -117,7 +117,7 @@ class Execution:
 
     def cancel(self) -> Execution:
         self._apply(
-            self.client.request("POST", f"/v1/executions/{self.id}/cancel")
+            self._client._request("POST", f"/v1/executions/{self.id}/cancel")
         )
         return self
 
@@ -140,8 +140,8 @@ class Commands:
         wait_timeout: float | None = None,
     ) -> Execution:
         execution = Execution(
-            self._sandbox.client,
-            self._sandbox.client.request(
+            self._sandbox._client,
+            self._sandbox._client._request(
                 "POST",
                 f"/v1/sandboxes/{self._sandbox.id}/commands",
                 json={
@@ -160,7 +160,7 @@ class Files:
         self._sandbox = sandbox
 
     def read(self, path: str) -> str:
-        payload = self._sandbox.client.request(
+        payload = self._sandbox._client._request(
             "GET",
             f"/v1/sandboxes/{self._sandbox.id}/files",
             params={"path": path},
@@ -170,7 +170,7 @@ class Files:
         return str(payload["content"])
 
     def write(self, path: str, content: str) -> str:
-        payload = self._sandbox.client.request(
+        payload = self._sandbox._client._request(
             "PUT",
             f"/v1/sandboxes/{self._sandbox.id}/files",
             json={"path": path, "content": content, "encoding": "utf-8"},
@@ -178,7 +178,7 @@ class Files:
         return str(payload["content"])
 
     def write_bytes(self, path: str, content: bytes) -> int:
-        payload = self._sandbox.client.request(
+        payload = self._sandbox._client._request(
             "PUT",
             f"/v1/sandboxes/{self._sandbox.id}/files/content",
             params={"path": path},
@@ -188,7 +188,7 @@ class Files:
         return int(payload["size"])
 
     def list(self, path: str = ".") -> list[dict[str, Any]]:
-        payload = self._sandbox.client.request(
+        payload = self._sandbox._client._request(
             "GET",
             f"/v1/sandboxes/{self._sandbox.id}/files/list",
             params={"path": path},
@@ -196,7 +196,7 @@ class Files:
         return list(payload["entries"])
 
     def remove(self, path: str) -> None:
-        self._sandbox.client.request(
+        self._sandbox._client._request(
             "DELETE",
             f"/v1/sandboxes/{self._sandbox.id}/files",
             params={"path": path},
@@ -205,7 +205,7 @@ class Files:
 
 class Sandbox:
     def __init__(self, client: SandboxClient, payload: dict[str, Any]) -> None:
-        self.client = client
+        self._client = client
         self._apply(payload)
         self.commands = Commands(self)
         self.files = Files(self)
@@ -228,8 +228,8 @@ class Sandbox:
         wait_timeout: float | None = None,
     ) -> Execution:
         execution = Execution(
-            self.client,
-            self.client.request(
+            self._client,
+            self._client._request(
                 "POST",
                 f"/v1/sandboxes/{self.id}/executions",
                 json={
@@ -242,7 +242,7 @@ class Sandbox:
         return execution.wait(wait_timeout) if wait else execution
 
     def refresh(self) -> Sandbox:
-        self._apply(self.client.request("GET", f"/v1/sandboxes/{self.id}"))
+        self._apply(self._client._request("GET", f"/v1/sandboxes/{self.id}"))
         return self
 
     def set_timeout(self, timeout_ms: int) -> Sandbox:
@@ -250,7 +250,7 @@ class Sandbox:
             message = "timeout_ms must be non-negative"
             raise ValueError(message)
         self._apply(
-            self.client.request(
+            self._client._request(
                 "PATCH",
                 f"/v1/sandboxes/{self.id}",
                 json={"idle_timeout_seconds": math.ceil(timeout_ms / 1000)},
@@ -260,7 +260,7 @@ class Sandbox:
 
     def touch(self) -> Sandbox:
         self._apply(
-            self.client.request(
+            self._client._request(
                 "PATCH",
                 f"/v1/sandboxes/{self.id}",
                 json={},
@@ -270,7 +270,7 @@ class Sandbox:
 
     def pause(self, *, memory: bool = True) -> Sandbox:
         self._apply(
-            self.client.request(
+            self._client._request(
                 "POST",
                 f"/v1/sandboxes/{self.id}/pause",
                 json={"memory": memory},
@@ -280,12 +280,12 @@ class Sandbox:
 
     def resume(self) -> Sandbox:
         self._apply(
-            self.client.request("POST", f"/v1/sandboxes/{self.id}/resume")
+            self._client._request("POST", f"/v1/sandboxes/{self.id}/resume")
         )
         return self
 
     def kill(self) -> None:
-        self.client.request("DELETE", f"/v1/sandboxes/{self.id}")
+        self._client._request("DELETE", f"/v1/sandboxes/{self.id}")
         self.status = "killed"
 
     def __enter__(self) -> Self:
