@@ -53,15 +53,15 @@ def can_admit(
         capacity.reserved_memory_mb + incremental_memory_mb
         > capacity.sandbox_budget_mb
     ):
-        return AdmissionDecision(False, "memory")
+        return AdmissionDecision(admitted=False, waiting_for="memory")
 
     if (
         capacity.host_available_memory_mb - incremental_memory_mb
         < emergency_available_memory_mb
     ):
-        return AdmissionDecision(False, "memory")
+        return AdmissionDecision(admitted=False, waiting_for="memory")
 
     if capacity.reserved_cpu + incremental_cpu > capacity.max_parallel_cpu:
-        return AdmissionDecision(False, "cpu")
+        return AdmissionDecision(admitted=False, waiting_for="cpu")
 
-    return AdmissionDecision(True)
+    return AdmissionDecision(admitted=True)

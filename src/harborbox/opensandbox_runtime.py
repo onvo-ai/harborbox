@@ -6,7 +6,10 @@ import logging
 import os
 import shlex
 import tempfile
+from dataclasses import dataclass
 from datetime import timedelta
+from http import HTTPStatus
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
 import httpx
@@ -48,6 +51,17 @@ if TYPE_CHECKING:
 
 SNAPSHOT_METADATA_KEY = "harborbox.runtime.snapshot_id"
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _CommandSpec:
+    """What to run and how; bundled to keep `_run_command`'s signature small."""
+
+    command: str
+    timeout_seconds: int
+    max_output_bytes: int
+    environment: dict[str, str]
+    cwd: str | None
 
 
 class _BoundedOutput:
@@ -193,7 +207,7 @@ class OpenSandboxRuntime:
     @staticmethod
     def _read_meminfo_mb(key: str) -> int:
         try:
-            with open("/proc/meminfo", encoding="utf-8") as handle:
+            with Path("/proc/meminfo").open(encoding="utf-8") as handle:
                 for line in handle:
                     if line.startswith(f"{key}:"):
                         return int(line.split()[1]) // 1024
@@ -317,12 +331,14 @@ class OpenSandboxRuntime:
     ) -> AgentExecutionResponse:
         if request.env:
             return await self._run_command(
-                sandbox=sandbox,
-                command=shlex.join(["python", "-c", request.code]),
-                timeout_seconds=request.timeout_seconds,
-                max_output_bytes=request.max_output_bytes,
-                environment=request.env,
-                cwd="/workspace",
+                sandbox,
+                _CommandSpec(
+                    command=shlex.join(["python", "-c", request.code]),
+                    timeout_seconds=request.timeout_seconds,
+                    max_output_bytes=request.max_output_bytes,
+                    environment=request.env,
+                    cwd="/workspace",
+                ),
             )
         handle = await self._get_handle(sandbox, check_ready=True)
         # Paid here rather than at sandbox-ready, so only callers that actually
@@ -348,12 +364,14 @@ class OpenSandboxRuntime:
         self, sandbox: Sandbox, request: AgentCommandRequest
     ) -> AgentExecutionResponse:
         return await self._run_command(
-            sandbox=sandbox,
-            command=request.command,
-            timeout_seconds=request.timeout_seconds,
-            max_output_bytes=request.max_output_bytes,
-            environment=request.env,
-            cwd=request.cwd,
+            sandbox,
+            _CommandSpec(
+                command=request.command,
+                timeout_seconds=request.timeout_seconds,
+                max_output_bytes=request.max_output_bytes,
+                environment=request.env,
+                cwd=request.cwd,
+            ),
         )
 
     async def execute_process(
@@ -364,33 +382,28 @@ class OpenSandboxRuntime:
             encoded = base64.b64encode(request.stdin.encode("utf-8")).decode("ascii")
             command = f"printf %s {shlex.quote(encoded)} | base64 -d | {command}"
         return await self._run_command(
-            sandbox=sandbox,
-            command=command,
-            timeout_seconds=request.timeout_seconds,
-            max_output_bytes=request.max_output_bytes,
-            environment=request.env,
-            cwd=request.cwd,
+            sandbox,
+            _CommandSpec(
+                command=command,
+                timeout_seconds=request.timeout_seconds,
+                max_output_bytes=request.max_output_bytes,
+                environment=request.env,
+                cwd=request.cwd,
+            ),
         )
 
     async def _run_command(
-        self,
-        *,
-        sandbox: Sandbox,
-        command: str,
-        timeout_seconds: int,
-        max_output_bytes: int,
-        environment: dict[str, str],
-        cwd: str | None,
+        self, sandbox: Sandbox, spec: _CommandSpec
     ) -> AgentExecutionResponse:
         handle = await self._get_handle(sandbox, check_ready=True)
-        output = _BoundedOutput(max_output_bytes)
+        output = _BoundedOutput(spec.max_output_bytes)
         try:
             execution = await handle.commands.run(
-                command,
+                spec.command,
                 opts=RunCommandOpts(
-                    working_directory=cwd,
-                    timeout=timedelta(seconds=timeout_seconds),
-                    envs=environment,
+                    working_directory=spec.cwd,
+                    timeout=timedelta(seconds=spec.timeout_seconds),
+                    envs=spec.environment,
                 ),
                 handlers=output.handlers(),
             )
@@ -492,7 +505,7 @@ class OpenSandboxRuntime:
         except SandboxException as exc:
             self._raise_runtime_error(exc, sandbox)
 
-    async def pause(self, sandbox: Sandbox, memory: bool) -> None:
+    async def pause(self, sandbox: Sandbox, *, memory: bool) -> None:
         if not sandbox.container_id:
             return
         handle = await self._get_handle(sandbox, check_ready=False)
@@ -553,13 +566,13 @@ class OpenSandboxRuntime:
                     skip_health_check=True,
                 )
             except SandboxApiException as exc:
-                if exc.status_code != 404:
+                if exc.status_code != HTTPStatus.NOT_FOUND:
                     self._raise_runtime_error(exc, sandbox)
         if handle is not None:
             try:
                 await handle.kill()
             except SandboxApiException as exc:
-                if exc.status_code != 404:
+                if exc.status_code != HTTPStatus.NOT_FOUND:
                     self._raise_runtime_error(exc, sandbox)
             finally:
                 await handle.close()
@@ -579,7 +592,7 @@ class OpenSandboxRuntime:
                 sandbox.container_id
             )
         except SandboxApiException as exc:
-            if exc.status_code == 404:
+            if exc.status_code == HTTPStatus.NOT_FOUND:
                 return None
             self._raise_runtime_error(exc, sandbox)
         state = info.status.state.lower()
@@ -650,7 +663,7 @@ class OpenSandboxRuntime:
         try:
             await (await self._get_manager()).delete_snapshot(snapshot_id)
         except SandboxApiException as exc:
-            if not (ignore_missing and exc.status_code == 404):
+            if not (ignore_missing and exc.status_code == HTTPStatus.NOT_FOUND):
                 raise SandboxUnavailableError(str(exc)) from exc
 
     @staticmethod

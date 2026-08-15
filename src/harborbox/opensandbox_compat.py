@@ -152,7 +152,9 @@ def template_for(body: OpenSandboxCreate, settings: Settings) -> str:
             message = f"unknown sandbox template: {requested}"
             raise ValueError(message)
         return requested
-    assert body.image is not None
+    if body.image is None:
+        message = "a registered Harborbox templateRef or template image is required"
+        raise ValueError(message)
     for template, image in settings.template_images.items():
         if body.image.uri == image:
             return template
@@ -188,7 +190,8 @@ def expiration(sandbox: Sandbox) -> datetime | None:
     if not value:
         return None
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        # datetime.fromisoformat has accepted a trailing "Z" since Python 3.11.
+        parsed = datetime.fromisoformat(value)
     except ValueError:
         return None
     return parsed.astimezone(UTC)

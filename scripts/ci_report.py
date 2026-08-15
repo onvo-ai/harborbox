@@ -128,16 +128,20 @@ def render_report(root: Path) -> str:
         top = sorted(by_rule.items(), key=lambda kv: -kv[1])[:8]
         lines += [
             "",
-            f"<details><summary><b>Lint backlog: {backlog}</b> — what "
-            "<code>ruff --select ALL</code> reports with nothing ignored "
-            "(click for the top rules)</summary>",
+            (
+                f"<details><summary><b>Lint backlog: {backlog}</b> — what "
+                "<code>ruff --select ALL</code> reports with nothing ignored "
+                "(click for the top rules)</summary>"
+            ),
             "",
             "| Rule | Count |",
             "|---|---:|",
             *(f"| `{rule}` | {n} |" for rule, n in top),
             "",
-            "These are the families `pyproject.toml` deliberately ignores, each "
-            "with its reason. The blocking gate is green at zero.",
+            (
+                "These are the families `pyproject.toml` deliberately ignores, "
+                "each with its reason. The blocking gate is green at zero."
+            ),
             "</details>",
         ]
 

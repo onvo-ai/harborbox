@@ -157,7 +157,7 @@ class Settings(BaseSettings):
         }
 
     def base_of_derived_template(self, template: str) -> str | None:
-        """The static base a derived template name refers to, if it is one.
+        """Return the static base a derived template name refers to, if it is one.
 
         Purely lexical, and deliberately so: derived image names are
         content-addressed by construction, which is what lets the synchronous
@@ -172,7 +172,7 @@ class Settings(BaseSettings):
         return f"{self.template_image_prefix}-{template}:{self.template_version}"
 
     def entrypoint_for_template(self, template: str | None) -> list[str]:
-        """What opensandbox runs as the sandbox's bootstrap command.
+        """Return what opensandbox runs as the sandbox's bootstrap command.
 
         Not the image's CMD — opensandbox ignores that and runs whatever the
         create request passes, so this is the only place a sandbox's long-lived
@@ -259,7 +259,7 @@ class Settings(BaseSettings):
         }
 
     def resources_for_template(self, template: str | None) -> tuple[int, float]:
-        """Static sizing for a template name.
+        """Return static sizing for a template name.
 
         A derived template inherits its base's sizing here. Any per-template
         override lives in the database and is applied by

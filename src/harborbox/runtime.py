@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from http import HTTPStatus
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import docker
@@ -42,6 +44,13 @@ class SandboxMemoryExceededError(SandboxRuntimeError):
         super().__init__(f"sandbox exceeded its {memory_mb} MiB memory limit")
 
 
+# Container exit code for a process killed by SIGKILL (128 + signal 9), which is
+# how the OOM killer terminates a container; the exit code is doubled with
+# OOMKilled below because the exit code alone is ambiguous (a process can `exit
+# 137` on its own).
+_SIGKILL_EXIT_CODE = 137
+
+
 class DockerRuntime:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -75,7 +84,7 @@ class DockerRuntime:
     async def available_memory_mb(self) -> int:
         def read_mem_available() -> int:
             try:
-                with open("/proc/meminfo", encoding="utf-8") as handle:
+                with Path("/proc/meminfo").open(encoding="utf-8") as handle:
                     for line in handle:
                         if line.startswith("MemAvailable:"):
                             return int(line.split()[1]) // 1024
@@ -217,7 +226,7 @@ class DockerRuntime:
                     headers=self._agent_headers(sandbox),
                     timeout=1.0,
                 )
-                if response.status_code == 200:
+                if response.status_code == HTTPStatus.OK:
                     return
             except httpx.HTTPError:
                 pass
@@ -312,12 +321,12 @@ class DockerRuntime:
         )
         response.raise_for_status()
 
-    async def pause(self, sandbox: Sandbox, memory: bool) -> None:
+    async def pause(self, sandbox: Sandbox, *, memory: bool) -> None:
         if not sandbox.container_id:
             return
-        await asyncio.to_thread(self._pause_sync, sandbox.container_id, memory)
+        await asyncio.to_thread(self._pause_sync, sandbox.container_id, memory=memory)
 
-    def _pause_sync(self, container_id: str, memory: bool) -> None:
+    def _pause_sync(self, container_id: str, *, memory: bool) -> None:
         try:
             container = self.client.containers.get(container_id)
             container.reload()
@@ -395,7 +404,7 @@ class DockerRuntime:
                 return None
 
         state = await asyncio.to_thread(inspect)
-        if state and (state[1] or state[0] == 137):
+        if state and (state[1] or state[0] == _SIGKILL_EXIT_CODE):
             raise SandboxMemoryExceededError(sandbox.memory_mb)
 
     def _agent_url(self, sandbox: Sandbox, path: str) -> str:

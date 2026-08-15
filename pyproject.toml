@@ -84,6 +84,9 @@ ignore = [
   "SLF001",   # Tests reach into private state to set up fixtures; see test_warm_pool.py.
 ]
 "scripts/**" = ["INP001"]  # scripts/ is intentionally not an importable package.
+# sandbox/ ships standalone scripts run inside the sandbox container via
+# `python forkrun.py`, not imported as a package.
+"sandbox/**" = ["INP001"]
 
 [tool.mypy]
 python_version = "3.12"

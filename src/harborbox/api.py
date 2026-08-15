@@ -4,6 +4,7 @@ import asyncio
 import json
 import secrets
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -840,15 +841,22 @@ async def opensandbox_patch_metadata(
     return response_for(sandbox, settings_from(request))
 
 
+@dataclass(frozen=True)
+class _ExecutionSpec:
+    """What the caller wants run; bundled to keep `enqueue`'s signature small."""
+
+    kind: str
+    code: str | None
+    command: str | None
+    environment: dict[str, str]
+    cwd: str | None
+    timeout_seconds: int | None
+
+
 async def enqueue(
     *,
     sandbox_id: str,
-    kind: str,
-    code: str | None,
-    command: str | None,
-    environment: dict[str, str],
-    cwd: str | None,
-    timeout_seconds: int | None,
+    spec: _ExecutionSpec,
     settings: Settings,
     session: AsyncSession,
 ) -> ExecutionResponse:
@@ -864,7 +872,7 @@ async def enqueue(
             detail="execution queue is full",
             headers={"Retry-After": "1"},
         )
-    timeout = timeout_seconds or settings.default_execution_timeout_seconds
+    timeout = spec.timeout_seconds or settings.default_execution_timeout_seconds
     if timeout > settings.max_execution_timeout_seconds:
         raise HTTPException(
             status_code=422,
@@ -873,19 +881,19 @@ async def enqueue(
                 f"{settings.max_execution_timeout_seconds}"
             ),
         )
-    payload = code if code is not None else command or ""
+    payload = spec.code if spec.code is not None else spec.command or ""
     if len(payload.encode("utf-8")) > settings.max_code_bytes:
         raise HTTPException(status_code=413, detail="execution payload is too large")
 
     execution = Execution(
         id=new_id("exec"),
         sandbox_id=sandbox.id,
-        kind=kind,
+        kind=spec.kind,
         status="queued",
-        code=code,
-        command=command,
-        environment=environment,
-        cwd=cwd,
+        code=spec.code,
+        command=spec.command,
+        environment=spec.environment,
+        cwd=spec.cwd,
         timeout_seconds=timeout,
     )
     session.add(execution)
@@ -908,12 +916,14 @@ async def create_execution(
 ) -> ExecutionResponse:
     return await enqueue(
         sandbox_id=sandbox_id,
-        kind="code",
-        code=body.code,
-        command=None,
-        environment=body.env,
-        cwd=None,
-        timeout_seconds=body.timeout_seconds,
+        spec=_ExecutionSpec(
+            kind="code",
+            code=body.code,
+            command=None,
+            environment=body.env,
+            cwd=None,
+            timeout_seconds=body.timeout_seconds,
+        ),
         settings=settings_from(request),
         session=session,
     )
@@ -933,12 +943,14 @@ async def create_command(
 ) -> ExecutionResponse:
     return await enqueue(
         sandbox_id=sandbox_id,
-        kind="command",
-        code=None,
-        command=body.command,
-        environment=body.env,
-        cwd=body.cwd,
-        timeout_seconds=body.timeout_seconds,
+        spec=_ExecutionSpec(
+            kind="command",
+            code=None,
+            command=body.command,
+            environment=body.env,
+            cwd=body.cwd,
+            timeout_seconds=body.timeout_seconds,
+        ),
         settings=settings_from(request),
         session=session,
     )
@@ -967,12 +979,14 @@ async def create_process(
     )
     return await enqueue(
         sandbox_id=sandbox_id,
-        kind="process",
-        code=None,
-        command=process_spec,
-        environment=seal_environment(settings, body.env, body.secret_env),
-        cwd=body.cwd,
-        timeout_seconds=body.timeout_seconds,
+        spec=_ExecutionSpec(
+            kind="process",
+            code=None,
+            command=process_spec,
+            environment=seal_environment(settings, body.env, body.secret_env),
+            cwd=body.cwd,
+            timeout_seconds=body.timeout_seconds,
+        ),
         settings=settings,
         session=session,
     )

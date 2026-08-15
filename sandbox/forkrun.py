@@ -26,10 +26,14 @@ Usage:  python forkrun.py <script.py>
 
 import contextlib
 import os
+import runpy
+import select
 import socket
 import struct
 import sys
 import time
+import traceback
+from pathlib import Path
 
 # Runs only inside the single-tenant sandbox container's tmpfs /tmp (see
 # DockerRuntime._start_sandbox_sync in src/harborbox/runtime.py); a fixed
@@ -41,12 +45,11 @@ SOCKET_PATH = "/tmp/.harborbox-forkrun.sock"  # noqa: S108
 PRELOAD = ("pandas", "numpy", "json", "datetime", "math")
 
 _READY_TIMEOUT_S = 30.0
+_EXPECTED_ARGC = 2
 
 
 def _run_in_process(path: str) -> int:
-    """The fallback, and what the forked child ends up calling."""
-    import runpy
-
+    """Run the fallback path, and what the forked child ends up calling."""
     try:
         runpy.run_path(path, run_name="__main__")
     except SystemExit as exc:
@@ -58,8 +61,6 @@ def _run_in_process(path: str) -> int:
         # arbitrary; anything it raises, including KeyboardInterrupt/GeneratorExit,
         # must be turned into a normal (code, stdout, stderr) result rather than
         # propagate, or a single bad widget kills the whole daemon/batch.
-        import traceback
-
         traceback.print_exc()
         return 1
     return 0
@@ -78,13 +79,11 @@ def _recv_exact(sock: socket.socket, count: int) -> bytes:
 
 
 def _drain(read_fds: "list[int]") -> "dict[int, bytes]":
-    """Reads both pipes concurrently.
+    """Read both pipes concurrently.
 
     Sequential reads deadlock: a script that fills the stderr pipe buffer while
     the parent is still reading stdout blocks forever.
     """
-    import select
-
     out = {fd: [] for fd in read_fds}
     open_fds = list(read_fds)
     while open_fds:
@@ -108,7 +107,7 @@ def _serve() -> None:
             __import__(name)
 
     with contextlib.suppress(FileNotFoundError):
-        os.unlink(SOCKET_PATH)
+        Path(SOCKET_PATH).unlink()
 
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(SOCKET_PATH)
@@ -207,14 +206,16 @@ def _connect() -> "socket.socket | None":
 
 
 def main(argv: "list[str]") -> int:
-    if len(argv) == 2 and argv[1] == "--serve":
+    if len(argv) == _EXPECTED_ARGC and argv[1] == "--serve":
         _serve()
         return 0
-    if len(argv) != 2:
-        print("usage: forkrun.py <script.py>", file=sys.stderr)
+    if len(argv) != _EXPECTED_ARGC:
+        # This is the script's CLI usage message, not application logging;
+        # stdout/stderr is the interface (see module docstring).
+        print("usage: forkrun.py <script.py>", file=sys.stderr)  # noqa: T201
         return 2
 
-    path = os.path.abspath(argv[1])
+    path = str(Path(argv[1]).resolve())
     sock = _connect()
     if sock is None:
         return _run_in_process(path)
