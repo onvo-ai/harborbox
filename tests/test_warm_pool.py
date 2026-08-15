@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import TYPE_CHECKING
 
 import pytest
 from opensandbox.config import ConnectionConfig
@@ -9,14 +9,23 @@ from opensandbox.config import ConnectionConfig
 from harborbox.config import Settings
 from harborbox.warm_pool import OpenSandboxWarmPools
 
+if TYPE_CHECKING:
+    from datetime import timedelta
+
+    from opensandbox.pool_types import AcquirePolicy
+
 
 class FakePool:
-    def __init__(self, sandbox: Any) -> None:
+    def __init__(self, sandbox: FakeWarmHandle) -> None:
         self.sandbox = sandbox
         self.acquired = 0
         self.resized: list[int] = []
 
-    async def acquire(self, **kwargs: Any) -> Any:
+    # OpenSandboxWarmPools.acquire only ever calls this with `sandbox_timeout`
+    # and `policy`, so the value type is the real union rather than Any.
+    async def acquire(
+        self, **kwargs: timedelta | AcquirePolicy | None
+    ) -> FakeWarmHandle:
         assert kwargs["sandbox_timeout"] is None
         self.acquired += 1
         return self.sandbox
@@ -31,7 +40,7 @@ class FakeWarmHandle:
     def __init__(self) -> None:
         self.renewed = False
 
-    async def renew(self, _timeout: Any) -> None:
+    async def renew(self, _timeout: timedelta) -> None:
         self.renewed = True
 
 
@@ -80,8 +89,11 @@ def test_configured_pool_is_included_in_admission_reservation() -> None:
 
     reservation = pools.reservation()
 
-    assert reservation.memory_mb == 1536
+    expected_memory_mb = 1536
     # relaydeck 2x0.5 + onvo-pro 1x1.0. Was 3.0 when the onvo templates
     # defaulted to 2.0 CPU each.
-    assert reservation.cpu == 2.0
-    assert reservation.sandboxes == 3
+    expected_cpu = 2.0
+    expected_sandboxes = 3
+    assert reservation.memory_mb == expected_memory_mb
+    assert reservation.cpu == expected_cpu
+    assert reservation.sandboxes == expected_sandboxes

@@ -16,7 +16,9 @@ from harborbox.opensandbox_runtime import (
 )
 
 
-def sandbox_record(**overrides: Any) -> Sandbox:
+# `overrides` can set any Sandbox column, whose types are heterogeneous
+# (str, int, float, dict, datetime, ...), so Any is the honest type here.
+def sandbox_record(**overrides: Any) -> Sandbox:  # noqa: ANN401
     values: dict[str, Any] = {
         "id": "sbx-test",
         "status": "created",
@@ -83,7 +85,9 @@ async def test_start_delegates_image_and_resource_limits_to_opensandbox(
 
     class FakeOpenSandbox:
         @classmethod
-        async def create(cls, *args: Any, **kwargs: Any) -> FakeHandle:
+        # Stands in for opensandbox.Sandbox.create and exists to capture
+        # whatever the runtime passes it, so it must accept anything.
+        async def create(cls, *args: Any, **kwargs: Any) -> FakeHandle:  # noqa: ANN401
             captured["args"] = args
             captured["kwargs"] = kwargs
             return handle
@@ -111,7 +115,9 @@ async def test_start_claims_matching_warm_template(
 ) -> None:
     handle = FakeHandle("osb-warm-1")
 
-    async def acquire(**kwargs: Any) -> FakeHandle:
+    # Stands in for the warm pool's acquire() and exists to assert on
+    # whatever kwargs the runtime forwards, so it must accept anything.
+    async def acquire(**kwargs: Any) -> FakeHandle:  # noqa: ANN401
         assert kwargs == {
             "template": "relaydeck",
             "memory_mb": 256,
@@ -145,7 +151,9 @@ async def test_cold_pause_snapshots_kills_and_restores(
 
     class FakeOpenSandbox:
         @classmethod
-        async def create(cls, *args: Any, **kwargs: Any) -> FakeHandle:
+        # Stands in for opensandbox.Sandbox.create and exists to capture
+        # whatever the runtime passes it, so it must accept anything.
+        async def create(cls, *args: Any, **kwargs: Any) -> FakeHandle:  # noqa: ANN401
             captured["args"] = args
             captured["kwargs"] = kwargs
             return restored

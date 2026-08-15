@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
+# Pydantic resolves field annotations at class-construction time, so `datetime`
+# must stay a real import here, not TYPE_CHECKING-only.
+from datetime import datetime  # noqa: TC003
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -250,5 +252,6 @@ class AgentExecutionResponse(BaseModel):
     @model_validator(mode="after")
     def error_and_exit_are_consistent(self) -> AgentExecutionResponse:
         if self.error is not None and self.exit_code == 0:
-            raise ValueError("an errored execution cannot have exit_code=0")
+            message = "an errored execution cannot have exit_code=0"
+            raise ValueError(message)
         return self

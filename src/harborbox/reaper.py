@@ -24,9 +24,23 @@ is guarded in `Settings.validate_warm_pool_budget`.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING
+
+from sqlalchemy import select
+
+from harborbox.models import Sandbox
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from harborbox.config import Settings
+    from harborbox.runtime_protocol import SandboxRuntime
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -85,16 +99,11 @@ def plan_reap(
 
 
 async def reap_once(
-    session_factory: Any, runtime: Any, settings: Any
+    session_factory: async_sessionmaker[AsyncSession],
+    runtime: SandboxRuntime,
+    settings: Settings,
 ) -> ReapPlan:
     """Run one sweep. Returns what it acted on, for logging and tests."""
-    import logging
-
-    from sqlalchemy import select
-
-    from .models import Sandbox
-
-    log = logging.getLogger(__name__)
     now = datetime.now(UTC)
 
     async with session_factory() as session:
@@ -152,14 +161,16 @@ async def reap_once(
 
 def _aware(value: datetime | None) -> datetime | None:
     """Normalise to UTC-aware; the column may come back naive."""
-
     if value is None:
         return None
     return value if value.tzinfo else value.replace(tzinfo=UTC)
 
 
 async def reaper_loop(
-    session_factory: Any, runtime: Any, settings: Any, stop: Any
+    session_factory: async_sessionmaker[AsyncSession],
+    runtime: SandboxRuntime,
+    settings: Settings,
+    stop: asyncio.Event,
 ) -> None:
     """Sweep on an interval until told to stop.
 
@@ -167,10 +178,6 @@ async def reaper_loop(
     leak protection with it, and every condition it hits is transient by nature
     (a database blip, a runtime that is restarting).
     """
-    import asyncio
-    import logging
-
-    log = logging.getLogger(__name__)
     while not stop.is_set():
         try:
             await reap_once(session_factory, runtime, settings)
@@ -187,5 +194,6 @@ async def reaper_loop(
 def _require(value: datetime | None) -> datetime:
     """`created_at` is NOT NULL in the schema; this narrows the type."""
     if value is None:  # pragma: no cover - defensive
-        raise ValueError("sandbox has no created_at")
+        message = "sandbox has no created_at"
+        raise ValueError(message)
     return value

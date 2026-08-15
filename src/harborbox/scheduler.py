@@ -4,26 +4,32 @@ import asyncio
 import json
 import logging
 import os
-from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING
 
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import selectinload
 
 from harborbox.admission import Capacity, can_admit, reserve_memory
-from harborbox.config import Settings
 from harborbox.db import session_factory
 from harborbox.execution_secrets import open_environment, scrub_environment
 from harborbox.models import Execution, Sandbox, SandboxTemplate, utc_now
 from harborbox.opensandbox_compat import expiration
-from harborbox.runtime import SandboxMemoryExceeded, SandboxUnavailable
-from harborbox.runtime_protocol import SandboxRuntime
+from harborbox.runtime import SandboxMemoryExceededError, SandboxUnavailableError
 from harborbox.schemas import (
     AgentCommandRequest,
     AgentExecutionRequest,
     AgentProcessRequest,
 )
-from harborbox.template_builder import TemplateBuilder
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from datetime import datetime
+
+    from harborbox.config import Settings
+    from harborbox.runtime_protocol import SandboxRuntime
+    from harborbox.schemas import AgentExecutionResponse
+    from harborbox.template_builder import TemplateBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +45,16 @@ RESERVED_SANDBOX_STATES = (
     "pooling",
     "pooled",
 )
+
+# Public error-taxonomy code written to `execution.error.name` and returned
+# to API clients (see presenters.py -> ExecutionResponse.error.name). This is
+# a wire contract, not a Python identifier: it is deliberately decoupled from
+# the `SandboxUnavailableError` class name so that renaming the exception
+# class does not silently change what callers see and match against (a
+# previous pass did exactly that; this is the fix). Do not rename this value
+# to track a future class rename without a coordinated API change.
+ERROR_NAME_SANDBOX_UNAVAILABLE = "SandboxUnavailable"
+
 TERMINAL_EXECUTION_STATES = ("succeeded", "failed", "cancelled")
 
 
@@ -73,6 +89,42 @@ def has_sandbox_execution_slot(
     if active_count >= limit or active_code:
         return False
     return kind in {"command", "process"} or active_count == 0
+
+
+@dataclass
+class _ScanState:
+    """Mutable bookkeeping threaded through one `_admit_available_jobs` sweep.
+
+    Bundled so `_admit_or_defer` takes one state argument instead of four,
+    keeping it under the too-many-arguments threshold.
+    """
+
+    capacity: Capacity
+    active_counts: dict[str, int] = field(default_factory=dict)
+    active_code_sandboxes: set[str] = field(default_factory=set)
+
+
+def _reject_ineligible(execution: Execution, sandbox: Sandbox, now: datetime) -> bool:
+    """Resolve `execution` in place if it should never be admitted.
+
+    Split out of `_admit_available_jobs`'s scan loop to keep that loop's
+    branch count under the complexity threshold. Returns True if the
+    execution was resolved here (the caller should skip it).
+    """
+    if execution.cancel_requested:
+        execution.status = "cancelled"
+        execution.finished_at = now
+        return True
+    if sandbox.status in {"killed", "failed"}:
+        execution.status = "failed"
+        execution.finished_at = now
+        execution.error = {
+            "name": ERROR_NAME_SANDBOX_UNAVAILABLE,
+            "value": f"sandbox is {sandbox.status}",
+            "traceback": [],
+        }
+        return True
+    return False
 
 
 class Scheduler:
@@ -161,7 +213,6 @@ class Scheduler:
             await asyncio.sleep(self.settings.scheduler_poll_seconds)
 
     async def _admit_available_jobs(self) -> None:
-        capacity = await self.capacity()
         now = utc_now()
         admitted_ids: list[str] = []
         async with session_factory() as session:
@@ -186,82 +237,91 @@ class Scheduler:
                     .group_by(Execution.sandbox_id, Execution.kind)
                 )
             ).all()
-            active_counts: dict[str, int] = {}
-            active_code_sandboxes: set[str] = set()
+            state = _ScanState(capacity=await self.capacity())
             for sandbox_id, kind, count in active_rows:
-                active_counts[sandbox_id] = active_counts.get(sandbox_id, 0) + int(
-                    count
-                )
+                state.active_counts[sandbox_id] = state.active_counts.get(
+                    sandbox_id, 0
+                ) + int(count)
                 if kind == "code":
-                    active_code_sandboxes.add(sandbox_id)
+                    state.active_code_sandboxes.add(sandbox_id)
 
             for index, execution in enumerate(queued):
                 sandbox = execution.sandbox
-                if execution.cancel_requested:
-                    execution.status = "cancelled"
-                    execution.finished_at = now
+                if _reject_ineligible(execution, sandbox, now):
                     continue
-                if sandbox.status in {"killed", "failed"}:
-                    execution.status = "failed"
-                    execution.finished_at = now
-                    execution.error = {
-                        "name": "SandboxUnavailable",
-                        "value": f"sandbox is {sandbox.status}",
-                        "traceback": [],
-                    }
-                    continue
-                active_count = active_counts.get(sandbox.id, 0)
+                active_count = state.active_counts.get(sandbox.id, 0)
                 if not has_sandbox_execution_slot(
                     kind=execution.kind,
                     active_count=active_count,
-                    active_code=sandbox.id in active_code_sandboxes,
+                    active_code=sandbox.id in state.active_code_sandboxes,
                     limit=self.settings.max_concurrent_executions_per_sandbox,
                 ):
                     continue
 
-                already_reserved = sandbox.status in RESERVED_SANDBOX_STATES
-                incremental_memory = 0 if already_reserved else sandbox.memory_mb
-                incremental_cpu = (
-                    0.0 if sandbox.status in {"running", "starting"} else sandbox.cpu
+                admitted, stop = self._admit_or_defer(
+                    execution, sandbox, index=index, now=now, state=state
                 )
-                decision = can_admit(
-                    capacity,
-                    incremental_memory_mb=incremental_memory,
-                    incremental_cpu=incremental_cpu,
-                    emergency_available_memory_mb=(
-                        self.settings.emergency_available_memory_mb
-                    ),
-                )
-                if not decision.admitted:
-                    waited = (now - execution.created_at).total_seconds()
-                    if index == 0 and waited >= self.settings.queue_aging_seconds:
-                        break
-                    continue
-
-                execution.status = "admitted"
-                execution.admitted_at = now
-                if not already_reserved:
-                    sandbox.status = "starting"
-                admitted_ids.append(execution.id)
-                active_counts[sandbox.id] = active_count + 1
-                if execution.kind == "code":
-                    active_code_sandboxes.add(sandbox.id)
-                capacity = replace(
-                    capacity,
-                    reserved_memory_mb=(
-                        capacity.reserved_memory_mb + incremental_memory
-                    ),
-                    reserved_cpu=capacity.reserved_cpu + incremental_cpu,
-                    host_available_memory_mb=(
-                        capacity.host_available_memory_mb - incremental_memory
-                    ),
-                )
+                if admitted:
+                    admitted_ids.append(execution.id)
+                if stop:
+                    break
             await session.commit()
 
         for execution_id in admitted_ids:
             task = asyncio.create_task(self._run_execution(execution_id))
             self._running_tasks[execution_id] = task
             task.add_done_callback(self._done_callback(execution_id))
+
+    def _admit_or_defer(
+        self,
+        execution: Execution,
+        sandbox: Sandbox,
+        *,
+        index: int,
+        now: datetime,
+        state: _ScanState,
+    ) -> tuple[bool, bool]:
+        """Admit `execution` if there is room under `state.capacity`.
+
+        Split out of `_admit_available_jobs`'s scan loop to keep that loop's
+        branch count under the complexity threshold. Mutates `execution`,
+        `sandbox` and `state` in place, the same way the inline loop body
+        used to. Returns `(admitted, stop)`: whether this execution was
+        admitted, and whether the scan should stop (the head of the queue
+        aged past `queue_aging_seconds`).
+        """
+        already_reserved = sandbox.status in RESERVED_SANDBOX_STATES
+        incremental_memory = 0 if already_reserved else sandbox.memory_mb
+        incremental_cpu = (
+            0.0 if sandbox.status in {"running", "starting"} else sandbox.cpu
+        )
+        decision = can_admit(
+            state.capacity,
+            incremental_memory_mb=incremental_memory,
+            incremental_cpu=incremental_cpu,
+            emergency_available_memory_mb=self.settings.emergency_available_memory_mb,
+        )
+        if not decision.admitted:
+            waited = (now - execution.created_at).total_seconds()
+            stop = index == 0 and waited >= self.settings.queue_aging_seconds
+            return False, stop
+
+        execution.status = "admitted"
+        execution.admitted_at = now
+        if not already_reserved:
+            sandbox.status = "starting"
+        state.active_counts[sandbox.id] = state.active_counts.get(sandbox.id, 0) + 1
+        if execution.kind == "code":
+            state.active_code_sandboxes.add(sandbox.id)
+        state.capacity = replace(
+            state.capacity,
+            reserved_memory_mb=state.capacity.reserved_memory_mb + incremental_memory,
+            reserved_cpu=state.capacity.reserved_cpu + incremental_cpu,
+            host_available_memory_mb=(
+                state.capacity.host_available_memory_mb - incremental_memory
+            ),
+        )
+        return True, False
 
     def _done_callback(
         self, execution_id: str
@@ -281,121 +341,160 @@ class Scheduler:
             )
 
     async def _run_execution(self, execution_id: str) -> None:
-        try:
-            async with session_factory() as session:
-                execution = await session.scalar(
-                    select(Execution)
-                    .options(selectinload(Execution.sandbox))
-                    .where(Execution.id == execution_id)
-                )
-                if execution is None:
-                    return
-                sandbox = execution.sandbox
-                # Re-validate rather than trust admission — see may_start_execution.
-                if not may_start_execution(
-                    cancel_requested=execution.cancel_requested,
-                    execution_status=execution.status,
-                    sandbox_status=sandbox.status,
-                ):
-                    return
-                execution.status = "starting"
-                if sandbox.status in {"created", "paused_cold"}:
-                    sandbox.status = "starting"
-                await session.commit()
+        """Run one admitted execution end to end.
 
+        Split into a slim try/except orchestrator over four private steps
+        (`_mark_starting`, `_ensure_running`, `_mark_running`,
+        `_execute_request`, `_record_result`) purely to stay under the
+        complexity/branches/statements thresholds; the sequence of work and
+        the exception handling are unchanged from before the split.
+        """
+        try:
+            sandbox = await self._mark_starting(execution_id)
+            if sandbox is None:
+                return
             await self._ensure_running(sandbox.id)
 
-            async with session_factory() as session:
-                execution = await session.scalar(
-                    select(Execution)
-                    .options(selectinload(Execution.sandbox))
-                    .where(Execution.id == execution_id)
-                )
-                if execution is None:
-                    return
-                execution.status = "running"
-                execution.started_at = utc_now()
-                execution.sandbox.last_activity_at = utc_now()
-                await session.commit()
-                sandbox = execution.sandbox
+            started = await self._mark_running(execution_id)
+            if started is None:
+                return
+            execution, sandbox = started
 
-            environment = open_environment(
-                self.settings,
-                execution.environment,
-            )
-            if execution.kind == "code":
-                response = await self.runtime.execute_code(
-                    sandbox,
-                    AgentExecutionRequest(
-                        code=execution.code or "",
-                        timeout_seconds=execution.timeout_seconds,
-                        max_output_bytes=self.settings.max_output_bytes,
-                        env=environment,
-                    ),
-                )
-            elif execution.kind == "command":
-                response = await self.runtime.execute_command(
-                    sandbox,
-                    AgentCommandRequest(
-                        command=execution.command or "",
-                        timeout_seconds=execution.timeout_seconds,
-                        max_output_bytes=self.settings.max_output_bytes,
-                        env=environment,
-                        cwd=execution.cwd,
-                    ),
-                )
-            else:
-                process_spec = json.loads(execution.command or "{}")
-                response = await self.runtime.execute_process(
-                    sandbox,
-                    AgentProcessRequest(
-                        executable=process_spec["executable"],
-                        args=process_spec.get("args", []),
-                        stdin=process_spec.get("stdin"),
-                        timeout_seconds=execution.timeout_seconds,
-                        max_output_bytes=self.settings.max_output_bytes,
-                        env=environment,
-                        cwd=execution.cwd,
-                    ),
-                )
-
-            async with session_factory() as session:
-                execution = await session.get(Execution, execution_id)
-                if execution is None:
-                    return
-                execution.finished_at = utc_now()
-                execution.environment = scrub_environment(execution.environment)
-                execution.result = {
-                    "logs": response.logs.model_dump(mode="json"),
-                    "results": [
-                        result.model_dump(mode="json", by_alias=True)
-                        for result in response.results
-                    ],
-                    "exit_code": response.exit_code,
-                }
-                if response.error is not None:
-                    execution.status = "failed"
-                    execution.error = response.error.model_dump(mode="json")
-                elif response.exit_code not in (None, 0):
-                    execution.status = "failed"
-                    execution.error = {
-                        "name": "CommandFailed",
-                        "value": f"command exited with status {response.exit_code}",
-                        "traceback": [],
-                    }
-                else:
-                    execution.status = "succeeded"
-                current_sandbox = await session.get(Sandbox, execution.sandbox_id)
-                if current_sandbox is not None:
-                    current_sandbox.last_activity_at = utc_now()
-                await session.commit()
-        except SandboxMemoryExceeded as exc:
+            environment = open_environment(self.settings, execution.environment)
+            response = await self._execute_request(sandbox, execution, environment)
+            await self._record_result(execution_id, response)
+        except SandboxMemoryExceededError as exc:
             await self._fail_execution(execution_id, "MemoryLimitExceeded", str(exc))
-        except SandboxUnavailable as exc:
-            await self._fail_execution(execution_id, "SandboxUnavailable", str(exc))
+        except SandboxUnavailableError as exc:
+            await self._fail_execution(
+                execution_id, ERROR_NAME_SANDBOX_UNAVAILABLE, str(exc)
+            )
         except Exception as exc:
             logger.exception("execution failed", extra={"execution_id": execution_id})
             await self._fail_execution(execution_id, type(exc).__name__, str(exc))
+
+    async def _mark_starting(self, execution_id: str) -> Sandbox | None:
+        """Validate and mark an admitted execution as starting.
+
+        Returns the sandbox to bring up, or None if the execution should not
+        run (already resolved, or its sandbox died between admission and
+        here — see `may_start_execution`).
+        """
+        async with session_factory() as session:
+            execution = await session.scalar(
+                select(Execution)
+                .options(selectinload(Execution.sandbox))
+                .where(Execution.id == execution_id)
+            )
+            if execution is None:
+                return None
+            sandbox = execution.sandbox
+            # Re-validate rather than trust admission — see may_start_execution.
+            if not may_start_execution(
+                cancel_requested=execution.cancel_requested,
+                execution_status=execution.status,
+                sandbox_status=sandbox.status,
+            ):
+                return None
+            execution.status = "starting"
+            if sandbox.status in {"created", "paused_cold"}:
+                sandbox.status = "starting"
+            await session.commit()
+            return sandbox
+
+    async def _mark_running(
+        self, execution_id: str
+    ) -> tuple[Execution, Sandbox] | None:
+        """Mark a started execution as running, once its sandbox is up."""
+        async with session_factory() as session:
+            execution = await session.scalar(
+                select(Execution)
+                .options(selectinload(Execution.sandbox))
+                .where(Execution.id == execution_id)
+            )
+            if execution is None:
+                return None
+            execution.status = "running"
+            execution.started_at = utc_now()
+            execution.sandbox.last_activity_at = utc_now()
+            await session.commit()
+            return execution, execution.sandbox
+
+    async def _execute_request(
+        self,
+        sandbox: Sandbox,
+        execution: Execution,
+        environment: dict[str, str],
+    ) -> AgentExecutionResponse:
+        """Dispatch to the runtime call matching `execution.kind`."""
+        if execution.kind == "code":
+            return await self.runtime.execute_code(
+                sandbox,
+                AgentExecutionRequest(
+                    code=execution.code or "",
+                    timeout_seconds=execution.timeout_seconds,
+                    max_output_bytes=self.settings.max_output_bytes,
+                    env=environment,
+                ),
+            )
+        if execution.kind == "command":
+            return await self.runtime.execute_command(
+                sandbox,
+                AgentCommandRequest(
+                    command=execution.command or "",
+                    timeout_seconds=execution.timeout_seconds,
+                    max_output_bytes=self.settings.max_output_bytes,
+                    env=environment,
+                    cwd=execution.cwd,
+                ),
+            )
+        process_spec = json.loads(execution.command or "{}")
+        return await self.runtime.execute_process(
+            sandbox,
+            AgentProcessRequest(
+                executable=process_spec["executable"],
+                args=process_spec.get("args", []),
+                stdin=process_spec.get("stdin"),
+                timeout_seconds=execution.timeout_seconds,
+                max_output_bytes=self.settings.max_output_bytes,
+                env=environment,
+                cwd=execution.cwd,
+            ),
+        )
+
+    async def _record_result(
+        self, execution_id: str, response: AgentExecutionResponse
+    ) -> None:
+        async with session_factory() as session:
+            execution = await session.get(Execution, execution_id)
+            if execution is None:
+                return
+            execution.finished_at = utc_now()
+            execution.environment = scrub_environment(execution.environment)
+            execution.result = {
+                "logs": response.logs.model_dump(mode="json"),
+                "results": [
+                    result.model_dump(mode="json", by_alias=True)
+                    for result in response.results
+                ],
+                "exit_code": response.exit_code,
+            }
+            if response.error is not None:
+                execution.status = "failed"
+                execution.error = response.error.model_dump(mode="json")
+            elif response.exit_code not in (None, 0):
+                execution.status = "failed"
+                execution.error = {
+                    "name": "CommandFailed",
+                    "value": f"command exited with status {response.exit_code}",
+                    "traceback": [],
+                }
+            else:
+                execution.status = "succeeded"
+            current_sandbox = await session.get(Sandbox, execution.sandbox_id)
+            if current_sandbox is not None:
+                current_sandbox.last_activity_at = utc_now()
+            await session.commit()
 
     async def _ensure_running(self, sandbox_id: str) -> None:
         lock = self._sandbox_start_locks.setdefault(sandbox_id, asyncio.Lock())
@@ -406,7 +505,8 @@ class Scheduler:
         async with session_factory() as session:
             sandbox = await session.get(Sandbox, sandbox_id)
             if sandbox is None:
-                raise SandboxUnavailable("sandbox does not exist")
+                message = "sandbox does not exist"
+                raise SandboxUnavailableError(message)
             previous_status = sandbox.status
 
         if previous_status == "paused_memory":
@@ -416,13 +516,15 @@ class Scheduler:
         elif previous_status == "running":
             started = None
         else:
-            raise SandboxUnavailable(f"sandbox is {previous_status}")
+            message = f"sandbox is {previous_status}"
+            raise SandboxUnavailableError(message)
         runtime_metadata = dict(sandbox.metadata_)
 
         async with session_factory() as session:
             sandbox = await session.get(Sandbox, sandbox_id)
             if sandbox is None:
-                raise SandboxUnavailable("sandbox does not exist")
+                message = "sandbox does not exist"
+                raise SandboxUnavailableError(message)
             # The container exists now, so a sandbox killed while it was starting
             # must have its container removed here. Writing `running` over
             # `killed` is the write that used to strand it: DELETE's own
@@ -440,7 +542,8 @@ class Scheduler:
                             current.container_id = None
                             current.container_name = None
                             await cleanup.commit()
-                raise SandboxUnavailable(f"sandbox is {sandbox.status}")
+                message = f"sandbox is {sandbox.status}"
+                raise SandboxUnavailableError(message)
             if started is not None:
                 sandbox.container_id = started.id
                 sandbox.container_name = started.name

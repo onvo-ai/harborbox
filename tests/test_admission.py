@@ -17,8 +17,10 @@ def capacity(**overrides: object) -> Capacity:
 
 
 def test_reserve_uses_larger_of_percentage_and_floor() -> None:
-    assert reserve_memory(16_000, 25, 2_048) == 4_000
-    assert reserve_memory(4_000, 25, 2_048) == 2_048
+    floor_mb = 2_048
+    percentage_result_mb = 4_000  # 25% of 16_000
+    assert reserve_memory(16_000, 25, floor_mb) == percentage_result_mb
+    assert reserve_memory(4_000, 25, floor_mb) == floor_mb
 
 
 def test_admits_parallel_job_when_reservation_fits() -> None:
@@ -43,17 +45,18 @@ def test_rejects_job_that_crosses_reserved_memory_budget() -> None:
 
 
 def test_configured_budget_is_an_absolute_ceiling_without_preallocation() -> None:
+    budget_mb = 4_096
     empty = capacity(
         reserved_memory_mb=0,
-        configured_sandbox_budget_mb=4_096,
+        configured_sandbox_budget_mb=budget_mb,
     )
-    assert empty.sandbox_budget_mb == 4_096
-    assert empty.available_reservation_mb == 4_096
+    assert empty.sandbox_budget_mb == budget_mb
+    assert empty.available_reservation_mb == budget_mb
     assert empty.reserved_memory_mb == 0
 
     full = capacity(
         reserved_memory_mb=3_584,
-        configured_sandbox_budget_mb=4_096,
+        configured_sandbox_budget_mb=budget_mb,
     )
     decision = can_admit(
         full,
@@ -66,13 +69,14 @@ def test_configured_budget_is_an_absolute_ceiling_without_preallocation() -> Non
 
 
 def test_configured_budget_never_overrides_safer_host_budget() -> None:
+    expected_sandbox_budget_mb = 2_560
     limited_host = capacity(
         total_memory_mb=4_096,
         reserve_memory_mb=1_024,
         platform_memory_reserve_mb=512,
         configured_sandbox_budget_mb=4_096,
     )
-    assert limited_host.sandbox_budget_mb == 2_560
+    assert limited_host.sandbox_budget_mb == expected_sandbox_budget_mb
 
 
 def test_rejects_job_when_live_available_memory_hits_emergency_reserve() -> None:

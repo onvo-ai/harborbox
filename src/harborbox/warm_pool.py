@@ -3,19 +3,28 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import timedelta
+from typing import TYPE_CHECKING
 
-from opensandbox import Sandbox as OpenSandbox
-from opensandbox.config import ConnectionConfig
 from opensandbox.exceptions import SandboxException
 from opensandbox.pool_async import SandboxPoolAsync
 from opensandbox.pool_types import AcquirePolicy, PoolCreationSpec
 
-from harborbox.config import Settings
 from harborbox.db import session_factory
 from harborbox.postgres_pool_store import AsyncPostgresPoolStateStore
 from harborbox.runtime_protocol import WarmPoolReservation
 
+if TYPE_CHECKING:
+    from opensandbox import Sandbox as OpenSandbox
+    from opensandbox.config import ConnectionConfig
+
+    from harborbox.config import Settings
+
 logger = logging.getLogger(__name__)
+
+# Tolerance for comparing a requested CPU allotment to a template's configured
+# CPU: both are floats derived from the same settings, so this only absorbs
+# floating-point round-trip noise, not any real difference.
+_CPU_COMPARISON_EPSILON = 0.000_001
 
 
 class OpenSandboxWarmPools:
@@ -134,7 +143,10 @@ class OpenSandboxWarmPools:
                 )
             return None
         expected_memory, expected_cpu = self.settings.resources_for_template(template)
-        if memory_mb != expected_memory or abs(cpu - expected_cpu) > 0.000_001:
+        if (
+            memory_mb != expected_memory
+            or abs(cpu - expected_cpu) > _CPU_COMPARISON_EPSILON
+        ):
             return None
 
         pool = self._pools[template]
@@ -155,7 +167,6 @@ class OpenSandboxWarmPools:
             )
             self._renew_tasks.add(task)
             task.add_done_callback(self._renew_tasks.discard)
-            return sandbox
         except SandboxException:
             logger.debug(
                 "No ready warm sandbox for template %s; using direct creation",
@@ -163,6 +174,8 @@ class OpenSandboxWarmPools:
                 exc_info=True,
             )
             return None
+        else:
+            return sandbox
 
     async def _renew_acquired(self, sandbox: OpenSandbox) -> None:
         try:
@@ -205,9 +218,10 @@ class OpenSandboxWarmPools:
         while not self._stop.is_set():
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=interval)
-                return
             except TimeoutError:
                 pass
+            else:
+                return
             await self._scale_down_inactive()
 
     async def _scale_down_inactive(self) -> None:

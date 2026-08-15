@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
-from typing import Any
+import contextlib
+from http import HTTPStatus
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import docker
 import httpx
 from docker.errors import APIError, NotFound
 
-from harborbox.config import Settings
-from harborbox.models import Sandbox
 from harborbox.runtime_protocol import StartedSandbox, WarmPoolReservation
 from harborbox.schemas import (
     AgentCommandRequest,
@@ -22,24 +22,48 @@ from harborbox.schemas import (
     FileWriteRequest,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
-class RuntimeErrorBase(RuntimeError):
+    from docker.models.containers import Container
+
+    from harborbox.config import Settings
+    from harborbox.models import Sandbox
+
+
+class SandboxRuntimeError(RuntimeError):
     pass
 
 
-class SandboxUnavailable(RuntimeErrorBase):
+class SandboxUnavailableError(SandboxRuntimeError):
     pass
 
 
-class SandboxMemoryExceeded(RuntimeErrorBase):
-    pass
+class SandboxMemoryExceededError(SandboxRuntimeError):
+    def __init__(self, memory_mb: int) -> None:
+        super().__init__(f"sandbox exceeded its {memory_mb} MiB memory limit")
+
+
+# Container exit code for a process killed by SIGKILL (128 + signal 9), which is
+# how the OOM killer terminates a container; the exit code is doubled with
+# OOMKilled below because the exit code alone is ambiguous (a process can `exit
+# 137` on its own).
+_SIGKILL_EXIT_CODE = 137
 
 
 class DockerRuntime:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.client = docker.DockerClient(**settings.docker_kwargs)
-        self.http = httpx.AsyncClient(timeout=None)
+        # Unbounded by default (`timeout=None`) meant any hung agent request —
+        # a dead container, a network partition — blocked its caller forever.
+        # `_post_agent` explicitly overrides back to `timeout=None` because a
+        # code execution can legitimately run up to
+        # `max_execution_timeout_seconds`, enforced by the agent itself; using
+        # that same figure as the client default bounds every other call
+        # (file read/write/list, health checks) to the longest duration this
+        # service ever intentionally waits.
+        self.http = httpx.AsyncClient(timeout=settings.max_execution_timeout_seconds)
 
     async def start(self) -> None:
         return None
@@ -60,7 +84,7 @@ class DockerRuntime:
     async def available_memory_mb(self) -> int:
         def read_mem_available() -> int:
             try:
-                with open("/proc/meminfo", encoding="utf-8") as handle:
+                with Path("/proc/meminfo").open(encoding="utf-8") as handle:
                     for line in handle:
                         if line.startswith("MemAvailable:"):
                             return int(line.split()[1]) // 1024
@@ -85,7 +109,8 @@ class DockerRuntime:
         try:
             sandbox_image = self.settings.image_for_template(template)
         except KeyError as exc:
-            raise SandboxUnavailable(f"unknown sandbox template: {template}") from exc
+            message = f"unknown sandbox template: {template}"
+            raise SandboxUnavailableError(message) from exc
         if self.settings.sandbox_runtime:
             runtime_options["runtime"] = self.settings.sandbox_runtime
 
@@ -137,7 +162,10 @@ class DockerRuntime:
                 user="10001:10001",
                 read_only=True,
                 tmpfs={
-                    "/tmp": (
+                    # Names the mount point *inside the new container*, not a
+                    # path this host process touches -- the docker-py API
+                    # requires the container's own /tmp here.
+                    "/tmp": (  # noqa: S108
                         f"rw,nosuid,nodev,noexec,size={self.settings.sandbox_tmpfs_mb}m"
                     ),
                     "/run": "rw,nosuid,nodev,noexec,size=16m",
@@ -156,15 +184,16 @@ class DockerRuntime:
             self._connect_egress(container, sandbox)
         except APIError as exc:
             if container is not None:
-                try:
+                # Best-effort cleanup of a container that failed to fully
+                # start; the original failure (`exc`) is what gets raised
+                # and reported either way.
+                with contextlib.suppress(APIError):
                     container.remove(force=True)
-                except APIError:
-                    pass
-            raise SandboxUnavailable(str(exc)) from exc
+            raise SandboxUnavailableError(str(exc)) from exc
 
         return StartedSandbox(container.id, container.name)
 
-    def _connect_egress(self, container: Any, sandbox: Sandbox) -> None:
+    def _connect_egress(self, container: Container, sandbox: Sandbox) -> None:
         """Attaches the egress network, for the sandboxes that asked for it.
 
         Was unconditional, which made egress an instance-wide setting: turning
@@ -197,13 +226,14 @@ class DockerRuntime:
                     headers=self._agent_headers(sandbox),
                     timeout=1.0,
                 )
-                if response.status_code == 200:
+                if response.status_code == HTTPStatus.OK:
                     return
             except httpx.HTTPError:
                 pass
             await asyncio.sleep(0.05)
         await self._raise_container_failure(sandbox)
-        raise SandboxUnavailable("sandbox agent did not become ready")
+        message = "sandbox agent did not become ready"
+        raise SandboxUnavailableError(message)
 
     async def execute_code(
         self, sandbox: Sandbox, request: AgentExecutionRequest
@@ -234,7 +264,7 @@ class DockerRuntime:
             return AgentExecutionResponse.model_validate(response.json())
         except httpx.HTTPError as exc:
             await self._raise_container_failure(sandbox)
-            raise SandboxUnavailable(str(exc)) from exc
+            raise SandboxUnavailableError(str(exc)) from exc
 
     async def read_file(self, sandbox: Sandbox, path: str) -> FileReadResponse:
         response = await self.http.get(
@@ -291,12 +321,12 @@ class DockerRuntime:
         )
         response.raise_for_status()
 
-    async def pause(self, sandbox: Sandbox, memory: bool) -> None:
+    async def pause(self, sandbox: Sandbox, *, memory: bool) -> None:
         if not sandbox.container_id:
             return
-        await asyncio.to_thread(self._pause_sync, sandbox.container_id, memory)
+        await asyncio.to_thread(self._pause_sync, sandbox.container_id, memory=memory)
 
-    def _pause_sync(self, container_id: str, memory: bool) -> None:
+    def _pause_sync(self, container_id: str, *, memory: bool) -> None:
         try:
             container = self.client.containers.get(container_id)
             container.reload()
@@ -339,10 +369,12 @@ class DockerRuntime:
             except NotFound:
                 pass
         volume_name = f"harborbox-workspace-{sandbox.id}"
-        try:
+        # Best-effort: the volume may already be gone (NotFound), or Docker
+        # may refuse removal because something else still references it
+        # (APIError) -- a kill should not fail just because cleanup couldn't
+        # finish.
+        with contextlib.suppress(NotFound, APIError):
             self.client.volumes.get(volume_name).remove(force=True)
-        except (NotFound, APIError):
-            pass
 
     async def container_status(self, sandbox: Sandbox) -> str | None:
         if not sandbox.container_id:
@@ -372,14 +404,13 @@ class DockerRuntime:
                 return None
 
         state = await asyncio.to_thread(inspect)
-        if state and (state[1] or state[0] == 137):
-            raise SandboxMemoryExceeded(
-                f"sandbox exceeded its {sandbox.memory_mb} MiB memory limit"
-            )
+        if state and (state[1] or state[0] == _SIGKILL_EXIT_CODE):
+            raise SandboxMemoryExceededError(sandbox.memory_mb)
 
     def _agent_url(self, sandbox: Sandbox, path: str) -> str:
         if not sandbox.container_name:
-            raise SandboxUnavailable("sandbox has no running container")
+            message = "sandbox has no running container"
+            raise SandboxUnavailableError(message)
         return (
             f"http://{sandbox.container_name}:{self.settings.sandbox_agent_port}{path}"
         )

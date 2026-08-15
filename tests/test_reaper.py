@@ -2,14 +2,14 @@
 
 from datetime import UTC, datetime, timedelta
 
-from harborbox.reaper import ReapCandidate, plan_reap
+from harborbox.reaper import ReapCandidate, ReapPlan, plan_reap
 
 NOW = datetime(2026, 8, 10, 12, 0, 0, tzinfo=UTC)
 STUCK_AFTER = timedelta(minutes=15)
 FAILED_RETENTION = timedelta(hours=24)
 
 
-def run(candidates: list[ReapCandidate]):
+def run(candidates: list[ReapCandidate]) -> ReapPlan:
     return plan_reap(
         candidates,
         now=NOW,
@@ -18,7 +18,7 @@ def run(candidates: list[ReapCandidate]):
     )
 
 
-def at(**kw) -> datetime:
+def at(**kw: float) -> datetime:
     return NOW - timedelta(**kw)
 
 

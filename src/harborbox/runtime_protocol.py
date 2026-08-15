@@ -1,20 +1,22 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
-from harborbox.models import Sandbox
-from harborbox.schemas import (
-    AgentCommandRequest,
-    AgentExecutionRequest,
-    AgentExecutionResponse,
-    AgentProcessRequest,
-    FileListResponse,
-    FileReadResponse,
-    FileUploadResponse,
-    FileWriteRequest,
-)
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from harborbox.models import Sandbox
+    from harborbox.schemas import (
+        AgentCommandRequest,
+        AgentExecutionRequest,
+        AgentExecutionResponse,
+        AgentProcessRequest,
+        FileListResponse,
+        FileReadResponse,
+        FileUploadResponse,
+        FileWriteRequest,
+    )
 
 
 @dataclass(frozen=True)
@@ -82,7 +84,7 @@ class SandboxRuntime(Protocol):
 
     async def remove_file(self, sandbox: Sandbox, path: str) -> None: ...
 
-    async def pause(self, sandbox: Sandbox, memory: bool) -> None: ...
+    async def pause(self, sandbox: Sandbox, *, memory: bool) -> None: ...
 
     async def resume(self, sandbox: Sandbox) -> StartedSandbox: ...
 

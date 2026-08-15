@@ -3,16 +3,16 @@ from __future__ import annotations
 import asyncio
 import json
 import secrets
-from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse, StreamingResponse
 from sqlalchemy import func, select, update
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from harborbox import __version__
 from harborbox.admission import can_admit
@@ -36,9 +36,8 @@ from harborbox.opensandbox_compat import (
 )
 from harborbox.presenters import execution_response
 from harborbox.reaper import reaper_loop
-from harborbox.runtime import SandboxUnavailable
+from harborbox.runtime import SandboxUnavailableError
 from harborbox.runtime_factory import create_runtime
-from harborbox.runtime_protocol import SandboxRuntime
 from harborbox.scheduler import (
     ACTIVE_EXECUTION_STATES,
     RESERVED_SANDBOX_STATES,
@@ -67,15 +66,22 @@ from harborbox.schemas import (
 from harborbox.security import require_api_key
 from harborbox.template_builder import TemplateBuilder
 from harborbox.templates import (
-    TemplateNotReady,
+    TemplateNotReadyError,
     TemplateSpecError,
-    UnknownTemplate,
+    UnknownTemplateError,
     list_derived_templates,
     mark_template_used,
     resolve_template,
     static_template,
     validate_template_spec,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from harborbox.runtime_protocol import SandboxRuntime
 
 
 def new_id(prefix: str) -> str:
@@ -395,9 +401,9 @@ async def create_sandbox(
     settings = settings_from(request)
     try:
         resolved = await resolve_template(session, settings, body.template)
-    except UnknownTemplate as exc:
+    except UnknownTemplateError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except TemplateNotReady as exc:
+    except TemplateNotReadyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     # An explicit request value always wins. The template row's sizing is a
@@ -586,11 +592,12 @@ async def resume_sandbox(
         await session.commit()
         await session.refresh(sandbox)
         await runtime_from(request).wait_until_ready(sandbox)
-        return sandbox
-    except SandboxUnavailable as exc:
+    except SandboxUnavailableError as exc:
         sandbox.status = "failed"
         await session.commit()
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    else:
+        return sandbox
 
 
 @app.delete(
@@ -796,7 +803,8 @@ async def opensandbox_renew(
     sandbox = await get_sandbox_or_404(session, sandbox_id)
     expires_at = body.expires_at.astimezone(UTC)
     if expires_at <= utc_now():
-        raise opensandbox_error("expiresAt must be in the future")
+        message = "expiresAt must be in the future"
+        raise opensandbox_error(message)
     metadata = dict(sandbox.metadata_)
     metadata[f"{INTERNAL_PREFIX}expires_at"] = expires_at.isoformat()
     sandbox.metadata_ = metadata
@@ -821,7 +829,8 @@ async def opensandbox_patch_metadata(
     metadata = dict(sandbox.metadata_)
     for key, value in body.items():
         if key.startswith(INTERNAL_PREFIX):
-            raise opensandbox_error(f"metadata key {key} is reserved")
+            message = f"metadata key {key} is reserved"
+            raise opensandbox_error(message)
         if value is None:
             metadata.pop(key, None)
         else:
@@ -832,15 +841,22 @@ async def opensandbox_patch_metadata(
     return response_for(sandbox, settings_from(request))
 
 
+@dataclass(frozen=True)
+class _ExecutionSpec:
+    """What the caller wants run; bundled to keep `enqueue`'s signature small."""
+
+    kind: str
+    code: str | None
+    command: str | None
+    environment: dict[str, str]
+    cwd: str | None
+    timeout_seconds: int | None
+
+
 async def enqueue(
     *,
     sandbox_id: str,
-    kind: str,
-    code: str | None,
-    command: str | None,
-    environment: dict[str, str],
-    cwd: str | None,
-    timeout_seconds: int | None,
+    spec: _ExecutionSpec,
     settings: Settings,
     session: AsyncSession,
 ) -> ExecutionResponse:
@@ -856,7 +872,7 @@ async def enqueue(
             detail="execution queue is full",
             headers={"Retry-After": "1"},
         )
-    timeout = timeout_seconds or settings.default_execution_timeout_seconds
+    timeout = spec.timeout_seconds or settings.default_execution_timeout_seconds
     if timeout > settings.max_execution_timeout_seconds:
         raise HTTPException(
             status_code=422,
@@ -865,19 +881,19 @@ async def enqueue(
                 f"{settings.max_execution_timeout_seconds}"
             ),
         )
-    payload = code if code is not None else command or ""
+    payload = spec.code if spec.code is not None else spec.command or ""
     if len(payload.encode("utf-8")) > settings.max_code_bytes:
         raise HTTPException(status_code=413, detail="execution payload is too large")
 
     execution = Execution(
         id=new_id("exec"),
         sandbox_id=sandbox.id,
-        kind=kind,
+        kind=spec.kind,
         status="queued",
-        code=code,
-        command=command,
-        environment=environment,
-        cwd=cwd,
+        code=spec.code,
+        command=spec.command,
+        environment=spec.environment,
+        cwd=spec.cwd,
         timeout_seconds=timeout,
     )
     session.add(execution)
@@ -900,12 +916,14 @@ async def create_execution(
 ) -> ExecutionResponse:
     return await enqueue(
         sandbox_id=sandbox_id,
-        kind="code",
-        code=body.code,
-        command=None,
-        environment=body.env,
-        cwd=None,
-        timeout_seconds=body.timeout_seconds,
+        spec=_ExecutionSpec(
+            kind="code",
+            code=body.code,
+            command=None,
+            environment=body.env,
+            cwd=None,
+            timeout_seconds=body.timeout_seconds,
+        ),
         settings=settings_from(request),
         session=session,
     )
@@ -925,12 +943,14 @@ async def create_command(
 ) -> ExecutionResponse:
     return await enqueue(
         sandbox_id=sandbox_id,
-        kind="command",
-        code=None,
-        command=body.command,
-        environment=body.env,
-        cwd=body.cwd,
-        timeout_seconds=body.timeout_seconds,
+        spec=_ExecutionSpec(
+            kind="command",
+            code=None,
+            command=body.command,
+            environment=body.env,
+            cwd=body.cwd,
+            timeout_seconds=body.timeout_seconds,
+        ),
         settings=settings_from(request),
         session=session,
     )
@@ -959,12 +979,14 @@ async def create_process(
     )
     return await enqueue(
         sandbox_id=sandbox_id,
-        kind="process",
-        code=None,
-        command=process_spec,
-        environment=seal_environment(settings, body.env, body.secret_env),
-        cwd=body.cwd,
-        timeout_seconds=body.timeout_seconds,
+        spec=_ExecutionSpec(
+            kind="process",
+            code=None,
+            command=process_spec,
+            environment=seal_environment(settings, body.env, body.secret_env),
+            cwd=body.cwd,
+            timeout_seconds=body.timeout_seconds,
+        ),
         settings=settings,
         session=session,
     )

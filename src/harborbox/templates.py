@@ -4,13 +4,16 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from harborbox.config import Settings
 from harborbox.models import SandboxTemplate, utc_now
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from harborbox.config import Settings
 
 TemplateStatus = str
 
@@ -39,11 +42,11 @@ class TemplateSpecError(ValueError):
     """A caller-supplied template spec that must never reach a Dockerfile."""
 
 
-class UnknownTemplate(LookupError):
+class UnknownTemplateError(LookupError):
     pass
 
 
-class TemplateNotReady(RuntimeError):
+class TemplateNotReadyError(RuntimeError):
     def __init__(self, name: str, status: str, error: str | None) -> None:
         detail = f"template {name} is {status}"
         if error:
@@ -120,18 +123,18 @@ class ResolvedTemplate:
 
 def _reject_metacharacters(kind: str, value: str) -> None:
     if not value:
-        raise TemplateSpecError(f"{kind} package name cannot be empty")
+        message = f"{kind} package name cannot be empty"
+        raise TemplateSpecError(message)
     if len(value) > MAX_PACKAGE_LENGTH:
-        raise TemplateSpecError(f"{kind} package name is longer than {MAX_PACKAGE_LENGTH}")
+        message = f"{kind} package name is longer than {MAX_PACKAGE_LENGTH}"
+        raise TemplateSpecError(message)
     for character in value:
         if not ("\x21" <= character <= "\x7e"):
-            raise TemplateSpecError(
-                f"{kind} package name contains a control or non-ASCII character"
-            )
+            message = f"{kind} package name contains a control or non-ASCII character"
+            raise TemplateSpecError(message)
         if character in FORBIDDEN_CHARACTERS:
-            raise TemplateSpecError(
-                f"{kind} package name contains the forbidden character {character!r}"
-            )
+            message = f"{kind} package name contains the forbidden character {character!r}"
+            raise TemplateSpecError(message)
 
 
 def split_npm_package(specifier: str) -> tuple[str, str | None]:
@@ -145,55 +148,57 @@ def split_npm_package(specifier: str) -> tuple[str, str | None]:
 
 def _validate_apt(settings: Settings, packages: list[str]) -> tuple[str, ...]:
     if len(packages) > settings.template_max_apt_packages:
-        raise TemplateSpecError(
-            f"at most {settings.template_max_apt_packages} apt packages are allowed"
-        )
+        message = f"at most {settings.template_max_apt_packages} apt packages are allowed"
+        raise TemplateSpecError(message)
     for package in packages:
         _reject_metacharacters("apt", package)
         if not APT_PACKAGE_PATTERN.fullmatch(package):
-            raise TemplateSpecError(f"invalid apt package name: {package}")
+            message = f"invalid apt package name: {package}"
+            raise TemplateSpecError(message)
         if package not in settings.template_apt_allowlist:
-            raise TemplateSpecError(f"apt package is not allowlisted: {package}")
+            message = f"apt package is not allowlisted: {package}"
+            raise TemplateSpecError(message)
     return tuple(sorted(set(packages)))
 
 
 def _validate_npm(settings: Settings, packages: list[str]) -> tuple[str, ...]:
     if len(packages) > settings.template_max_npm_packages:
-        raise TemplateSpecError(
-            f"at most {settings.template_max_npm_packages} npm packages are allowed"
-        )
+        message = f"at most {settings.template_max_npm_packages} npm packages are allowed"
+        raise TemplateSpecError(message)
     for specifier in packages:
         _reject_metacharacters("npm", specifier)
         name, version = split_npm_package(specifier)
         if not NPM_PACKAGE_PATTERN.fullmatch(name):
-            raise TemplateSpecError(f"invalid npm package name: {specifier}")
+            message = f"invalid npm package name: {specifier}"
+            raise TemplateSpecError(message)
         if version is not None and not NPM_VERSION_PATTERN.fullmatch(version):
-            raise TemplateSpecError(f"invalid npm version specifier: {specifier}")
+            message = f"invalid npm version specifier: {specifier}"
+            raise TemplateSpecError(message)
         if name not in settings.template_npm_allowlist:
-            raise TemplateSpecError(f"npm package is not allowlisted: {name}")
+            message = f"npm package is not allowlisted: {name}"
+            raise TemplateSpecError(message)
     return tuple(sorted(set(packages)))
 
 
 def _validate_env(settings: Settings, env: dict[str, str]) -> dict[str, str]:
     if len(env) > settings.template_max_env_vars:
-        raise TemplateSpecError(
-            f"at most {settings.template_max_env_vars} environment variables are allowed"
-        )
+        message = f"at most {settings.template_max_env_vars} environment variables are allowed"
+        raise TemplateSpecError(message)
     validated: dict[str, str] = {}
     for name, value in env.items():
         if not ENV_NAME_PATTERN.fullmatch(name):
-            raise TemplateSpecError(f"invalid environment variable name: {name}")
+            message = f"invalid environment variable name: {name}"
+            raise TemplateSpecError(message)
         if len(value) > settings.template_max_env_value_length:
-            raise TemplateSpecError(
+            message = (
                 f"environment variable {name} exceeds "
                 f"{settings.template_max_env_value_length} characters"
             )
+            raise TemplateSpecError(message)
         for character in value:
             if not ("\x20" <= character <= "\x7e"):
-                raise TemplateSpecError(
-                    f"environment variable {name} contains a control or "
-                    "non-ASCII character"
-                )
+                message = f"environment variable {name} contains a control or non-ASCII character"
+                raise TemplateSpecError(message)
         validated[name] = value
     return validated
 
@@ -211,7 +216,8 @@ def validate_template_spec(
     Raises `TemplateSpecError` for anything that must not reach the build host.
     """
     if base not in settings.template_images:
-        raise TemplateSpecError(f"unknown base template: {base}")
+        message = f"unknown base template: {base}"
+        raise TemplateSpecError(message)
     return TemplateSpec(
         base=base,
         apt=_validate_apt(settings, apt),
@@ -221,9 +227,9 @@ def validate_template_spec(
 
 
 def dockerfile_value(value: str) -> str:
-    """Quote an env value for a Dockerfile `ENV` instruction.
+    r"""Quote an env value for a Dockerfile `ENV` instruction.
 
-    JSON quoting handles `"` and `\\`; `$` is then escaped so the Dockerfile
+    JSON quoting handles `"` and `\`; `$` is then escaped so the Dockerfile
     parser does not expand it into a build argument at image build time.
     """
     return json.dumps(value).replace("$", "\\$")
@@ -245,8 +251,9 @@ def render_dockerfile(*, base_image: str, spec: TemplateSpec) -> str:
     preferable.
     """
     lines = [f"FROM {base_image}", "USER root"]
-    for name in sorted(spec.env):
-        lines.append(f"ENV {name}={dockerfile_value(spec.env[name])}")
+    lines.extend(
+        f"ENV {name}={dockerfile_value(spec.env[name])}" for name in sorted(spec.env)
+    )
     if spec.apt:
         packages = " \\\n      ".join(spec.apt)
         lines.append(
@@ -316,10 +323,11 @@ async def resolve_template(
     """
     resolved = await find_template(session, settings, name)
     if resolved is None:
-        raise UnknownTemplate(f"unknown sandbox template: {name}")
+        message = f"unknown sandbox template: {name}"
+        raise UnknownTemplateError(message)
     if resolved.status != "ready":
         template = await session.get(SandboxTemplate, name)
-        raise TemplateNotReady(
+        raise TemplateNotReadyError(
             name, resolved.status, template.error if template else None
         )
     return resolved

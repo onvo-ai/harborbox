@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
+from http import HTTPStatus
+from typing import Any, Self
 
 import httpx
 
@@ -63,10 +64,12 @@ class SandboxClient:
         )
         self.sandboxes = Sandboxes(self)
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+    # Forwards arbitrary httpx.request kwargs (json, params, headers, ...) and
+    # httpx.Response.json() itself is typed to return Any, so both are genuine.
+    def _request(self, method: str, path: str, **kwargs: Any) -> Any:  # noqa: ANN401
         response = self._http.request(method, path, **kwargs)
         response.raise_for_status()
-        if response.status_code == 204:
+        if response.status_code == HTTPStatus.NO_CONTENT:
             return None
         return response.json()
 
@@ -76,7 +79,7 @@ class SandboxClient:
     def close(self) -> None:
         self._http.close()
 
-    def __enter__(self) -> SandboxClient:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_: object) -> None:

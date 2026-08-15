@@ -102,10 +102,11 @@ def test_spec_hash_is_deterministic_and_order_independent() -> None:
         env={"PLAYWRIGHT_BROWSERS_PATH": "0"},
     )
 
+    spec_hash_length = 12
     assert first.apt == ("chromium", "fonts-liberation")
     assert first.spec_hash == second.spec_hash
     assert first.name == f"relaydeck-{first.spec_hash}"
-    assert len(first.spec_hash) == 12
+    assert len(first.spec_hash) == spec_hash_length
 
 
 def test_canonical_json_matches_the_published_contract() -> None:

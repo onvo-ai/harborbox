@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import base64
 import math
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self
 
 if TYPE_CHECKING:
     from harborbox_sdk.client import SandboxClient
@@ -105,7 +106,8 @@ class Execution:
         deadline = time.monotonic() + timeout if timeout is not None else None
         while self.status not in TERMINAL_STATES:
             if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(f"execution {self.id} did not finish in time")
+                timeout_message = f"execution {self.id} did not finish in time"
+                raise TimeoutError(timeout_message)
             time.sleep(poll_interval)
             self.refresh()
         if raise_on_error and self.status != "succeeded":
@@ -124,7 +126,10 @@ class Commands:
     def __init__(self, sandbox: Sandbox) -> None:
         self._sandbox = sandbox
 
-    def run(
+    def run(  # noqa: PLR0913 - a public SDK convenience wrapper; each keyword is
+        # independently useful to callers (`sandbox.commands.run("ls")` stays the
+        # common case), and bundling them into an options object would make that
+        # call site worse, not better.
         self,
         command: str,
         *,
@@ -161,8 +166,6 @@ class Files:
             params={"path": path},
         )
         if payload["encoding"] == "base64":
-            import base64
-
             return base64.b64decode(payload["content"]).decode("utf-8")
         return str(payload["content"])
 
@@ -244,7 +247,8 @@ class Sandbox:
 
     def set_timeout(self, timeout_ms: int) -> Sandbox:
         if timeout_ms < 0:
-            raise ValueError("timeout_ms must be non-negative")
+            message = "timeout_ms must be non-negative"
+            raise ValueError(message)
         self._apply(
             self._client._request(
                 "PATCH",
@@ -284,7 +288,7 @@ class Sandbox:
         self._client._request("DELETE", f"/v1/sandboxes/{self.id}")
         self.status = "killed"
 
-    def __enter__(self) -> Sandbox:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_: object) -> None:

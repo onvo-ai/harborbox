@@ -23,6 +23,8 @@ dev = [
   "mypy>=1.17.0",
   "pytest>=8.4.0",
   "pytest-asyncio>=1.1.0",
+  "pytest-cov>=6.0.0",
+  "pytest-json-report>=1.5.0",
   "ruff>=0.12.0",
 ]
 
@@ -34,26 +36,87 @@ build-backend = "hatchling.build"
 packages = ["src/harborbox", "src/harborbox_sdk"]
 
 [tool.pytest.ini_options]
-addopts = "-q"
+# -m "not e2e" keeps the live-stack suites out of the default and CI unit runs.
+# The e2e job opts back in with `pytest -m e2e`.
+addopts = "-q -m 'not e2e'"
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# ci_report.py lives in scripts/, not src/; add it to sys.path so tests can
+# import it directly, matching how it is invoked in CI (python scripts/ci_report.py).
+pythonpath = ["scripts"]
+# The e2e_*.py modules hold live-stack tests; pytest's default test_*.py
+# pattern would never discover them, leaving `pytest -m e2e` empty.
+python_files = ["test_*.py", "e2e_*.py"]
+markers = [
+  "e2e: requires a live Compose stack (postgres, opensandbox, harborbox-api)",
+  "postgres: requires a real Postgres; SQLite cannot run the pg-dialect SQL under test",
+]
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "ASYNC"]
+# Inverted default: everything is on, and each exemption below is a decision on
+# record rather than an unexamined omission. New ruff rules arrive enabled.
+select = ["ALL"]
 ignore = [
-  "ASYNC240", # The sandbox agent intentionally performs tiny local filesystem calls.
+  "D100",     # Docstring-on-every-module is not this repo's convention.
+  "D101",     # ...nor on every class.
+  "D102",     # ...nor on every method.
+  "D103",     # ...nor on every function.
+  "D104",     # ...nor on every package.
+  "D105",     # ...nor on every magic method.
+  "D107",     # ...nor on every __init__.
+  "D203",     # Incompatible with D211, which ruff prefers.
+  "D213",     # Incompatible with D212, which ruff prefers.
+  "CPY001",   # This repo carries no copyright headers.
+  "COM812",   # Conflicts with the formatter's trailing-comma handling.
   "B008",     # FastAPI's Depends/Query call defaults are framework conventions.
+  "FAST002",  # Same: FastAPI's non-annotated dependency style is intentional.
+  "ASYNC240", # The sandbox agent intentionally performs tiny local filesystem calls.
 ]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+  "S101",     # assert is pytest's idiom.
+  "INP001",   # tests/ is intentionally not an importable package.
+  "SLF001",   # Tests reach into private state to set up fixtures; see test_warm_pool.py.
+]
+"scripts/**" = ["INP001"]  # scripts/ is intentionally not an importable package.
+# sandbox/ ships standalone scripts run inside the sandbox container via
+# `python forkrun.py`, not imported as a package.
+"sandbox/**" = ["INP001"]
+# harborbox_sdk is a shipped public package (see __init__.py's __all__ and the
+# README), so its underscore-prefixed names are not implementation details to
+# be widened into public API -- they mark package-internal cooperation between
+# Sandbox/Execution/Commands/Files and SandboxClient, deliberately kept off
+# the public surface. Same reasoning as the tests/** SLF001 entry above.
+"src/harborbox_sdk/**" = ["SLF001"]
 
 [tool.mypy]
 python_version = "3.12"
 strict = true
 packages = ["harborbox", "harborbox_sdk"]
+# ci_report.py is a standalone module in scripts/, not part of either src
+# package, so it needs its own entry: mypy_path lets mypy find it by name,
+# and modules brings it under the same strict checking as the packages above.
+mypy_path = ["scripts"]
+modules = ["ci_report"]
 
 [[tool.mypy.overrides]]
 module = ["docker", "docker.*"]
 ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["src"]
+branch = false
+
+[tool.coverage.report]
+show_missing = true
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",              # import-time-only; never executes at runtime
+  "raise NotImplementedError",      # runtime_protocol.py stubs, by definition unreachable
+  "if __name__ == \"__main__\":",   # uvicorn and agent entrypoints, not unit-testable
+]

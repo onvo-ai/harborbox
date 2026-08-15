@@ -3,15 +3,17 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from typing import TYPE_CHECKING
 
 from cryptography.fernet import Fernet, InvalidToken
 
-from harborbox.config import Settings
+if TYPE_CHECKING:
+    from harborbox.config import Settings
 
-SECRET_ENVELOPE_KEY = "__harborbox_secret_environment"
+SECRET_ENVELOPE_KEY = "__harborbox_secret_environment"  # noqa: S105 -- dict key name, not a credential
 
 
-class InvalidSecretEnvelope(ValueError):
+class InvalidSecretEnvelopeError(ValueError):
     pass
 
 
@@ -51,12 +53,14 @@ def open_environment(
         decoded = _fernet(settings).decrypt(envelope.encode("ascii"))
         secret = json.loads(decoded)
     except (InvalidToken, UnicodeError, json.JSONDecodeError) as exc:
-        raise InvalidSecretEnvelope("invalid execution secret envelope") from exc
+        message = "invalid execution secret envelope"
+        raise InvalidSecretEnvelopeError(message) from exc
     if not isinstance(secret, dict) or not all(
         isinstance(key, str) and isinstance(value, str)
         for key, value in secret.items()
     ):
-        raise InvalidSecretEnvelope("invalid execution secret environment")
+        message = "invalid execution secret environment"
+        raise InvalidSecretEnvelopeError(message)
     return {**public, **secret}
 
 
