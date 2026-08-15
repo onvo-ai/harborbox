@@ -19,6 +19,10 @@ jobs:
     # postgres_pool_store.py uses dialects.postgresql.insert and
     # with_for_update(skip_locked=True). SQLite cannot execute either, so its
     # tests need the real thing rather than a fake session.
+    #
+    # No test uses this service or HARBORBOX_TEST_DATABASE_URL yet - both
+    # arrive with the coverage branch (postgres_pool_store.py coverage). Not
+    # dead configuration, just not wired up yet.
     services:
       postgres:
         image: postgres:17-alpine
@@ -51,10 +55,14 @@ jobs:
       - name: Typecheck
         run: uv run mypy
 
-      # Blocking from Task 20, when fail_under = 100 is added.
+      # Tests are a blocking gate: a failing test fails this job. Coverage is
+      # measured and reported (see the PR comment) but not yet enforced -
+      # `[tool.coverage.report]` in pyproject.toml sets no fail_under, so the
+      # command can't fail on coverage regardless. `if: always()` keeps
+      # coverage measurement running even if Lint or Typecheck failed above,
+      # so the PR comment still has numbers to show.
       - name: Tests and coverage
         if: always()
-        continue-on-error: true
         run: >-
           uv run pytest --cov --cov-report=json --cov-report=term-missing
           --json-report --json-report-file=unit-results.json
@@ -86,7 +94,8 @@ jobs:
       contents: read
     # Temporary deferral, not a permanent downgrade: the e2e suite is expected
     # to be a blocking gate and this line should come out as soon as the fixes
-    # below land (tracked on a separate branch). A live run against the real
+    # below land. Tracked as Task 21 in
+    # docs/superpowers/plans/2026-08-14-strict-lint-full-coverage-ci.md. A live run against the real
     # stack turned up 5 genuine failures, none of them stale-test flakiness:
     #   - two 409 Conflicts on PUT /v1/sandboxes/{id}/files/content
     #   - a TimeoutError in the parallel-execution smoke test
@@ -205,6 +214,9 @@ jobs:
         with:
           script: |
             const fs = require('fs');
+            // This marker string is the contract that lets this job find and
+            // update its own previous comment (see "mine" below). It must
+            // stay stable - there is no other copy of it anywhere else.
             const marker = '<!-- harborbox-ci-report -->';
             const body = marker + '\n' + fs.readFileSync('ci-report.md', 'utf8');
             const { owner, repo } = context.repo;
