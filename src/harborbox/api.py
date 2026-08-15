@@ -565,17 +565,22 @@ async def update_sandbox(
     session: AsyncSession = Depends(get_session),
 ) -> Sandbox:
     sandbox = await get_sandbox_or_404(session, sandbox_id)
-    if sandbox.status in {"killed", "failed"}:
+    if lazy_start_action(sandbox.status) == "unavailable":
         raise HTTPException(status_code=409, detail=f"cannot update {sandbox.status}")
-    # An idle timeout only means anything once the sandbox is actually
-    # running -- the reaper only ever cold-pauses `running` sandboxes -- and a
-    # caller configuring it is, in practice, about to use the sandbox (this is
-    # exactly Onvo's own pattern: create, configure, then run). Lazily
-    # starting it here, the same way the file endpoints do, means a caller
-    # who sets the timeout before its first execution or file call sees a
-    # sandbox that is actually on its way up rather than one silently stuck
-    # in `created` until something else happens to start it.
-    sandbox = await ensure_ready(sandbox, request, session)
+    # A never-started sandbox is lazily started here, the same way the file
+    # endpoints do: an idle timeout only means anything once the sandbox is
+    # actually running (the reaper only ever cold-pauses `running`
+    # sandboxes), and a caller configuring it is, in practice, about to use
+    # the sandbox (this is exactly Onvo's own pattern: create, configure,
+    # then run). A caller who *explicitly paused* the sandbox is a different
+    # story: `paused_cold`/`paused_memory` are left exactly as this endpoint
+    # always left them -- a metadata PATCH must not have the side effect of
+    # spinning a container back up and restarting idle accounting on a
+    # sandbox someone deliberately put to sleep. Only file I/O, where there
+    # is no way to serve the request without a live container, revives a
+    # paused sandbox.
+    if sandbox.status in {"created", "starting"}:
+        sandbox = await ensure_ready(sandbox, request, session)
     if body.idle_timeout_seconds is not None:
         sandbox.idle_timeout_seconds = body.idle_timeout_seconds
     sandbox.last_activity_at = utc_now()
