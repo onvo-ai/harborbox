@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from opensandbox.exceptions import SandboxException
 
 import harborbox.opensandbox_runtime as runtime_module
 from harborbox.config import Settings
@@ -14,6 +16,8 @@ from harborbox.opensandbox_runtime import (
     OpenSandboxRuntime,
     _BoundedOutput,
 )
+from harborbox.runtime import SandboxMemoryExceededError, SandboxUnavailableError
+from harborbox.schemas import AgentExecutionRequest
 
 
 # `overrides` can set any Sandbox column, whose types are heterogeneous
@@ -62,6 +66,10 @@ class FakeHandle:
 class FakeManager:
     def __init__(self) -> None:
         self.deleted: list[str] = []
+        # What get_sandbox_info() returns, or an exception it raises instead.
+        # Tests that care set this before triggering the call.
+        self.sandbox_info: SimpleNamespace | None = None
+        self.sandbox_info_error: Exception | None = None
 
     async def get_snapshot(self, snapshot_id: str) -> SimpleNamespace:
         assert snapshot_id == "snap-test"
@@ -72,8 +80,20 @@ class FakeManager:
     async def delete_snapshot(self, snapshot_id: str) -> None:
         self.deleted.append(snapshot_id)
 
+    async def get_sandbox_info(self, sandbox_id: str) -> SimpleNamespace:  # noqa: ARG002
+        if self.sandbox_info_error is not None:
+            raise self.sandbox_info_error
+        assert self.sandbox_info is not None, "test must set sandbox_info first"
+        return self.sandbox_info
+
     async def close(self) -> None:
         return None
+
+
+def sandbox_info(
+    *, state: str = "terminated", reason: str | None = None, message: str | None = None
+) -> SimpleNamespace:
+    return SimpleNamespace(status=SimpleNamespace(state=state, reason=reason, message=message))
 
 
 @pytest.mark.asyncio
@@ -204,3 +224,185 @@ async def test_output_collector_enforces_byte_limit() -> None:
     assert output.stdout == ["abcde"]
     assert output.stderr == []
     assert output.truncated is True
+
+
+# --- OOM detection (task 21, failure #5) ------------------------------------
+#
+# OpenSandbox's client-visible exception taxonomy carries no memory-limit
+# code (see `opensandbox.exceptions.sandbox.SandboxError`), so the substring
+# match this used to do against `str(exc)` could never fire -- confirmed by
+# `test_raise_runtime_error_ignores_oom_text_in_the_exception_itself` below.
+# The only live signal this backend has is `SandboxStatus.reason`/`.message`
+# from `get_sandbox_info`, which `_detect_memory_exceeded` queries.
+
+
+class TestDetectMemoryExceeded:
+    async def _runtime(self, manager: FakeManager) -> OpenSandboxRuntime:
+        runtime = OpenSandboxRuntime(Settings())
+        runtime._manager = manager  # type: ignore[assignment]
+        return runtime
+
+    @pytest.mark.asyncio
+    async def test_no_container_id_is_not_treated_as_oom(self) -> None:
+        runtime = await self._runtime(FakeManager())
+        sandbox = sandbox_record(container_id=None)
+
+        assert await runtime._detect_memory_exceeded(sandbox) is False
+
+    @pytest.mark.asyncio
+    async def test_a_still_running_sandbox_is_not_treated_as_oom(self) -> None:
+        manager = FakeManager()
+        # Even if `reason` happened to mention memory, a live container did
+        # not die of anything -- whatever failed was not the container.
+        manager.sandbox_info = sandbox_info(state="running", reason="oom-adjacent-noise")
+        runtime = await self._runtime(manager)
+        sandbox = sandbox_record(container_id="osb-x")
+
+        assert await runtime._detect_memory_exceeded(sandbox) is False
+
+    @pytest.mark.asyncio
+    async def test_a_failed_diagnostic_lookup_does_not_claim_oom(self) -> None:
+        manager = FakeManager()
+        manager.sandbox_info_error = SandboxException("info endpoint unreachable")
+        runtime = await self._runtime(manager)
+        sandbox = sandbox_record(container_id="osb-x")
+
+        assert await runtime._detect_memory_exceeded(sandbox) is False
+
+    @pytest.mark.asyncio
+    async def test_a_dead_sandbox_with_no_reason_is_not_treated_as_oom(self) -> None:
+        manager = FakeManager()
+        manager.sandbox_info = sandbox_info(state="terminated")
+        runtime = await self._runtime(manager)
+        sandbox = sandbox_record(container_id="osb-x")
+
+        assert await runtime._detect_memory_exceeded(sandbox) is False
+
+    @pytest.mark.parametrize(
+        ("reason", "message"),
+        [
+            ("OOMKilled", None),
+            (None, "container was killed: out of memory"),
+            ("Killed", "process exited with exit code 137"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_an_oom_shaped_reason_or_message_is_detected(
+        self, reason: str | None, message: str | None
+    ) -> None:
+        manager = FakeManager()
+        manager.sandbox_info = sandbox_info(state="terminated", reason=reason, message=message)
+        runtime = await self._runtime(manager)
+        sandbox = sandbox_record(container_id="osb-x")
+
+        assert await runtime._detect_memory_exceeded(sandbox) is True
+
+
+@pytest.mark.asyncio
+async def test_raise_runtime_error_reports_oom_from_live_status() -> None:
+    manager = FakeManager()
+    manager.sandbox_info = sandbox_info(state="failed", message="sandbox died: OOM")
+    runtime = OpenSandboxRuntime(Settings())
+    runtime._manager = manager  # type: ignore[assignment]
+    sandbox = sandbox_record(container_id="osb-x")
+
+    with pytest.raises(SandboxMemoryExceededError):
+        await runtime._raise_runtime_error(SandboxException("upstream call failed"), sandbox)
+
+
+@pytest.mark.asyncio
+async def test_raise_runtime_error_ignores_oom_text_in_the_exception_itself() -> None:
+    """The old behaviour: substring-matching `str(exc)` for "oom" is gone.
+
+    Only the live `get_sandbox_info` status is trusted now, not the
+    exception's own text -- confirming the previous dead-code match (the SDK
+    taxonomy can never produce those substrings, but a test double easily
+    can) no longer drives the outcome.
+    """
+    manager = FakeManager()
+    manager.sandbox_info = sandbox_info(state="terminated", reason="ManualStop")
+    runtime = OpenSandboxRuntime(Settings())
+    runtime._manager = manager  # type: ignore[assignment]
+    sandbox = sandbox_record(container_id="osb-x")
+
+    with pytest.raises(SandboxUnavailableError, match="ran out of memory: oom"):
+        await runtime._raise_runtime_error(
+            SandboxException("ran out of memory: oom"), sandbox
+        )
+
+
+class _FakeCodes:
+    """Stands in for `CodeInterpreter().codes`.
+
+    The readiness probe execute_code pays via `_wait_python_ready` runs
+    "pass" and must return immediately; any other code hangs well past the
+    caller's timeout so `execute_code`'s `except TimeoutError` branch is
+    exercised the same way a kernel silently killed by OOM would trigger it.
+    """
+
+    async def run(
+        self,
+        code: str,
+        *,
+        language: Any = None,  # noqa: ANN401, ARG002
+        handlers: Any = None,  # noqa: ANN401, ARG002
+    ) -> SimpleNamespace:
+        if code == "pass":
+            return SimpleNamespace(exit_code=0, error=None)
+        await asyncio.sleep(10)
+        return SimpleNamespace(exit_code=0, error=None)  # pragma: no cover
+
+
+class FakeInterpreter:
+    def __init__(self) -> None:
+        self.codes = _FakeCodes()
+
+    @classmethod
+    async def create(cls, handle: Any) -> FakeInterpreter:  # noqa: ANN401, ARG003
+        return cls()
+
+
+@pytest.mark.asyncio
+async def test_execute_code_timeout_reports_oom_when_the_sandbox_died_of_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runtime_module, "CodeInterpreter", FakeInterpreter)
+    manager = FakeManager()
+    manager.sandbox_info = sandbox_info(state="terminated", reason="OOMKilled")
+    runtime = OpenSandboxRuntime(Settings())
+    runtime._manager = manager  # type: ignore[assignment]
+    sandbox = sandbox_record(container_id="osb-runtime-1")
+    runtime._sandboxes[sandbox.id] = FakeHandle()
+
+    with pytest.raises(SandboxMemoryExceededError):
+        await runtime.execute_code(
+            sandbox,
+            AgentExecutionRequest(code="1 + 1", timeout_seconds=0, max_output_bytes=1024),
+        )
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_execute_code_timeout_without_an_oom_signal_stays_generic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A merely slow script must not be misreported as an OOM.
+
+    Same hang as above, but the live status shows nothing OOM-shaped (or no
+    status at all) -- the caller still sees the pre-existing generic timeout
+    error, unchanged.
+    """
+    monkeypatch.setattr(runtime_module, "CodeInterpreter", FakeInterpreter)
+    manager = FakeManager()
+    manager.sandbox_info = sandbox_info(state="running")
+    runtime = OpenSandboxRuntime(Settings())
+    runtime._manager = manager  # type: ignore[assignment]
+    sandbox = sandbox_record(container_id="osb-runtime-1")
+    runtime._sandboxes[sandbox.id] = FakeHandle()
+
+    with pytest.raises(SandboxUnavailableError, match="exceeded 0 seconds"):
+        await runtime.execute_code(
+            sandbox,
+            AgentExecutionRequest(code="1 + 1", timeout_seconds=0, max_output_bytes=1024),
+        )
+    await runtime.close()
