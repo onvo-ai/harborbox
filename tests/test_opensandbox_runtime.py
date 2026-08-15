@@ -257,15 +257,35 @@ class TestDetectMemoryExceeded:
         assert await runtime._detect_memory_exceeded(sandbox) is False
 
     @pytest.mark.asyncio
-    async def test_a_still_running_sandbox_is_not_treated_as_oom(self) -> None:
+    async def test_a_running_sandbox_with_no_oom_signal_is_not_treated_as_oom(
+        self,
+    ) -> None:
         manager = FakeManager()
-        # Even if `reason` happened to mention memory, a live container did
-        # not die of anything -- whatever failed was not the container.
-        manager.sandbox_info = sandbox_info(state="running", reason="oom-adjacent-noise")
+        manager.sandbox_info = sandbox_info(state="running", reason="config-updated")
         runtime = await self._runtime(manager)
         sandbox = sandbox_record(container_id="osb-x")
 
         assert await runtime._detect_memory_exceeded(sandbox) is False
+
+    @pytest.mark.asyncio
+    async def test_a_running_sandbox_can_still_be_reported_as_oom(self) -> None:
+        """Round-2 regression test.
+
+        This used to be `test_a_still_running_sandbox_is_not_treated_as_oom`
+        and asserted the opposite: that `state == "running"` always meant
+        "not OOM," even with an OOM-shaped `reason`. CI evidence disproved
+        that theory -- the Linux OOM killer targets the memory-hungry kernel
+        process inside the container's cgroup, not necessarily the
+        container's own PID 1, so the container (and this status call)
+        legitimately reports `running` throughout. The state check is gone;
+        only the reason/message content decides now.
+        """
+        manager = FakeManager()
+        manager.sandbox_info = sandbox_info(state="running", reason="OOMKilled")
+        runtime = await self._runtime(manager)
+        sandbox = sandbox_record(container_id="osb-x")
+
+        assert await runtime._detect_memory_exceeded(sandbox) is True
 
     @pytest.mark.asyncio
     async def test_a_failed_diagnostic_lookup_does_not_claim_oom(self) -> None:
@@ -450,4 +470,112 @@ async def test_execute_code_timeout_without_an_oom_signal_stays_generic(
             sandbox,
             AgentExecutionRequest(code="1 + 1", timeout_seconds=0, max_output_bytes=1024),
         )
+    await runtime.close()
+
+
+# --- _wait_python_ready's per-attempt bound (task 21, round 2, failure #1) --
+#
+# CI showed a cold-resume-via-snapshot occupy this loop's entire externally
+# observable window (60s+) with only one attempt ever logged, because the
+# per-attempt cap used to be a hardcoded 60s -- nearly the whole outer
+# deadline. These prove the loop can now actually retry within its budget,
+# and that a single hanging attempt is bounded rather than eating the whole
+# outer deadline by itself.
+
+
+class _FlakyPassCodes:
+    """Stands in for `CodeInterpreter().codes` for `_wait_python_ready` tests.
+
+    Fails (or hangs) on the first `fail_times` attempts, then succeeds --
+    lets a test assert the loop actually retried rather than giving up or
+    blocking on the first attempt.
+    """
+
+    def __init__(self, *, fail_times: int = 0, hang_seconds: float = 0.0) -> None:
+        self.fail_times = fail_times
+        self.hang_seconds = hang_seconds
+        self.attempts = 0
+
+    async def run(
+        self,
+        code: str,
+        *,
+        language: Any = None,  # noqa: ANN401, ARG002
+        handlers: Any = None,  # noqa: ANN401, ARG002
+    ) -> SimpleNamespace:
+        assert code == "pass"
+        self.attempts += 1
+        if self.hang_seconds:
+            await asyncio.sleep(self.hang_seconds)
+        if self.attempts <= self.fail_times:
+            message = "kernel not ready yet"
+            raise RuntimeError(message)
+        return SimpleNamespace(exit_code=0, error=None)
+
+
+class _FlakyInterpreter:
+    def __init__(self, codes: _FlakyPassCodes) -> None:
+        self.codes = codes
+
+
+def _flaky_interpreter_factory(codes: _FlakyPassCodes) -> type:
+    class Factory:
+        @classmethod
+        async def create(cls, handle: Any) -> _FlakyInterpreter:  # noqa: ANN401, ARG003
+            return _FlakyInterpreter(codes)
+
+    return Factory
+
+
+@pytest.mark.asyncio
+async def test_wait_python_ready_retries_within_the_outer_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failures_before_success = 2
+    codes = _FlakyPassCodes(fail_times=failures_before_success)
+    monkeypatch.setattr(
+        runtime_module, "CodeInterpreter", _flaky_interpreter_factory(codes)
+    )
+    settings = Settings(
+        sandbox_python_ready_timeout_seconds=5,
+        sandbox_python_ready_attempt_timeout_seconds=1,
+    )
+    runtime = OpenSandboxRuntime(settings)
+    sandbox = sandbox_record()
+
+    await runtime._wait_python_ready(sandbox, FakeHandle())
+
+    assert codes.attempts == failures_before_success + 1
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_wait_python_ready_bounds_a_hanging_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A single hanging attempt must not consume the whole outer budget.
+
+    Every attempt hangs for far longer than either the per-attempt or the
+    outer deadline below. Elapsed wall-clock time staying far under the
+    artificial hang duration proves the per-attempt `asyncio.timeout` is
+    what ends each attempt, not the hang resolving on its own -- exactly
+    the CI-observed failure mode this setting exists to prevent.
+    """
+    codes = _FlakyPassCodes(hang_seconds=5.0)
+    monkeypatch.setattr(
+        runtime_module, "CodeInterpreter", _flaky_interpreter_factory(codes)
+    )
+    settings = Settings(
+        sandbox_python_ready_timeout_seconds=0.5,
+        sandbox_python_ready_attempt_timeout_seconds=0.05,
+    )
+    runtime = OpenSandboxRuntime(settings)
+    sandbox = sandbox_record()
+
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(SandboxUnavailableError, match="kernel never became available"):
+        await runtime._wait_python_ready(sandbox, FakeHandle())
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert elapsed < codes.hang_seconds
     await runtime.close()

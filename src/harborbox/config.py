@@ -73,6 +73,17 @@ class Settings(BaseSettings):
     # rather than tuned — a sandbox that has not got a kernel by now is broken,
     # not slow.
     sandbox_python_ready_timeout_seconds: float = Field(default=120.0, gt=0)
+    # Bounds a single attempt inside that outer deadline. Was a hardcoded 60s
+    # -- nearly the whole outer budget on its own -- until CI evidence from a
+    # cold-resume-via-snapshot showed one attempt occupying the entire
+    # observable window with no second attempt ever logged: a fixed 60s
+    # attempt cap defeats the retry loop's own purpose the moment a single
+    # attempt is merely slow rather than instantly failing. Shorter here
+    # means a transient stall gets an actual retry within the outer budget
+    # instead of exhausting most of it on one attempt, and a genuine hang
+    # surfaces a clear SandboxUnavailableError well before a caller's own
+    # wait budget elapses instead of after it.
+    sandbox_python_ready_attempt_timeout_seconds: float = Field(default=15.0, gt=0)
     sandbox_network: str = "harborbox-net"
     sandbox_egress_network: str | None = None
     sandbox_runtime: str | None = None
