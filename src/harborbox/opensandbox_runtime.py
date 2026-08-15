@@ -303,6 +303,17 @@ class OpenSandboxRuntime:
         window with no second attempt ever logged, because the per-attempt
         cap used to be nearly as large as the outer deadline itself. See
         `sandbox_python_ready_attempt_timeout_seconds` for why that changed.
+
+        A 404 from OpenSandbox (`SandboxApiException` with
+        `status_code == HTTPStatus.NOT_FOUND`) is not one of the transient
+        failures this loop exists to ride out, and is handled separately:
+        CI evidence (task 21, round 3) showed this loop retrying against a
+        sandbox that had already been killed and removed by an external
+        caller (the e2e test's own cleanup, once its client-side wait
+        elapsed) for the rest of its 120s budget, producing nothing but
+        repeated, identical "not found" log lines until the deadline. A
+        sandbox that is gone will never come back; that is answered the
+        moment the first 404 arrives, not after riding out the full budget.
         """
         template = sandbox.metadata_.get("template")
         base = self.settings.base_of_derived_template(template or "") or template
@@ -326,17 +337,26 @@ class OpenSandboxRuntime:
                     await interpreter.codes.run(
                         "pass", language=SupportedLanguage.PYTHON
                     )
+            except SandboxApiException as exc:
+                if exc.status_code == HTTPStatus.NOT_FOUND:
+                    message = (
+                        "sandbox's OpenSandbox container was not found while "
+                        f"waiting for its Python kernel -- it will not come "
+                        f"back: {exc}"
+                    )
+                    raise SandboxUnavailableError(message) from exc
+                last = exc
             except Exception as exc:  # noqa: BLE001 - retried until the deadline
                 last = exc
-                logger.warning(
-                    "sandbox %s python not ready yet: %s: %s",
-                    sandbox.id,
-                    type(exc).__name__,
-                    exc,
-                )
-                await asyncio.sleep(1.0)
             else:
                 return
+            logger.warning(
+                "sandbox %s python not ready yet: %s: %s",
+                sandbox.id,
+                type(last).__name__,
+                last,
+            )
+            await asyncio.sleep(1.0)
         message = (
             "sandbox started but its Python kernel never became available after "
             f"{self.settings.sandbox_python_ready_timeout_seconds}s: "

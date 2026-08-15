@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from http import HTTPStatus
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from opensandbox.exceptions import SandboxException
+from opensandbox.exceptions import SandboxApiException, SandboxException
 
 import harborbox.opensandbox_runtime as runtime_module
 from harborbox.config import Settings
@@ -491,9 +492,21 @@ class _FlakyPassCodes:
     blocking on the first attempt.
     """
 
-    def __init__(self, *, fail_times: int = 0, hang_seconds: float = 0.0) -> None:
+    def __init__(
+        self,
+        *,
+        fail_times: int = 0,
+        hang_seconds: float = 0.0,
+        raise_on_attempt: int | None = None,
+        raise_error: Exception | None = None,
+    ) -> None:
         self.fail_times = fail_times
         self.hang_seconds = hang_seconds
+        # On this attempt number (1-indexed), raise `raise_error` instead of
+        # the normal fail/succeed logic -- lets a test inject a specific,
+        # terminal error partway through a run without hanging or retrying.
+        self.raise_on_attempt = raise_on_attempt
+        self.raise_error = raise_error
         self.attempts = 0
 
     async def run(
@@ -507,6 +520,8 @@ class _FlakyPassCodes:
         self.attempts += 1
         if self.hang_seconds:
             await asyncio.sleep(self.hang_seconds)
+        if self.attempts == self.raise_on_attempt and self.raise_error is not None:
+            raise self.raise_error
         if self.attempts <= self.fail_times:
             message = "kernel not ready yet"
             raise RuntimeError(message)
@@ -578,4 +593,82 @@ async def test_wait_python_ready_bounds_a_hanging_attempt(
     elapsed = asyncio.get_running_loop().time() - started
 
     assert elapsed < codes.hang_seconds
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_wait_python_ready_stops_immediately_on_a_not_found_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task 21, round 3: a 404 is terminal, not one more transient failure.
+
+    CI showed this loop retrying against a sandbox that had already been
+    killed and removed by an external caller (a test's own cleanup, once its
+    client-side wait elapsed), producing nothing but repeated "not found"
+    log lines until the full 120s budget expired. A missing sandbox will
+    never come back; a `SandboxApiException` with `status_code == 404`
+    must abort on the attempt that discovers it, not retry until the
+    deadline the way a merely-slow kernel does (that case is
+    `test_wait_python_ready_retries_within_the_outer_deadline` above).
+    """
+    not_found_on_attempt = 2
+    not_found = SandboxApiException(
+        "Sandbox 4e0de637-... not found. | [DOCKER::SANDBOX_NOT_FOUND]",
+        status_code=HTTPStatus.NOT_FOUND,
+    )
+    codes = _FlakyPassCodes(
+        fail_times=1, raise_on_attempt=not_found_on_attempt, raise_error=not_found
+    )
+    monkeypatch.setattr(
+        runtime_module, "CodeInterpreter", _flaky_interpreter_factory(codes)
+    )
+    outer_deadline_seconds = 30
+    settings = Settings(
+        sandbox_python_ready_timeout_seconds=outer_deadline_seconds,
+        sandbox_python_ready_attempt_timeout_seconds=1,
+    )
+    runtime = OpenSandboxRuntime(settings)
+    sandbox = sandbox_record()
+
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(SandboxUnavailableError, match="was not found"):
+        await runtime._wait_python_ready(sandbox, FakeHandle())
+    elapsed = asyncio.get_running_loop().time() - started
+
+    # Stopped on the attempt that discovered the 404, not after riding out
+    # the full outer deadline.
+    assert codes.attempts == not_found_on_attempt
+    assert elapsed < outer_deadline_seconds / 2
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_wait_python_ready_retries_a_non_404_api_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `SandboxApiException` that isn't a 404 is still transient.
+
+    Only "the sandbox is gone" is terminal; any other API error (a 500, a
+    transient connection refusal, ...) keeps retrying like every other
+    failure this loop already tolerates.
+    """
+    transient = SandboxApiException(
+        "temporary upstream error", status_code=HTTPStatus.BAD_GATEWAY
+    )
+    codes = _FlakyPassCodes(raise_on_attempt=1, raise_error=transient)
+    # After the injected exception, the next attempt succeeds normally.
+    expected_attempts = 2
+    monkeypatch.setattr(
+        runtime_module, "CodeInterpreter", _flaky_interpreter_factory(codes)
+    )
+    settings = Settings(
+        sandbox_python_ready_timeout_seconds=5,
+        sandbox_python_ready_attempt_timeout_seconds=1,
+    )
+    runtime = OpenSandboxRuntime(settings)
+    sandbox = sandbox_record()
+
+    await runtime._wait_python_ready(sandbox, FakeHandle())
+
+    assert codes.attempts == expected_attempts
     await runtime.close()
