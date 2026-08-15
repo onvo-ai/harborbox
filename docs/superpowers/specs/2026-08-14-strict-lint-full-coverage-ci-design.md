@@ -3,6 +3,17 @@
 Date: 2026-08-14
 Status: approved, not yet implemented
 
+> **Scope note (added during review of the initial implementation branch):**
+> the work described here was split. The `lint-strict-unit-tests` branch
+> delivers the CI pipeline itself, the sticky report comment, and strict lint
+> at zero findings, blocking. It deliberately stops short of the other two
+> items below: coverage to 100% (`fail_under = 100`) and the e2e fixes are
+> tracked as separate follow-up work (the coverage gate is Task 20, the e2e
+> fixes are Task 21, both in
+> `docs/superpowers/plans/2026-08-14-strict-lint-full-coverage-ci.md`) and
+> land on their own branches. The rest of this document still describes the
+> original, unsplit goal.
+
 ## Goal
 
 Three things, delivered on one branch that is green when it merges:

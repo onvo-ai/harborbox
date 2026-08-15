@@ -16,7 +16,10 @@ htmlcov/
 *.bak
 *.pre-guard
 
-# CI-generated report artifacts (coverage, unit test results, strict lint backlog).
+# CI-generated report artifacts (coverage, unit test results, strict lint
+# backlog, e2e results, the rendered PR report).
 /coverage.json
 /unit-results.json
 /ruff-strict.json
+/e2e-results.json
+/ci-report.md
