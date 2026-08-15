@@ -44,6 +44,13 @@ def test_missing_artifacts_render_as_dashes_not_zeros(tmp_path: Path) -> None:
     assert "Total unit test coverage: —." in report
 
 
+def test_missing_e2e_results_keep_internal_capitals(tmp_path: Path) -> None:
+    report = render_report(tmp_path)
+
+    assert "E2E test results unavailable." in report
+    assert "E2e" not in report
+
+
 def test_malformed_json_is_treated_as_absent(tmp_path: Path) -> None:
     (tmp_path / "coverage.json").write_text("{not json", encoding="utf-8")
 

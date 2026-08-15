@@ -17,14 +17,13 @@ from typing import Any
 
 PACKAGES = ("harborbox", "harborbox_agent", "harborbox_sdk")
 
-MARKER = "<!-- harborbox-ci-report -->"
-
 FOOTNOTE = (
     "<sub>Unit coverage is line coverage from pytest-cov across each package's "
     "whole tree in `src`. E2E tests run against a local Compose stack built from "
     "this commit. The lint backlog is what `ruff --select ALL` reports with "
     "nothing ignored; the blocking `ruff check` gate is green at zero. Coverage "
-    "is enforced at 100% by the blocking pytest job.</sub>"
+    "is reported but not yet enforced - the blocking pytest job runs tests, "
+    "not a coverage threshold; that gate arrives with the coverage work.</sub>"
 )
 
 
@@ -151,7 +150,7 @@ def render_report(root: Path) -> str:
 
 def _summary(pair: tuple[int, int] | None, noun: str) -> str:
     if pair is None:
-        return f"{noun.capitalize()} results unavailable."
+        return f"{noun[0].upper() + noun[1:]} results unavailable."
     total, failed = pair
     if failed:
         return f"{failed} failing {noun}{'' if failed == 1 else 's'} out of {total}."
