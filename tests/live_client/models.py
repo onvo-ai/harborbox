@@ -36,8 +36,8 @@ def _inline_wait_options(
 
     The body half asks the server to hold the connection; the httpx half widens
     this one request's timeout so the client does not give up while the server
-    is still legitimately waiting. Shared by `run_code` and `commands.run`
-    because getting only one of the two halves right is a silent bug.
+    is still legitimately waiting. Kept separate from the body so
+    getting only one of the two halves right cannot be a silent bug.
     """
     body: dict[str, Any] = {"wait": wait}
     if not wait:
@@ -140,8 +140,8 @@ class Execution:
     ) -> Execution:
         """Poll until this execution finishes.
 
-        This is the fallback path now: `run_code` and `commands.run` ask the
-        server to hold the connection instead, and only land here when the
+        This is the fallback path now: `commands.run` asks the server to hold
+        the connection instead, and only land here when the
         execution outlives the server's willingness to wait. It stays public
         because a caller who submitted with `wait=False` still needs it.
 
@@ -275,42 +275,6 @@ class Sandbox:
         self.cpu = float(payload["cpu"])
         self.idle_timeout_seconds = int(payload["idle_timeout_seconds"])
         self.metadata = dict(payload.get("metadata", {}))
-
-    def run_code(
-        self,
-        code: str,
-        *,
-        timeout: int | None = None,
-        env: dict[str, str] | None = None,
-        wait: bool = True,
-        wait_timeout: float | None = None,
-    ) -> Execution:
-        # Let the server hold the connection until the result is ready. It
-        # answers as soon as the execution finishes, so the common case is one
-        # round trip instead of a poll loop whose interval was most of the
-        # latency on fast code.
-        body, request_options = _inline_wait_options(
-            wait=wait, wait_timeout=wait_timeout, timeout=timeout
-        )
-        execution = Execution(
-            self._client,
-            self._client._request(
-                "POST",
-                f"/v1/sandboxes/{self.id}/executions",
-                json={
-                    "code": code,
-                    "timeout_seconds": timeout,
-                    "env": env or {},
-                    **body,
-                },
-                **request_options,
-            ),
-        )
-        if not wait or execution.status in TERMINAL_STATES:
-            return execution
-        # The server gave up waiting before the execution finished. Falling back
-        # to polling keeps the same contract for slow work.
-        return execution.wait(wait_timeout)
 
     def refresh(self) -> Sandbox:
         self._apply(self._client._request("GET", f"/v1/sandboxes/{self.id}"))

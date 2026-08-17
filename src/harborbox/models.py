@@ -94,7 +94,7 @@ class Execution(Base):
 
     id: Mapped[str] = mapped_column(String(40), primary_key=True)
     sandbox_id: Mapped[str] = mapped_column(ForeignKey("sandboxes.id", ondelete="CASCADE"))
-    kind: Mapped[str] = mapped_column(String(16), default="code")
+    kind: Mapped[str] = mapped_column(String(16), default="command")
     status: Mapped[str] = mapped_column(String(32), index=True, default="queued")
     code: Mapped[str | None] = mapped_column(Text, nullable=True)
     command: Mapped[str | None] = mapped_column(Text, nullable=True)

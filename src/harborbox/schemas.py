@@ -100,14 +100,6 @@ class PauseRequest(BaseModel):
     memory: bool = True
 
 
-class CodeExecutionCreate(BaseModel):
-    code: str
-    timeout_seconds: int | None = Field(default=None, ge=1)
-    env: dict[str, str] = Field(default_factory=dict)
-    wait: bool = False
-    wait_timeout_seconds: int | None = Field(default=None, ge=1)
-
-
 class CommandCreate(BaseModel):
     command: str
     timeout_seconds: int | None = Field(default=None, ge=1)
@@ -158,6 +150,9 @@ class ExecutionError(BaseModel):
 class ExecutionResponse(BaseModel):
     id: str
     sandbox_id: str
+    # "code" is retained for reading only: `POST /v1/sandboxes/{id}/executions`
+    # is gone and nothing produces new code executions, but rows written before
+    # its removal still carry the value and must not 500 on read.
     kind: Literal["code", "command", "process"]
     status: ExecutionStatus
     queue_position: int | None = None
@@ -222,13 +217,6 @@ class CapacityResponse(BaseModel):
     running_sandboxes: int
     running_executions: int
     queued_executions: int
-
-
-class AgentExecutionRequest(BaseModel):
-    code: str
-    timeout_seconds: int
-    max_output_bytes: int
-    env: dict[str, str] = Field(default_factory=dict)
 
 
 class AgentCommandRequest(BaseModel):

@@ -10,13 +10,17 @@ import pytest
 if TYPE_CHECKING:
     from live_client import SandboxClient
 
+# Allocates well past the sandbox's 128 MB limit. Runs through /commands
+# because POST /v1/sandboxes/{id}/executions no longer exists.
+OOM_COMMAND = "/opt/venv/bin/python -c 'payload = bytearray(384 * 1024 * 1024)'"
+
 
 @pytest.mark.e2e
 def test_oom_is_contained_and_reported(client: SandboxClient) -> None:
     sandbox = client.sandboxes.create(template="onvo-lite", memory_mb=128, cpu=1)
     try:
-        execution = sandbox.run_code(
-            "payload = bytearray(384 * 1024 * 1024)",
+        execution = sandbox.commands.run(
+            OOM_COMMAND,
             wait=False,
         )
         execution.wait(timeout=60)
@@ -31,8 +35,8 @@ def test_oom_is_contained_and_reported(client: SandboxClient) -> None:
 def test_api_stays_healthy_after_oom(client: SandboxClient) -> None:
     sandbox = client.sandboxes.create(template="onvo-lite", memory_mb=128, cpu=1)
     try:
-        execution = sandbox.run_code(
-            "payload = bytearray(384 * 1024 * 1024)",
+        execution = sandbox.commands.run(
+            OOM_COMMAND,
             wait=False,
         )
         execution.wait(timeout=60)

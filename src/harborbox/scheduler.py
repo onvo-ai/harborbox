@@ -18,7 +18,6 @@ from harborbox.opensandbox_compat import expiration
 from harborbox.runtime import SandboxMemoryExceededError, SandboxUnavailableError
 from harborbox.schemas import (
     AgentCommandRequest,
-    AgentExecutionRequest,
     AgentProcessRequest,
 )
 
@@ -80,16 +79,16 @@ def may_start_execution(
     return sandbox_status not in {"killed", "failed"}
 
 
-def has_sandbox_execution_slot(
-    *,
-    kind: str,
-    active_count: int,
-    active_code: bool,
-    limit: int,
-) -> bool:
-    if active_count >= limit or active_code:
-        return False
-    return kind in {"command", "process"} or active_count == 0
+def has_sandbox_execution_slot(*, active_count: int, limit: int) -> bool:
+    """Whether a sandbox has room for one more execution.
+
+    Used to take a `kind` too: code executions ran on a per-sandbox Jupyter
+    kernel with one shared namespace, so they had to be exclusive within a
+    sandbox and blocked everything else. `POST /v1/sandboxes/{id}/executions`
+    is gone, so every remaining execution is an ordinary process and the only
+    limit left is the configured concurrency.
+    """
+    return active_count < limit
 
 
 @dataclass
@@ -102,7 +101,6 @@ class _ScanState:
 
     capacity: Capacity
     active_counts: dict[str, int] = field(default_factory=dict)
-    active_code_sandboxes: set[str] = field(default_factory=set)
 
 
 def _reject_ineligible(execution: Execution, sandbox: Sandbox, now: datetime) -> bool:
@@ -320,18 +318,14 @@ class Scheduler:
 
             active_rows = (
                 await session.execute(
-                    select(Execution.sandbox_id, Execution.kind, func.count())
+                    select(Execution.sandbox_id, func.count())
                     .where(Execution.status.in_(ACTIVE_EXECUTION_STATES))
-                    .group_by(Execution.sandbox_id, Execution.kind)
+                    .group_by(Execution.sandbox_id)
                 )
             ).all()
             state = _ScanState(capacity=await self.capacity())
-            for sandbox_id, kind, count in active_rows:
-                state.active_counts[sandbox_id] = state.active_counts.get(
-                    sandbox_id, 0
-                ) + int(count)
-                if kind == "code":
-                    state.active_code_sandboxes.add(sandbox_id)
+            for sandbox_id, count in active_rows:
+                state.active_counts[sandbox_id] = int(count)
 
             rejected_ids: list[str] = []
             for index, execution in enumerate(queued):
@@ -341,9 +335,7 @@ class Scheduler:
                     continue
                 active_count = state.active_counts.get(sandbox.id, 0)
                 if not has_sandbox_execution_slot(
-                    kind=execution.kind,
                     active_count=active_count,
-                    active_code=sandbox.id in state.active_code_sandboxes,
                     limit=self.settings.max_concurrent_executions_per_sandbox,
                 ):
                     continue
@@ -407,8 +399,6 @@ class Scheduler:
         if not already_reserved:
             sandbox.status = "starting"
         state.active_counts[sandbox.id] = state.active_counts.get(sandbox.id, 0) + 1
-        if execution.kind == "code":
-            state.active_code_sandboxes.add(sandbox.id)
         state.capacity = replace(
             state.capacity,
             reserved_memory_mb=state.capacity.reserved_memory_mb + incremental_memory,
@@ -523,16 +513,6 @@ class Scheduler:
         environment: dict[str, str],
     ) -> AgentExecutionResponse:
         """Dispatch to the runtime call matching `execution.kind`."""
-        if execution.kind == "code":
-            return await self.runtime.execute_code(
-                sandbox,
-                AgentExecutionRequest(
-                    code=execution.code or "",
-                    timeout_seconds=execution.timeout_seconds,
-                    max_output_bytes=self.settings.max_output_bytes,
-                    env=environment,
-                ),
-            )
         if execution.kind == "command":
             return await self.runtime.execute_command(
                 sandbox,

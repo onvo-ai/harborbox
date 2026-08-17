@@ -1,6 +1,6 @@
 """Measure what each Python execution path costs for one widget-shaped workload.
 
-Four variants, all running byte-identical source over the same ~100 MB CSV, so
+Three variants, all running byte-identical source over the same ~100 MB CSV, so
 the only difference is the machinery around the code:
 
 * `cold`    - `python analysis.py`. No substrate, but every run pays the
@@ -9,8 +9,6 @@ the only difference is the machinery around the code:
               plus an ipykernel spawn, before any code runs.
 * `forkrun` - `sandbox/forkrun.py`: a daemon that imports pandas once and forks
               a pristine child per run.
-* `coderun` - forkrun *and* `sandbox/coderun.py`. What `POST /v1/executions`
-              runs today, and so the variant to compare against `jupyter`.
 
 Two numbers matter and they are reported separately:
 
@@ -46,7 +44,6 @@ from pathlib import Path
 BENCH_DIR = Path(__file__).resolve().parent
 SANDBOX_DIR = BENCH_DIR.parent.parent / "sandbox"
 FORKRUN = SANDBOX_DIR / "forkrun.py"
-CODERUN = SANDBOX_DIR / "coderun.py"
 FORKRUN_SOCKET = Path("/tmp/.harborbox-forkrun.sock")  # noqa: S108 - forkrun's fixed path
 JUPYTER_PORT = 8899
 BOOT_TIMEOUT_S = 120.0
@@ -255,35 +252,6 @@ def bench_forkrun(python: str, script: Path, csv_path: Path, repeats: int) -> Va
     )
 
 
-def bench_coderun(python: str, script: Path, csv_path: Path, repeats: int) -> Variant:
-    """Measure the path `POST /v1/executions` actually takes today.
-
-    forkrun for the warm imports, coderun for the final-expression echo. This is
-    the number to compare against `jupyter`, since `forkrun` alone skips the
-    runner the endpoint really invokes.
-    """
-    environment = _environment(csv_path)
-    environment["HARBORBOX_CODE_PATH"] = str(script)
-    environment["HARBORBOX_RESULT_SENTINEL"] = "__harborbox_bench_sentinel__"
-    with suppress(FileNotFoundError):
-        FORKRUN_SOCKET.unlink()
-
-    command = [python, str(FORKRUN), str(CODERUN)]
-    first, stdout = _run(command, environment)
-    samples = [_run(command, environment)[0] for _ in range(repeats)]
-    warm = statistics.median(samples)
-    return Variant(
-        name="coderun",
-        cold_start_seconds=first,
-        boot_seconds=max(0.0, first - warm),
-        first_execution_seconds=warm,
-        warm_seconds=warm,
-        warm_samples=samples,
-        body_seconds=_body_seconds(stdout),
-        note="forkrun daemon + coderun runner; what execute_code runs today",
-    )
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", type=Path, required=True)
@@ -314,7 +282,6 @@ def main() -> int:
             bench_jupyter(arguments.python, script, arguments.csv, arguments.repeats)
         )
     variants.append(bench_forkrun(arguments.python, script, arguments.csv, arguments.repeats))
-    variants.append(bench_coderun(arguments.python, script, arguments.csv, arguments.repeats))
 
     report = {
         "csv_bytes": arguments.csv.stat().st_size,

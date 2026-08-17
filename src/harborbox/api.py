@@ -49,7 +49,6 @@ from harborbox.scheduler import (
 )
 from harborbox.schemas import (
     CapacityResponse,
-    CodeExecutionCreate,
     CommandCreate,
     ExecutionResponse,
     FileListResponse,
@@ -864,7 +863,6 @@ class _ExecutionSpec:
     """What the caller wants run; bundled to keep `enqueue`'s signature small."""
 
     kind: str
-    code: str | None
     command: str | None
     environment: dict[str, str]
     cwd: str | None
@@ -967,8 +965,7 @@ async def enqueue(
                 f"{settings.max_execution_timeout_seconds}"
             ),
         )
-    payload = spec.code if spec.code is not None else spec.command or ""
-    if len(payload.encode("utf-8")) > settings.max_code_bytes:
+    if len((spec.command or "").encode("utf-8")) > settings.max_code_bytes:
         raise HTTPException(status_code=413, detail="execution payload is too large")
 
     execution = Execution(
@@ -976,7 +973,6 @@ async def enqueue(
         sandbox_id=sandbox.id,
         kind=spec.kind,
         status="queued",
-        code=spec.code,
         command=spec.command,
         environment=spec.environment,
         cwd=spec.cwd,
@@ -1018,40 +1014,6 @@ async def enqueue(
 
 
 @app.post(
-    "/v1/sandboxes/{sandbox_id}/executions",
-    response_model=ExecutionResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-    dependencies=authenticated,
-)
-async def create_execution(
-    sandbox_id: str,
-    body: CodeExecutionCreate,
-    request: Request,
-    response: Response,
-    session: AsyncSession = Depends(get_session),
-) -> ExecutionResponse:
-    return await enqueue(
-        sandbox_id=sandbox_id,
-        spec=_ExecutionSpec(
-            kind="code",
-            code=body.code,
-            command=None,
-            environment=body.env,
-            cwd=None,
-            timeout_seconds=body.timeout_seconds,
-            wait=body.wait,
-            wait_timeout_seconds=body.wait_timeout_seconds,
-        ),
-        context=_EnqueueContext(
-            settings=settings_from(request),
-            session=session,
-            notifier=notifier_from(request),
-            response=response,
-        ),
-    )
-
-
-@app.post(
     "/v1/sandboxes/{sandbox_id}/commands",
     response_model=ExecutionResponse,
     status_code=status.HTTP_202_ACCEPTED,
@@ -1068,7 +1030,6 @@ async def create_command(
         sandbox_id=sandbox_id,
         spec=_ExecutionSpec(
             kind="command",
-            code=None,
             command=body.command,
             environment=body.env,
             cwd=body.cwd,
@@ -1111,7 +1072,6 @@ async def create_process(
         sandbox_id=sandbox_id,
         spec=_ExecutionSpec(
             kind="process",
-            code=None,
             command=process_spec,
             environment=seal_environment(settings, body.env, body.secret_env),
             cwd=body.cwd,
@@ -1142,22 +1102,19 @@ async def get_execution(
     waiting_for = None
     if execution.status == "queued":
         sandbox = await get_sandbox_or_404(session, execution.sandbox_id)
-        active_rows = (
-            await session.execute(
-                select(Execution.kind, func.count())
+        active_count = int(
+            await session.scalar(
+                select(func.count())
+                .select_from(Execution)
                 .where(
                     Execution.sandbox_id == sandbox.id,
                     Execution.status.in_(ACTIVE_EXECUTION_STATES),
                 )
-                .group_by(Execution.kind)
             )
-        ).all()
-        active_count = sum(int(count) for _, count in active_rows)
-        active_code = any(kind == "code" for kind, _ in active_rows)
+            or 0
+        )
         blocked_by_sandbox = not has_sandbox_execution_slot(
-            kind=execution.kind,
             active_count=active_count,
-            active_code=active_code,
             limit=settings_from(request).max_concurrent_executions_per_sandbox,
         )
         if blocked_by_sandbox:

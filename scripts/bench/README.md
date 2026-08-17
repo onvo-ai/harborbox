@@ -52,7 +52,13 @@ uv run python scripts/bench/bench_queue.py --samples 40
 | `cold` | `python script.py`. No substrate; pays `import pandas` every run. |
 | `jupyter` | What the image used to start: a `jupyter server` plus an ipykernel spawn. |
 | `forkrun` | `sandbox/forkrun.py` alone — a daemon that imports pandas once and forks per run. |
-| `coderun` | forkrun **and** `sandbox/coderun.py`. What `POST /v1/executions` runs today. |
+
+The recorded runs in `results/` also carry a fourth variant, `coderun`. That
+was `sandbox/coderun.py`, the runner written to serve
+`POST /v1/sandboxes/{id}/executions` after the kernel was removed. The endpoint
+turned out to have no caller and was deleted along with the runner, so the
+harness no longer produces that variant; the results keep it because it is what
+was measured at the time.
 
 `cold_start` is substrate boot plus first execution — what a caller waits for on
 a sandbox that just started. `warm` is the median of the runs after that.

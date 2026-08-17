@@ -15,7 +15,6 @@ between them: feed the compose file's own environment into `Settings` and assert
 the resulting behaviour matches what the host can actually provide.
 """
 
-import inspect
 import re
 from pathlib import Path
 
@@ -23,7 +22,6 @@ import pytest
 import yaml
 
 from harborbox.config import Settings
-from harborbox.opensandbox_runtime import OpenSandboxRuntime
 from harborbox.schemas import SandboxCreate
 
 COMPOSE = Path(__file__).resolve().parent.parent / "compose.internal-tools.yaml"
@@ -221,34 +219,6 @@ def test_no_template_image_installs_a_python_kernel() -> None:
                 f"{requirements.name} still installs {forbidden}; "
                 "no template runs a kernel any more"
             )
-
-
-@pytest.mark.parametrize("dockerfile", ["Dockerfile", "Dockerfile.relaydeck"])
-def test_every_template_image_ships_the_code_runner(dockerfile: str) -> None:
-    """`POST /v1/executions` is served by coderun.py, so it has to be present.
-
-    Unlike forkrun, whose absence only costs speed, a missing coderun.py fails
-    every code execution outright -- relaydeck included, which is why it is
-    checked in both Dockerfiles rather than only the pandas ones.
-    """
-    text = (Path(__file__).resolve().parent.parent / "sandbox" / dockerfile).read_text()
-
-    assert "COPY sandbox/coderun.py /opt/coderun.py" in text
-
-
-def test_code_execution_does_not_reach_for_a_kernel() -> None:
-    """`execute_code` runs a command; it does not talk to an interpreter service.
-
-    Pinned at the source level because the failure mode is silent: reintroducing
-    a kernel client here would work in a dev image that still had Jupyter
-    installed and 500 in production, which is the exact shape of the outage
-    this file exists for.
-    """
-    execute = inspect.getsource(OpenSandboxRuntime.execute_code)
-
-    assert "CodeInterpreter" not in execute
-    assert "_wait_python_ready" not in execute
-    assert "CODE_RUNNER_PATH" in execute
 
 
 def test_forkrun_is_installed_in_the_sandbox_image() -> None:

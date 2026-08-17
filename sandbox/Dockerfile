@@ -34,14 +34,6 @@ RUN /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt \
 # still ran, just paying the import every time.
 COPY sandbox/forkrun.py /opt/forkrun.py
 
-# Serves POST /v1/executions. execd runs bash directly and only ever proxied
-# Python to a Jupyter server, so this image used to ship jupyter-server plus
-# ipykernel and start a server in every sandbox — measured at ~3s of boot and
-# ~197MB resident before any user code ran (scripts/bench/). coderun.py
-# reproduces the one thing the kernel provided that a plain script does not,
-# the final-expression echo, and costs nothing when idle.
-COPY sandbox/coderun.py /opt/coderun.py
-
 WORKDIR /workspace
 USER 10001:10001
 

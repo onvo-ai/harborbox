@@ -127,6 +127,9 @@ class Settings(BaseSettings):
     execution_stream_keepalive_seconds: float = Field(default=15.0, gt=0)
     scheduler_scan_limit: int = Field(default=100, ge=1)
     queue_aging_seconds: int = Field(default=60, ge=1)
+    # Caps a queued command's payload. Named for the code endpoint it was
+    # written for; kept under that name so existing deployments' env vars
+    # keep working.
     max_code_bytes: int = Field(default=262_144, ge=1024)
     max_output_bytes: int = Field(default=8_388_608, ge=1024)
     max_upload_bytes: int = Field(default=157_286_400, ge=1024)
@@ -190,10 +193,10 @@ class Settings(BaseSettings):
         Every template now idles. This used to branch: anything that ran Python
         started a Jupyter server here, because execd runs bash itself but
         proxied Python to a server nothing else would start. That server cost
-        ~3 s of boot and ~197 MB resident in every sandbox to serve one endpoint
-        (`POST /v1/executions`), which now runs Python as an ordinary command
-        through `coderun.py`. Nothing in the sandbox needs a long-lived process
-        of its own any more, so there is no branch left to make.
+        ~3 s of boot and ~197 MB resident in every sandbox to serve one
+        endpoint, `POST /v1/sandboxes/{id}/executions`, which has since been
+        removed outright -- it had no caller. Nothing in the sandbox needs a
+        long-lived process of its own any more, so there is no branch to make.
 
         The `template` argument is kept because callers pass it and a future
         template may want its own bootstrap; it is deliberately unused today.

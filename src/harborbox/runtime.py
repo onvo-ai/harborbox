@@ -13,7 +13,6 @@ from docker.errors import APIError, NotFound
 from harborbox.runtime_protocol import StartedSandbox, WarmPoolReservation
 from harborbox.schemas import (
     AgentCommandRequest,
-    AgentExecutionRequest,
     AgentExecutionResponse,
     AgentProcessRequest,
     FileListResponse,
@@ -234,11 +233,6 @@ class DockerRuntime:
         await self._raise_container_failure(sandbox)
         message = "sandbox agent did not become ready"
         raise SandboxUnavailableError(message)
-
-    async def execute_code(
-        self, sandbox: Sandbox, request: AgentExecutionRequest
-    ) -> AgentExecutionResponse:
-        return await self._post_agent(sandbox, "/v1/execute", request.model_dump())
 
     async def execute_command(
         self, sandbox: Sandbox, request: AgentCommandRequest

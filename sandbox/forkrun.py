@@ -61,11 +61,10 @@ def _apply_request(path: str, argv: "list[str]", env: "dict[str, str] | None") -
 
     A forked child inherits the daemon's `os.environ`, and the daemon was
     started by whichever call happened to be first. Without this, a per-call
-    environment -- the credentials `/v1/sandboxes/{id}/commands` injects, or the
-    code path and result sentinel `coderun.py` reads -- is silently invisible to
-    the script, which then runs against whatever the first caller happened to
-    have. Replacing the mapping wholesale is what makes a forked run match
-    `python script.py`.
+    environment -- the credentials `/v1/sandboxes/{id}/commands` injects -- is
+    silently invisible to the script, which then runs against whatever the
+    first caller happened to have. Replacing the mapping wholesale is what
+    makes a forked run match `python script.py`.
     """
     sys.argv = [path, *argv]
     if env is not None:

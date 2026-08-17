@@ -9,7 +9,6 @@ if TYPE_CHECKING:
     from harborbox.models import Sandbox
     from harborbox.schemas import (
         AgentCommandRequest,
-        AgentExecutionRequest,
         AgentExecutionResponse,
         AgentProcessRequest,
         FileListResponse,
@@ -54,10 +53,6 @@ class SandboxRuntime(Protocol):
     async def start_sandbox(self, sandbox: Sandbox) -> StartedSandbox: ...
 
     async def wait_until_ready(self, sandbox: Sandbox) -> None: ...
-
-    async def execute_code(
-        self, sandbox: Sandbox, request: AgentExecutionRequest
-    ) -> AgentExecutionResponse: ...
 
     async def execute_command(
         self, sandbox: Sandbox, request: AgentCommandRequest
