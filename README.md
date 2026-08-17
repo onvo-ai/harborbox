@@ -304,10 +304,10 @@ host memory - host reserve - platform reserve
 ```
 
 For example, an 8 GiB sandbox budget can run eight 1 GiB sandboxes, four 2 GiB
-sandboxes, or any safe combination. Different sandboxes run concurrently.
-Stateful kernel executions remain exclusive within a sandbox. Shell commands
-may overlap up to `HARBORBOX_MAX_CONCURRENT_EXECUTIONS_PER_SANDBOX`; the
-container's hard memory and CPU limits still bound their combined usage.
+sandboxes, or any safe combination. Different sandboxes run concurrently. Code
+executions remain exclusive within a sandbox. Shell commands may overlap up to
+`HARBORBOX_MAX_CONCURRENT_EXECUTIONS_PER_SANDBOX`; the container's hard memory
+and CPU limits still bound their combined usage.
 
 The `/v1/capacity` endpoint reports current reservations, warm-pool headroom,
 and queue counts.
@@ -414,18 +414,33 @@ It does not create a base64 copy of large uploads. File API absolute paths are
 limited to `/workspace` and `/tmp`; other absolute roots and traversal are
 rejected.
 
-Python code runs as an ordinary command through `/opt/coderun.py`, which
-reproduces the one thing a Jupyter kernel provided that a plain script does
-not: the value of a trailing expression, returned in `results[0].text`. There
-is no persistent interpreter, so the old special case for per-call environment
-variables is gone -- every execution is a fresh forked child and a secret has
-nowhere to linger. Where `/opt/forkrun.py` is present (onvo-pro, onvo-lite) the
-child is forked from a daemon that has already imported pandas, which keeps the
-~1.5 s import off every call.
+### Execution model
 
-Removing the kernel took ~3 s of boot and ~197 MB of resident memory out of
-every onvo-pro and onvo-lite sandbox; see `scripts/bench/` for the harness and
-`scripts/bench/results/` for the measurements.
+**Executions are isolated from one another.** Each `POST /v1/executions` runs in
+its own process, so a name bound by one call is not visible to the next:
+
+```python
+sandbox.run_code("value = 40")
+sandbox.run_code("value + 2")   # NameError, not 42
+```
+
+This changed in 0.3.0. Python used to run on a per-sandbox Jupyter kernel that
+held one namespace, so variables persisted across calls and across a warm
+pause. Serving that cost ~3 s of boot and ~197 MB resident in every onvo-pro
+and onvo-lite sandbox — see `scripts/bench/` for the harness and
+`scripts/bench/results/` for the measurements — and the kernel is gone. Use the
+filesystem to carry state between calls, or send one larger body: within a
+single execution nothing has changed.
+
+Code runs through `/opt/coderun.py`, which reproduces the one thing the kernel
+provided that a plain script does not: the value of a trailing expression,
+returned in `results[0].text`. Where `/opt/forkrun.py` is present (onvo-pro,
+onvo-lite) the child is forked from a daemon that has already imported pandas,
+which keeps the ~1.5 s import off every call.
+
+The old special case for per-call environment variables is gone with the
+interpreter that motivated it — every execution is a fresh forked child, so a
+secret has nowhere to linger.
 
 ## Development
 

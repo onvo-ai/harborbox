@@ -46,24 +46,34 @@ def test_two_sandboxes_run_code_in_parallel(client: SandboxClient) -> None:
         assert first_started < second_finished
         assert second_started < first_finished
 
-        stateful = first.run_code("first_value + 3", wait=True, wait_timeout=30)
-        assert stateful.text == "43"
+        # Executions are isolated from one another. This used to assert the
+        # opposite -- `first_value` set above was still bound here, because a
+        # Jupyter kernel held one namespace per sandbox. Removing the kernel
+        # made every execution a fresh forked child, so cross-call state is
+        # gone deliberately: the filesystem is now the only thing that carries
+        # anything between calls, and the assertions below say so.
+        isolated = first.run_code("first_value + 3", wait=True, wait_timeout=30)
+        assert isolated.status == "failed"
+        assert isolated.error
+        assert isolated.error.name == "NameError", isolated.error
 
         first.files.write("state.txt", "preserved")
         assert first.files.read("state.txt") == "preserved"
 
+        # A warm pause keeps the container, so the workspace is untouched...
         first.pause(memory=True)
         first.resume()
-        warm_state = first.run_code("first_value", wait=True, wait_timeout=30)
-        assert warm_state.text == "40"
+        assert first.files.read("state.txt") == "preserved"
+        warm_state = first.run_code("open('state.txt').read()", wait=True, wait_timeout=30)
+        assert warm_state.text == "'preserved'", warm_state.error
 
+        # ...and a cold pause rebuilds the container from a snapshot, which is
+        # the harder case: files still have to survive it.
         first.pause(memory=False)
         first.resume()
         assert first.files.read("state.txt") == "preserved"
-        cold_state = first.run_code("first_value", wait=True, wait_timeout=30)
-        assert cold_state.status == "failed"
-        assert cold_state.error
-        assert cold_state.error.name == "NameError"
+        cold_state = first.run_code("open('state.txt').read()", wait=True, wait_timeout=30)
+        assert cold_state.text == "'preserved'", cold_state.error
 
         min_reserved_memory_mb = 256
         capacity = client.capacity()
@@ -77,9 +87,9 @@ def test_two_sandboxes_run_code_in_parallel(client: SandboxClient) -> None:
                 "parallel_elapsed_seconds": round(elapsed, 2),
                 "first": first_job.text,
                 "second": second_job.text,
-                "stateful": stateful.text,
-                "warm_pause_state": warm_state.text,
-                "cold_pause_error": cold_state.error.name,
+                "isolated_execution": isolated.error.name,
+                "warm_pause_file": warm_state.text,
+                "cold_pause_file": cold_state.text,
                 "reserved_memory_mb": capacity["reserved_memory_mb"],
             },
         )
