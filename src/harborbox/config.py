@@ -39,7 +39,6 @@ class Settings(BaseSettings):
         "local-development-secret-change-me"
     )
     database_url: str = "postgresql+asyncpg://harborbox:harborbox@postgres/harborbox"
-    runtime_provider: Literal["opensandbox", "docker"] = "opensandbox"
     opensandbox_domain: str = "opensandbox:8080"
     opensandbox_protocol: Literal["http", "https"] = "http"
     opensandbox_api_key: SecretStr = SecretStr("change-me-opensandbox")
@@ -61,34 +60,9 @@ class Settings(BaseSettings):
     relaydeck_image: str = "harborbox-sandbox-relaydeck:local"
     template_image_prefix: str = "harborbox-sandbox"
     template_version: str = "local"
-    # Must match JUPYTER_HOST baked into sandbox/Dockerfile: execd reads the
-    # host from the image's env, and this decides what actually listens.
-    sandbox_jupyter_port: int = Field(default=8888, ge=1, le=65535)
-    templates_without_python: frozenset[str] = frozenset({"relaydeck"})
-    # DEBUG makes the sandbox's Jupyter log every request, which is the only
-    # way to see what execd actually asks for from outside the binary.
-    sandbox_jupyter_log_level: str = "INFO"
-    # Cold sandboxes race their own Jupyter server; execd only retries for
-    # ~12s. Measured cold start is well under a minute, so this is generous
-    # rather than tuned — a sandbox that has not got a kernel by now is broken,
-    # not slow.
-    sandbox_python_ready_timeout_seconds: float = Field(default=120.0, gt=0)
-    # Bounds a single attempt inside that outer deadline. Was a hardcoded 60s
-    # -- nearly the whole outer budget on its own -- until CI evidence from a
-    # cold-resume-via-snapshot showed one attempt occupying the entire
-    # observable window with no second attempt ever logged: a fixed 60s
-    # attempt cap defeats the retry loop's own purpose the moment a single
-    # attempt is merely slow rather than instantly failing. Shorter here
-    # means a transient stall gets an actual retry within the outer budget
-    # instead of exhausting most of it on one attempt, and a genuine hang
-    # surfaces a clear SandboxUnavailableError well before a caller's own
-    # wait budget elapses instead of after it.
-    sandbox_python_ready_attempt_timeout_seconds: float = Field(default=15.0, gt=0)
     sandbox_network: str = "harborbox-net"
     sandbox_egress_network: str | None = None
     sandbox_runtime: str | None = None
-    sandbox_agent_port: int = 8080
-    sandbox_agent_connect_timeout_seconds: float = 30.0
 
     total_memory_mb: int | None = Field(default=None, ge=512)
     host_memory_reserve_percent: int = Field(default=25, ge=5, le=90)
@@ -116,10 +90,10 @@ class Settings(BaseSettings):
     # `Scheduler._ensure_running` catching it -- holds real capacity, unlike
     # a stuck `created` row. Shorter than reaper_stuck_created_after_seconds
     # on purpose: five minutes is generous over every start budget that
-    # feeds into it (opensandbox_ready_timeout_seconds,
-    # lazy_start_wait_timeout_seconds, sandbox_python_ready_timeout_seconds
-    # combined tops out well under this), so anything still `starting` this
-    # long is abandoned, not slow. Defence in depth, not the primary fix.
+    # feeds into it (opensandbox_ready_timeout_seconds and
+    # lazy_start_wait_timeout_seconds combined top out well under this), so
+    # anything still `starting` this long is abandoned, not slow. Defence in
+    # depth, not the primary fix.
     reaper_stuck_starting_after_seconds: int = Field(default=300, ge=30)
     # Long enough that a failure is still there when someone comes to look.
     reaper_failed_retention_hours: int = Field(default=24, ge=1)
@@ -158,22 +132,46 @@ class Settings(BaseSettings):
 
     max_queue_depth: int = Field(default=1000, ge=1)
     max_concurrent_executions_per_sandbox: int = Field(default=1, ge=1, le=32)
+    # Not the tick it used to be. The scheduler is woken by a notification when
+    # something is enqueued (see notify.py); this is the fallback timeout that
+    # makes a missed notification cost one interval instead of stalling, and
+    # the interval on which deferred work is rescanned for capacity.
     scheduler_poll_seconds: float = Field(default=0.25, gt=0)
+    # How long an SSE stream waits before emitting a keepalive. Completion
+    # arrives by notification, so this only bounds silence on the wire.
+    execution_stream_keepalive_seconds: float = Field(default=15.0, gt=0)
     scheduler_scan_limit: int = Field(default=100, ge=1)
     queue_aging_seconds: int = Field(default=60, ge=1)
+    # Caps a queued command's payload. Named for the code endpoint it was
+    # written for; kept under that name so existing deployments' env vars
+    # keep working.
     max_code_bytes: int = Field(default=262_144, ge=1024)
     max_output_bytes: int = Field(default=8_388_608, ge=1024)
     max_upload_bytes: int = Field(default=157_286_400, ge=1024)
     default_execution_timeout_seconds: int = Field(default=30, ge=1)
     max_execution_timeout_seconds: int = Field(default=600, ge=1)
     default_idle_timeout_seconds: int = Field(default=300, ge=0)
+
+    # The hot tier of the idle ladder. A sandbox idle for this long is frozen
+    # (`paused_memory`) rather than snapshotted: CPU is released, the container
+    # and its warm interpreter survive, and resuming is an unfreeze rather than
+    # a fresh container built from a snapshot. It goes cold at
+    # `idle_timeout_seconds` as before, so this only inserts a cheap-to-undo
+    # step in front of the expensive one. 0 disables the tier and restores the
+    # previous running -> paused_cold behaviour.
+    hot_pause_idle_seconds: int = Field(default=60, ge=0)
+    # A frozen sandbox still holds its full memory reservation, so without a cap
+    # the hot tier would quietly consume the admission headroom that live work
+    # needs. Freezing stops at this total and everything above it goes straight
+    # to cold. 0 disables the tier the same way as above.
+    hot_pause_budget_mb: int = Field(default=2048, ge=0)
     # Budget for an HTTP request (a file operation, or a PATCH that touches the
     # sandbox) that lands on a not-yet-running sandbox and triggers the same
-    # lazy start `create_execution` has always benefited from. Sized to match
-    # the full cold-start budget a first execution gets end to end (container
-    # create + agent health), not the much larger kernel-ready budget below --
-    # these callers never touch the kernel. If it elapses the start is not
-    # aborted, only the caller's wait: see `Scheduler.ensure_sandbox_ready`.
+    # lazy start command and process creation have always benefited from. Sized
+    # to match the full cold-start budget a first execution gets end to end:
+    # container create plus health check, which since the kernel's removal is
+    # all there is to wait for. If it elapses the start is not aborted, only the
+    # caller's wait: see `Scheduler.ensure_sandbox_ready`.
     lazy_start_wait_timeout_seconds: float = Field(default=60.0, gt=0)
     reaper_poll_seconds: float = Field(default=5.0, gt=0)
     # How many started-but-unassigned sandboxes to keep ready. 0 disables the
@@ -208,47 +206,25 @@ class Settings(BaseSettings):
     def derived_template_image(self, template: str) -> str:
         return f"{self.template_image_prefix}-{template}:{self.template_version}"
 
-    def entrypoint_for_template(self, template: str | None) -> list[str]:
+    def entrypoint_for_template(self, template: str | None) -> list[str]:  # noqa: ARG002 - see docstring
         """Return what opensandbox runs as the sandbox's bootstrap command.
 
         Not the image's CMD — opensandbox ignores that and runs whatever the
         create request passes, so this is the only place a sandbox's long-lived
         process is decided.
 
-        It has to be a Jupyter server for anything that runs Python. execd
-        executes bash itself but proxies Python to a Jupyter server it reaches
-        via JUPYTER_HOST/JUPYTER_TOKEN, and nothing else starts one: not execd,
-        not the opensandbox server, and not the image, whose CMD is discarded.
-        Both call sites here passed `tail -f /dev/null`, which produces a
-        sandbox that starts, reports healthy, runs bash, and fails every Python
-        execution with a 500 whose only clue is execd logging an empty
-        "Jupyter server host is: ".
+        Every template now idles. This used to branch: anything that ran Python
+        started a Jupyter server here, because execd runs bash itself but
+        proxied Python to a server nothing else would start. That server cost
+        ~3 s of boot and ~197 MB resident in every sandbox to serve one
+        endpoint, `POST /v1/sandboxes/{id}/executions`, which has since been
+        removed outright -- it had no caller. Nothing in the sandbox needs a
+        long-lived process of its own any more, so there is no branch to make.
 
-        Templates that never run Python keep the idle command — relaydeck is
-        sized at 256 MB and installs no Jupyter to start.
+        The `template` argument is kept because callers pass it and a future
+        template may want its own bootstrap; it is deliberately unused today.
         """
-        base = self.base_of_derived_template(template or "") or template
-        if base in self.templates_without_python:
-            return ["tail", "-f", "/dev/null"]
-        return [
-            # Absolute, not `jupyter`: opensandbox execs this through its
-            # bootstrap script, and the venv is only on PATH for the image's
-            # own entrypoint.
-            "/opt/venv/bin/jupyter",
-            "server",
-            "--ip=127.0.0.1",
-            f"--port={self.sandbox_jupyter_port}",
-            "--no-browser",
-            # Empty token: auth off. execd needs JUPYTER_TOKEN set to believe a
-            # Python runtime exists, but never sends it, so a server that
-            # enforces one answers 403 and execd reports "no kernel specs
-            # found". These flags must live here and not only in the image's
-            # CMD — opensandbox discards the image CMD and runs exactly this
-            # list, so a flag added there alone does nothing.
-            "--IdentityProvider.token=",
-            "--ServerApp.disable_check_xsrf=True",
-            f"--ServerApp.log_level={self.sandbox_jupyter_log_level}",
-        ]
+        return ["tail", "-f", "/dev/null"]
 
     def is_known_template_name(self, template: str) -> bool:
         """Whether the name is well-formed. Existence and readiness need the DB."""

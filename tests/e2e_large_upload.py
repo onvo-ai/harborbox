@@ -11,7 +11,7 @@ import pytest
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from harborbox_sdk import SandboxClient
+    from live_client import SandboxClient
 
 
 def upload_chunks(megabytes: int) -> Iterator[bytes]:

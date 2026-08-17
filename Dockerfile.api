@@ -26,7 +26,6 @@ RUN apt-get update \
 
 COPY pyproject.toml README.md /app/
 COPY src/harborbox /app/src/harborbox
-COPY src/harborbox_sdk /app/src/harborbox_sdk
 
 RUN pip install --upgrade pip \
     && pip install .

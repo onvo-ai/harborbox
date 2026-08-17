@@ -100,17 +100,13 @@ class PauseRequest(BaseModel):
     memory: bool = True
 
 
-class CodeExecutionCreate(BaseModel):
-    code: str
-    timeout_seconds: int | None = Field(default=None, ge=1)
-    env: dict[str, str] = Field(default_factory=dict)
-
-
 class CommandCreate(BaseModel):
     command: str
     timeout_seconds: int | None = Field(default=None, ge=1)
     env: dict[str, str] = Field(default_factory=dict)
     cwd: str | None = None
+    wait: bool = False
+    wait_timeout_seconds: int | None = Field(default=None, ge=1)
 
 
 class ProcessCreate(BaseModel):
@@ -121,6 +117,8 @@ class ProcessCreate(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
     secret_env: dict[str, str] = Field(default_factory=dict)
     cwd: str | None = None
+    wait: bool = False
+    wait_timeout_seconds: int | None = Field(default=None, ge=1)
 
 
 class LogOutput(BaseModel):
@@ -152,6 +150,9 @@ class ExecutionError(BaseModel):
 class ExecutionResponse(BaseModel):
     id: str
     sandbox_id: str
+    # "code" is retained for reading only: `POST /v1/sandboxes/{id}/executions`
+    # is gone and nothing produces new code executions, but rows written before
+    # its removal still carry the value and must not 500 on read.
     kind: Literal["code", "command", "process"]
     status: ExecutionStatus
     queue_position: int | None = None
@@ -218,14 +219,7 @@ class CapacityResponse(BaseModel):
     queued_executions: int
 
 
-class AgentExecutionRequest(BaseModel):
-    code: str
-    timeout_seconds: int
-    max_output_bytes: int
-    env: dict[str, str] = Field(default_factory=dict)
-
-
-class AgentCommandRequest(BaseModel):
+class RuntimeCommandRequest(BaseModel):
     command: str
     timeout_seconds: int
     max_output_bytes: int
@@ -233,7 +227,7 @@ class AgentCommandRequest(BaseModel):
     cwd: str | None = None
 
 
-class AgentProcessRequest(BaseModel):
+class RuntimeProcessRequest(BaseModel):
     executable: str
     args: list[str] = Field(default_factory=list)
     stdin: str | None = None
@@ -243,14 +237,14 @@ class AgentProcessRequest(BaseModel):
     cwd: str | None = None
 
 
-class AgentExecutionResponse(BaseModel):
+class RuntimeExecutionResult(BaseModel):
     logs: LogOutput
     results: list[ExecutionResult] = Field(default_factory=list)
     error: ExecutionError | None = None
     exit_code: int | None = None
 
     @model_validator(mode="after")
-    def error_and_exit_are_consistent(self) -> AgentExecutionResponse:
+    def error_and_exit_are_consistent(self) -> RuntimeExecutionResult:
         if self.error is not None and self.exit_code == 0:
             message = "an errored execution cannot have exit_code=0"
             raise ValueError(message)

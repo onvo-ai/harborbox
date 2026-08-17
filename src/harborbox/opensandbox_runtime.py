@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
 import httpx
-from code_interpreter import CodeInterpreter, SupportedLanguage
 from opensandbox import Sandbox as OpenSandbox
 from opensandbox import SandboxManager
 from opensandbox.config import ConnectionConfig
@@ -21,13 +20,9 @@ from opensandbox.exceptions import SandboxApiException, SandboxException
 from opensandbox.models.execd import Execution, ExecutionHandlers, RunCommandOpts
 from opensandbox.models.filesystem import DirectoryListEntry
 
-from harborbox.runtime import SandboxMemoryExceededError, SandboxUnavailableError
+from harborbox.errors import SandboxMemoryExceededError, SandboxUnavailableError
 from harborbox.runtime_protocol import StartedSandbox, WarmPoolReservation
 from harborbox.schemas import (
-    AgentCommandRequest,
-    AgentExecutionRequest,
-    AgentExecutionResponse,
-    AgentProcessRequest,
     ExecutionError,
     ExecutionResult,
     FileEntry,
@@ -36,6 +31,9 @@ from harborbox.schemas import (
     FileUploadResponse,
     FileWriteRequest,
     LogOutput,
+    RuntimeCommandRequest,
+    RuntimeExecutionResult,
+    RuntimeProcessRequest,
 )
 from harborbox.warm_pool import OpenSandboxWarmPools
 
@@ -133,7 +131,7 @@ class _BoundedOutput:
             skip_accumulation=True,
         )
 
-    def response(self, execution: Execution) -> AgentExecutionResponse:
+    def response(self, execution: Execution) -> RuntimeExecutionResult:
         error = self.error
         if error is None and execution.error is not None:
             error = ExecutionError(
@@ -141,7 +139,7 @@ class _BoundedOutput:
                 value=execution.error.value,
                 traceback=list(execution.error.traceback),
             )
-        return AgentExecutionResponse(
+        return RuntimeExecutionResult(
             logs=LogOutput(
                 stdout=self.stdout,
                 stderr=self.stderr,
@@ -269,147 +267,19 @@ class OpenSandboxRuntime:
             await self._raise_runtime_error(exc, sandbox)
 
     async def wait_until_ready(self, sandbox: Sandbox) -> None:
-        """Ready means the container answers — deliberately not the kernel.
+        """Ready means the container answers, which is now all there is to wait for.
 
-        Waiting for Jupyter here cost every sandbox ~6-11s of boot and kernel
-        spawn, and Onvo never uses the kernel: its client uploads a script and
-        runs it through /v1/sandboxes/{id}/commands, reading only stdout. So the
-        whole cost was paid for a capability the one caller does not touch, and
-        it showed up as a ~10x regression on dashboard refreshes.
-
-        `execute_code` waits for the kernel itself, so the callers that do use
-        Python contexts still get a clear failure instead of a race.
+        This used to be a careful distinction: readiness deliberately did not
+        wait for the Jupyter kernel, because doing so cost every sandbox its
+        boot and spawn for a capability the main caller never touched. With the
+        kernel and the endpoint it served both gone, there is no second thing
+        to become ready -- a sandbox that answers can run commands.
         """
         await self._get_handle(sandbox, check_ready=True)
 
-    async def _wait_python_ready(self, sandbox: Sandbox, handle: OpenSandbox) -> None:
-        """Wait for the Jupyter kernel, not just the container.
-
-        opensandbox's health check covers execd, which is up almost
-        immediately. The Jupyter server that execd proxies Python to is started
-        by the sandbox entrypoint *after* execd, and takes an order of
-        magnitude longer to accept connections. execd retries `create_context`
-        for about twelve seconds and then gives up, so a cold sandbox raced its
-        own kernel and returned a 500 that said nothing about why — the only
-        trace being `no kernel specs found` in the sandbox's log.
-
-        Waiting here rather than retrying at execution time keeps the failure
-        in one place: by the time an execution is dispatched the sandbox can
-        actually run Python, or starting it failed and says so.
-
-        A cold-resume-via-snapshot (see `SNAPSHOT_METADATA_KEY`) can be far
-        slower to answer this probe than a fresh container: CI evidence
-        showed one attempt occupy this loop's entire externally-observable
-        window with no second attempt ever logged, because the per-attempt
-        cap used to be nearly as large as the outer deadline itself. See
-        `sandbox_python_ready_attempt_timeout_seconds` for why that changed.
-
-        A 404 from OpenSandbox (`SandboxApiException` with
-        `status_code == HTTPStatus.NOT_FOUND`) is not one of the transient
-        failures this loop exists to ride out, and is handled separately:
-        CI evidence (task 21, round 3) showed this loop retrying against a
-        sandbox that had already been killed and removed by an external
-        caller (the e2e test's own cleanup, once its client-side wait
-        elapsed) for the rest of its 120s budget, producing nothing but
-        repeated, identical "not found" log lines until the deadline. A
-        sandbox that is gone will never come back; that is answered the
-        moment the first 404 arrives, not after riding out the full budget.
-        """
-        template = sandbox.metadata_.get("template")
-        base = self.settings.base_of_derived_template(template or "") or template
-        if base in self.settings.templates_without_python:
-            return
-
-        deadline = (
-            asyncio.get_running_loop().time()
-            + self.settings.sandbox_python_ready_timeout_seconds
-        )
-        last: Exception | None = None
-        while asyncio.get_running_loop().time() < deadline:
-            try:
-                interpreter = await CodeInterpreter.create(handle)
-                # The same call an execution makes, deliberately: a probe on a
-                # different endpoint proved nothing, since only this path goes
-                # through execd to the kernel.
-                async with asyncio.timeout(
-                    self.settings.sandbox_python_ready_attempt_timeout_seconds
-                ):
-                    await interpreter.codes.run(
-                        "pass", language=SupportedLanguage.PYTHON
-                    )
-            except SandboxApiException as exc:
-                if exc.status_code == HTTPStatus.NOT_FOUND:
-                    message = (
-                        "sandbox's OpenSandbox container was not found while "
-                        f"waiting for its Python kernel -- it will not come "
-                        f"back: {exc}"
-                    )
-                    raise SandboxUnavailableError(message) from exc
-                last = exc
-            except Exception as exc:  # noqa: BLE001 - retried until the deadline
-                last = exc
-            else:
-                return
-            logger.warning(
-                "sandbox %s python not ready yet: %s: %s",
-                sandbox.id,
-                type(last).__name__,
-                last,
-            )
-            await asyncio.sleep(1.0)
-        message = (
-            "sandbox started but its Python kernel never became available after "
-            f"{self.settings.sandbox_python_ready_timeout_seconds}s: "
-            # The type matters: several SDK exceptions stringify to nothing.
-            f"{type(last).__name__}: {last}"
-        )
-        raise SandboxUnavailableError(message)
-
-    async def execute_code(
-        self, sandbox: Sandbox, request: AgentExecutionRequest
-    ) -> AgentExecutionResponse:
-        if request.env:
-            return await self._run_command(
-                sandbox,
-                _CommandSpec(
-                    command=shlex.join(["python", "-c", request.code]),
-                    timeout_seconds=request.timeout_seconds,
-                    max_output_bytes=request.max_output_bytes,
-                    environment=request.env,
-                    cwd="/workspace",
-                ),
-            )
-        handle = await self._get_handle(sandbox, check_ready=True)
-        # Paid here rather than at sandbox-ready, so only callers that actually
-        # run Python through a kernel wait for one to exist.
-        await self._wait_python_ready(sandbox, handle)
-        output = _BoundedOutput(request.max_output_bytes)
-        try:
-            interpreter = await CodeInterpreter.create(handle)
-            async with asyncio.timeout(request.timeout_seconds):
-                execution = await interpreter.codes.run(
-                    request.code,
-                    language=SupportedLanguage.PYTHON,
-                    handlers=output.handlers(),
-                )
-            return output.response(execution)
-        except TimeoutError as exc:
-            # A genuine OOM kill and a script that is merely slow look
-            # identical from here: the kernel process dies silently, nothing
-            # on the execd/kernel side reports it back over this connection,
-            # and `codes.run()` simply never returns until this timeout
-            # fires. Check the sandbox's live status before assuming it was
-            # the latter -- see `_detect_memory_exceeded`.
-            if await self._detect_memory_exceeded(sandbox):
-                raise SandboxMemoryExceededError(sandbox.memory_mb) from exc
-            message = f"code execution exceeded {request.timeout_seconds} seconds"
-            raise SandboxUnavailableError(message) from exc
-        except SandboxException as exc:
-            await self._raise_runtime_error(exc, sandbox)
-
     async def execute_command(
-        self, sandbox: Sandbox, request: AgentCommandRequest
-    ) -> AgentExecutionResponse:
+        self, sandbox: Sandbox, request: RuntimeCommandRequest
+    ) -> RuntimeExecutionResult:
         return await self._run_command(
             sandbox,
             _CommandSpec(
@@ -422,8 +292,8 @@ class OpenSandboxRuntime:
         )
 
     async def execute_process(
-        self, sandbox: Sandbox, request: AgentProcessRequest
-    ) -> AgentExecutionResponse:
+        self, sandbox: Sandbox, request: RuntimeProcessRequest
+    ) -> RuntimeExecutionResult:
         command = shlex.join([request.executable, *request.args])
         if request.stdin is not None:
             encoded = base64.b64encode(request.stdin.encode("utf-8")).decode("ascii")
@@ -441,7 +311,7 @@ class OpenSandboxRuntime:
 
     async def _run_command(
         self, sandbox: Sandbox, spec: _CommandSpec
-    ) -> AgentExecutionResponse:
+    ) -> RuntimeExecutionResult:
         handle = await self._get_handle(sandbox, check_ready=True)
         output = _BoundedOutput(spec.max_output_bytes)
         try:
@@ -743,10 +613,10 @@ class OpenSandboxRuntime:
         regardless of `state` -- it used to return `False` outright whenever
         `state == "running"` on the theory that a live container could not
         have died. CI evidence from a real OOM disproved that: the Linux OOM
-        killer targets the memory-hungry *process* (the Jupyter kernel, here)
-        inside the container's cgroup, not necessarily the container's own
-        PID 1 (execd) -- so the kernel dies, the container and its `execd`
-        keep running, and `get_sandbox_info` reports `state: running`
+        killer targets the memory-hungry *process* inside the container's
+        cgroup -- the command's own interpreter -- not necessarily the
+        container's own PID 1 (execd), so that process dies, the container
+        and its `execd` keep running, and `get_sandbox_info` reports `running`
         throughout. That call is answering "is the container up," which is a
         different question from "did something inside it just get killed."
         Whatever `reason`/`message` do or do not say is checked either way
@@ -777,9 +647,8 @@ class OpenSandboxRuntime:
         which this pass could not confirm without a live stack to test it
         against.
 
-        This is a diagnostic on the error path of all 14 call sites of
-        `_raise_runtime_error`, one of them (`execute_code`'s own timeout
-        branch) already reached by a caller who has been waiting. Without an
+        This is a diagnostic on the error path of every `_raise_runtime_error`
+        call site, reached by a caller who has already been waiting. Without an
         explicit short bound it would inherit
         `ConnectionConfig.request_timeout`
         (`opensandbox_ready_timeout_seconds`, 30s by default), turning a

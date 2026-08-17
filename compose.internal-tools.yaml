@@ -94,9 +94,10 @@ services:
   #
   # which Trigger surfaced to the dashboard as "Harborbox sandbox failed to
   # become ready" on every widget. A *running* container is the reference prune
-  # honours, so each build target now holds its own image open. `tail -f` and
-  # not the image's own CMD: sandbox/Dockerfile starts a Jupyter server, and
-  # paying ~150MB three times over to pin three tags would be absurd.
+  # honours, so each build target now holds its own image open. The explicit
+  # `tail -f` is now the same thing the image's own CMD does; it is kept
+  # because a keeper container's job is to hold a tag open as cheaply as
+  # possible regardless of what the image decides to run later.
   sandbox-onvo-pro-image:
     image: harborbox-sandbox-onvo-pro:${HARBORBOX_IMAGE_TAG:-local}
     build:
@@ -216,7 +217,6 @@ services:
       # no uvicorn, `CMD ["tail","-f","/dev/null"]` — because execd runs the
       # code. DockerRuntime polls a harborbox agent on :8080 that those images
       # do not contain, so `docker` needs different images, not just this flag.
-      HARBORBOX_RUNTIME_PROVIDER: opensandbox
       HARBORBOX_OPENSANDBOX_DOMAIN: opensandbox:8080
       HARBORBOX_OPENSANDBOX_PROTOCOL: http
       # opensandbox v0.2.2's proxy 500s on execd's streaming /code endpoint

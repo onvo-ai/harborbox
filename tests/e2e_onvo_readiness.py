@@ -10,7 +10,7 @@ import pytest
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from harborbox_sdk import Sandbox, SandboxClient
+    from live_client import Sandbox, SandboxClient
 
 
 def timestamp(value: str | None) -> datetime:

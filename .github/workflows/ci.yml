@@ -30,8 +30,13 @@ jobs:
           POSTGRES_USER: harborbox
           POSTGRES_PASSWORD: harborbox
           POSTGRES_DB: harborbox_test
+        # -d is not optional here: pg_isready defaults the database name to the
+        # user name, so without it the probe asks for a `harborbox` database
+        # that POSTGRES_DB never creates. It still reports healthy -- the server
+        # answering is all pg_isready tests -- but it logs a FATAL every 5s and
+        # never touches the database the tests actually use.
         options: >-
-          --health-cmd "pg_isready -U harborbox"
+          --health-cmd "pg_isready -U harborbox -d harborbox_test"
           --health-interval 5s --health-timeout 5s --health-retries 20
         ports: ["5432:5432"]
 
@@ -136,8 +141,16 @@ jobs:
       - name: Start the stack
         run: docker compose up -d --wait
 
+      # --capture=tee-sys, not the default: pytest replays a test's stdout only
+      # when it fails, so e2e_pause_ladder's measured transition times -- the
+      # entire reason that suite exists -- were invisible on a green run, and
+      # e2e_smoke's own summary print had the same problem. tee-sys passes
+      # output through to the job log *and* keeps capturing it, so the json
+      # report is unaffected.
       - name: Run the e2e suites
-        run: uv run pytest -m e2e --json-report --json-report-file=e2e-results.json
+        run: >-
+          uv run pytest -m e2e --capture=tee-sys
+          --json-report --json-report-file=e2e-results.json
 
       - name: Stack logs on failure
         if: failure()

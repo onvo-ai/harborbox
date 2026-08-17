@@ -22,8 +22,8 @@ from harborbox import scheduler as scheduler_module
 from harborbox.api import app
 from harborbox.config import Settings
 from harborbox.db import Base, get_session
+from harborbox.errors import SandboxUnavailableError
 from harborbox.models import Sandbox
-from harborbox.runtime import SandboxUnavailableError
 from harborbox.runtime_protocol import StartedSandbox, WarmPoolReservation
 from harborbox.schemas import (
     FileListResponse,

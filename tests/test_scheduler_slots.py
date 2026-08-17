@@ -1,43 +1,26 @@
+"""Per-sandbox execution slots.
+
+This used to encode a second rule: code executions ran on one shared Jupyter
+namespace per sandbox, so they were exclusive and blocked everything else.
+`POST /v1/sandboxes/{id}/executions` has been removed -- it had no caller --
+so every execution is now an ordinary process and concurrency is the only
+limit left.
+"""
+
+from __future__ import annotations
+
 from harborbox.scheduler import has_sandbox_execution_slot
 
 
-def test_commands_can_share_a_sandbox_up_to_the_limit() -> None:
-    assert has_sandbox_execution_slot(
-        kind="command",
-        active_count=2,
-        active_code=False,
-        limit=4,
-    )
-    assert not has_sandbox_execution_slot(
-        kind="command",
-        active_count=4,
-        active_code=False,
-        limit=4,
-    )
-    assert has_sandbox_execution_slot(
-        kind="process",
-        active_count=2,
-        active_code=False,
-        limit=4,
-    )
+def test_an_idle_sandbox_has_a_slot() -> None:
+    assert has_sandbox_execution_slot(active_count=0, limit=1)
 
 
-def test_kernel_code_remains_exclusive() -> None:
-    assert not has_sandbox_execution_slot(
-        kind="code",
-        active_count=1,
-        active_code=False,
-        limit=4,
-    )
-    assert not has_sandbox_execution_slot(
-        kind="command",
-        active_count=1,
-        active_code=True,
-        limit=4,
-    )
-    assert has_sandbox_execution_slot(
-        kind="code",
-        active_count=0,
-        active_code=False,
-        limit=4,
-    )
+def test_a_sandbox_at_its_limit_has_none() -> None:
+    assert not has_sandbox_execution_slot(active_count=1, limit=1)
+
+
+def test_concurrency_above_one_allows_overlap() -> None:
+    """The setting that makes two shell commands share a sandbox."""
+    assert has_sandbox_execution_slot(active_count=1, limit=2)
+    assert not has_sandbox_execution_slot(active_count=2, limit=2)

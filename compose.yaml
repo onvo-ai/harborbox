@@ -122,7 +122,6 @@ services:
       HARBORBOX_API_KEY: ${HARBORBOX_API_KEY:-change-me}
       HARBORBOX_EXECUTION_SECRET_KEY: ${HARBORBOX_EXECUTION_SECRET_KEY:-local-development-secret-change-me}
       HARBORBOX_DATABASE_URL: postgresql+asyncpg://harborbox:${POSTGRES_PASSWORD:-harborbox}@postgres/harborbox
-      HARBORBOX_RUNTIME_PROVIDER: opensandbox
       HARBORBOX_OPENSANDBOX_DOMAIN: opensandbox:8080
       HARBORBOX_OPENSANDBOX_PROTOCOL: http
       HARBORBOX_OPENSANDBOX_API_KEY: ${OPENSANDBOX_API_KEY:-change-me-opensandbox}

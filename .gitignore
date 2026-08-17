@@ -8,6 +8,8 @@ __pycache__/
 *.py[cod]
 dist/
 build/
+# Installed when typechecking the TypeScript SDK; never part of a commit.
+node_modules/
 .coverage
 htmlcov/
 

@@ -1,0 +1,65 @@
+{
+  "csv_bytes": 105018115,
+  "script": "noop.py",
+  "repeats": 7,
+  "python": "/tmp/claude-0/-home-user-harborbox/0b22d8a5-92dc-51b8-94ea-c836fcf2472a/scratchpad/benchvenv/bin/python",
+  "variants": [
+    {
+      "name": "cold",
+      "cold_start_seconds": 0.4038285149999865,
+      "boot_seconds": 0.0,
+      "first_execution_seconds": 0.4038285149999865,
+      "warm_seconds": 0.4093059380001023,
+      "warm_samples": [
+        0.4472570550000228,
+        0.4158988149999914,
+        0.4396484669999836,
+        0.39574943299999177,
+        0.40181855800005906,
+        0.4093059380001023,
+        0.3915346890000819
+      ],
+      "body_seconds": 0.0011,
+      "substrate_rss_mb": 0.0,
+      "note": "no substrate; every run re-imports pandas"
+    },
+    {
+      "name": "jupyter",
+      "cold_start_seconds": 3.236135850999972,
+      "boot_seconds": 2.9500750549999566,
+      "first_execution_seconds": 0.2860607960000152,
+      "warm_seconds": 0.007244216000003689,
+      "warm_samples": [
+        0.008528781999984858,
+        0.008121858999970755,
+        0.007244216000003689,
+        0.0071739589999424425,
+        0.006907153000042854,
+        0.007278977999931158,
+        0.007182718999956705
+      ],
+      "body_seconds": NaN,
+      "substrate_rss_mb": 197.2,
+      "note": "server boot 2.01s + kernel spawn 0.94s; shared namespace across runs"
+    },
+    {
+      "name": "forkrun",
+      "cold_start_seconds": 0.4184412989999373,
+      "boot_seconds": 0.36264865999999074,
+      "first_execution_seconds": 0.055792638999946575,
+      "warm_seconds": 0.055792638999946575,
+      "warm_samples": [
+        0.055792638999946575,
+        0.057906709999997474,
+        0.05671062899989465,
+        0.05428852199997891,
+        0.05476001299996369,
+        0.05494736900004682,
+        0.057149630999902
+      ],
+      "body_seconds": 0.0045,
+      "substrate_rss_mb": 0.0,
+      "note": "daemon pre-imports pandas/numpy; each run is a forked pristine child"
+    }
+  ]
+}

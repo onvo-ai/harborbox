@@ -1,6 +1,6 @@
 from typing import Any
 
-from harborbox_sdk.models import Execution
+from live_client.models import Execution
 
 
 class FakeClient:

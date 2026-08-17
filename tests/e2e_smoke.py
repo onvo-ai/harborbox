@@ -9,7 +9,12 @@ from typing import TYPE_CHECKING
 import pytest
 
 if TYPE_CHECKING:
-    from harborbox_sdk import SandboxClient
+    from live_client import SandboxClient
+
+# Absolute: opensandbox runs commands through its own bootstrap, and the venv
+# is only on PATH for the image's entrypoint.
+PYTHON = "/opt/venv/bin/python"
+READ_STATE = "cat /workspace/state.txt"
 
 
 # XFAIL, not a passing budget fix. Task 21 (see task-21-fix-report.md,
@@ -58,7 +63,7 @@ if TYPE_CHECKING:
     strict=False,
 )
 @pytest.mark.e2e
-def test_two_sandboxes_run_code_in_parallel(client: SandboxClient) -> None:
+def test_two_sandboxes_execute_in_parallel(client: SandboxClient) -> None:
     first = client.sandboxes.create(
         template="onvo-lite", memory_mb=128, cpu=1, idle_timeout_seconds=60
     )
@@ -67,19 +72,19 @@ def test_two_sandboxes_run_code_in_parallel(client: SandboxClient) -> None:
     )
     try:
         started = time.monotonic()
-        first_job = first.run_code(
-            "import time; time.sleep(2); first_value = 40; first_value + 2",
+        first_job = first.commands.run(
+            f"{PYTHON} -c 'import time; time.sleep(2); print(40 + 2)'",
             wait=False,
         )
-        second_job = second.run_code(
-            "import time; time.sleep(2); second_value = 5; second_value * 2",
+        second_job = second.commands.run(
+            f"{PYTHON} -c 'import time; time.sleep(2); print(5 * 2)'",
             wait=False,
         )
         first_job.wait(timeout=60, raise_on_error=True)
         second_job.wait(timeout=60, raise_on_error=True)
         elapsed = time.monotonic() - started
-        assert first_job.text == "42", first_job.error
-        assert second_job.text == "10", second_job.error
+        assert "".join(first_job.logs.stdout).strip() == "42", first_job.error
+        assert "".join(second_job.logs.stdout).strip() == "10", second_job.error
         assert first_job.started_at
         assert first_job.finished_at
         assert second_job.started_at
@@ -91,31 +96,27 @@ def test_two_sandboxes_run_code_in_parallel(client: SandboxClient) -> None:
         assert first_started < second_finished
         assert second_started < first_finished
 
-        stateful = first.run_code("first_value + 3", wait=True, wait_timeout=30)
-        assert stateful.text == "43"
-
         first.files.write("state.txt", "preserved")
         assert first.files.read("state.txt") == "preserved"
 
+        # A warm pause keeps the container, so the workspace is untouched...
         first.pause(memory=True)
         first.resume()
-        warm_state = first.run_code("first_value", wait=True, wait_timeout=30)
-        assert warm_state.text == "40"
+        assert first.files.read("state.txt") == "preserved"
+        warm_state = first.commands.run(READ_STATE, wait=True, wait_timeout=30)
+        assert "".join(warm_state.logs.stdout).strip() == "preserved", warm_state.error
 
+        # ...and a cold pause rebuilds the container from a snapshot, which is
+        # the harder case: files still have to survive it.
         first.pause(memory=False)
         first.resume()
         assert first.files.read("state.txt") == "preserved"
-        # 60s here (matching the first cold start's own budget above) is
-        # necessary but not sufficient: this whole test is marked xfail
-        # above because the sandbox is lost during this cold pause/resume
-        # cycle regardless of how long is given here. Kept at 60s rather
-        # than reverted to 30s because that inconsistency was a real,
-        # separate defect (fixed in round 1) even though it was never what
-        # actually made this test fail.
-        cold_state = first.run_code("first_value", wait=True, wait_timeout=60)
-        assert cold_state.status == "failed"
-        assert cold_state.error
-        assert cold_state.error.name == "NameError"
+        # 60s, matching the first cold start's own budget above rather than
+        # the 30s used for the warm case. That inconsistency was a real defect
+        # in its own right (main, round 1); it was never what made this test
+        # fail, and the xfail above still stands on its own reason.
+        cold_state = first.commands.run(READ_STATE, wait=True, wait_timeout=60)
+        assert "".join(cold_state.logs.stdout).strip() == "preserved", cold_state.error
 
         min_reserved_memory_mb = 256
         capacity = client.capacity()
@@ -127,11 +128,10 @@ def test_two_sandboxes_run_code_in_parallel(client: SandboxClient) -> None:
             "e2e ok:",
             {
                 "parallel_elapsed_seconds": round(elapsed, 2),
-                "first": first_job.text,
-                "second": second_job.text,
-                "stateful": stateful.text,
-                "warm_pause_state": warm_state.text,
-                "cold_pause_error": cold_state.error.name,
+                "first": "".join(first_job.logs.stdout).strip(),
+                "second": "".join(second_job.logs.stdout).strip(),
+                "warm_pause_file": "".join(warm_state.logs.stdout).strip(),
+                "cold_pause_file": "".join(cold_state.logs.stdout).strip(),
                 "reserved_memory_mb": capacity["reserved_memory_mb"],
             },
         )

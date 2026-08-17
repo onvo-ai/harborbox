@@ -8,14 +8,13 @@ if TYPE_CHECKING:
 
     from harborbox.models import Sandbox
     from harborbox.schemas import (
-        AgentCommandRequest,
-        AgentExecutionRequest,
-        AgentExecutionResponse,
-        AgentProcessRequest,
         FileListResponse,
         FileReadResponse,
         FileUploadResponse,
         FileWriteRequest,
+        RuntimeCommandRequest,
+        RuntimeExecutionResult,
+        RuntimeProcessRequest,
     )
 
 
@@ -36,9 +35,10 @@ class SandboxRuntime(Protocol):
     """Runtime-neutral lifecycle and execution boundary.
 
     The shape follows the OpenSandbox split between lifecycle operations and
-    in-sandbox execution. Docker is the current provider; a remote OpenSandbox
-    or Kubernetes provider can implement this protocol without changing the
-    scheduler, admission controller, API, or Relaydeck.
+    in-sandbox execution. OpenSandbox is the only provider; the protocol stays
+    because it is what the scheduler, admission controller, API and Relaydeck
+    are written against, so a Kubernetes or remote provider is an addition here
+    rather than a change to any of them.
     """
 
     async def start(self) -> None: ...
@@ -55,17 +55,13 @@ class SandboxRuntime(Protocol):
 
     async def wait_until_ready(self, sandbox: Sandbox) -> None: ...
 
-    async def execute_code(
-        self, sandbox: Sandbox, request: AgentExecutionRequest
-    ) -> AgentExecutionResponse: ...
-
     async def execute_command(
-        self, sandbox: Sandbox, request: AgentCommandRequest
-    ) -> AgentExecutionResponse: ...
+        self, sandbox: Sandbox, request: RuntimeCommandRequest
+    ) -> RuntimeExecutionResult: ...
 
     async def execute_process(
-        self, sandbox: Sandbox, request: AgentProcessRequest
-    ) -> AgentExecutionResponse: ...
+        self, sandbox: Sandbox, request: RuntimeProcessRequest
+    ) -> RuntimeExecutionResult: ...
 
     async def read_file(self, sandbox: Sandbox, path: str) -> FileReadResponse: ...
 

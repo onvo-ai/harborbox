@@ -1,21 +1,22 @@
 """The deployed compose must agree with what the code actually does.
 
-This exists because of a real outage. `compose.internal-tools.yaml` never set
-`HARBORBOX_RUNTIME_PROVIDER`, which was harmless for as long as the API
-constructed `DockerRuntime` directly in its lifespan and never read the setting.
-0.2.0 introduced `create_runtime()`, which honours it — and its default is
-`opensandbox`. The deploy came up healthy, reported the right version, and
-listed all three templates as ready, while every single sandbox creation died at
-`[Errno -3] Temporary failure in name resolution` dialling a service that does
-not run on that host.
+This exists because of a real outage. A deploy came up healthy, reported the
+right version, and listed all three templates as ready, while every single
+sandbox creation died at `[Errno -3] Temporary failure in name resolution`
+dialling an OpenSandbox server that does not run on that host.
 
 Every check that could be done without creating a sandbox passed. So the thing
 worth pinning is not the code and not the YAML in isolation, but the agreement
 between them: feed the compose file's own environment into `Settings` and assert
 the resulting behaviour matches what the host can actually provide.
+
+The outage was originally reached through a runtime-provider setting that chose
+between OpenSandbox and an in-sandbox Docker agent. That setting and that agent
+are gone -- OpenSandbox is the only runtime -- but the failure this pins never
+depended on the choice, only on whether the host answers to the name the API
+dials.
 """
 
-import inspect
 import re
 from pathlib import Path
 
@@ -23,7 +24,6 @@ import pytest
 import yaml
 
 from harborbox.config import Settings
-from harborbox.opensandbox_runtime import OpenSandboxRuntime
 from harborbox.schemas import SandboxCreate
 
 COMPOSE = Path(__file__).resolve().parent.parent / "compose.internal-tools.yaml"
@@ -69,47 +69,30 @@ def built_images(compose: dict) -> set[str]:
     }
 
 
-def test_the_configured_runtime_provider_is_actually_provided(
+def test_the_opensandbox_server_the_api_dials_is_actually_run(
     compose: dict, settings: Settings
 ) -> None:
-    """The outage, pinned — and its mirror image.
+    """The outage, pinned.
 
-    Both halves of this bit once, in opposite directions:
-
-    `opensandbox` needs a server to talk to. The file did not run one, and the
+    OpenSandbox needs a server to talk to. The file did not run one, and the
     API dialled a hostname that did not resolve, so no container was ever
     created.
-
-    `docker` needs images that answer on :8080. 0.2.0's templates ship no
-    agent — no fastapi, no uvicorn, `CMD ["tail","-f","/dev/null"]` — so
-    switching the flag without changing the images produces sandboxes that
-    start, sit there, and fail every execution with "agent did not become
-    ready". That looks like a network fault and is not one.
     """
-    if settings.runtime_provider == "opensandbox":
-        host = settings.opensandbox_domain.split(":")[0]
-        names = set(compose["services"])
-        # `networks:` is a bare list on some services and a mapping on others.
-        aliases = set()
-        for svc in compose["services"].values():
-            nets = svc.get("networks")
-            if not isinstance(nets, dict):
-                continue
-            for net in nets.values():
-                if isinstance(net, dict):
-                    aliases.update(net.get("aliases") or [])
-        assert host in names | aliases, (
-            f"runtime_provider is opensandbox and the API dials {host!r}, but "
-            f"no service or alias in {COMPOSE.name} answers to that name."
-        )
-    else:
-        agent_deps = Path(__file__).resolve().parent.parent / "sandbox"
-        for req in agent_deps.glob("requirements-*.txt"):
-            body = req.read_text()
-            assert "uvicorn" in body, (
-                f"runtime_provider is docker, which polls a harborbox agent on "
-                f":8080, but {req.name} installs no uvicorn to serve it."
-            )
+    host = settings.opensandbox_domain.split(":")[0]
+    names = set(compose["services"])
+    # `networks:` is a bare list on some services and a mapping on others.
+    aliases = set()
+    for svc in compose["services"].values():
+        nets = svc.get("networks")
+        if not isinstance(nets, dict):
+            continue
+        for net in nets.values():
+            if isinstance(net, dict):
+                aliases.update(net.get("aliases") or [])
+    assert host in names | aliases, (
+        f"the API dials {host!r}, but no service or alias in {COMPOSE.name} "
+        f"answers to that name."
+    )
 
 
 def test_every_static_template_resolves_to_an_image_that_gets_built(
@@ -184,61 +167,43 @@ def test_onvo_pro_sizing_fits_the_configured_cpu_budget(settings: Settings) -> N
     )
 
 
-def test_python_kernelspec_is_registered_under_the_language_name() -> None:
-    """Execd looks a kernel up by the language it was asked for.
+@pytest.mark.parametrize("template", ["relaydeck", "onvo-pro", "onvo-lite"])
+def test_no_template_starts_a_long_lived_process(template: str) -> None:
+    """Every sandbox idles until asked to do something.
 
-    The SDK's default context language is `python`, and execd resolves that
-    against Jupyter's kernelspec *names*. `ipykernel install` registers
-    `python3` only, so execd fetched `/api/kernelspecs`, got a 200 listing
-    python3, found nothing called `python`, and reported `no kernel specs
-    found` — which reads like Jupyter is missing and is really a name mismatch.
-    Registering both names is what made execution work.
+    Templates that ran Python used to boot a Jupyter server here, because execd
+    runs bash itself but proxied Python to a server nothing else would start.
+    Measured (scripts/bench/), that server cost ~3 s of boot and ~197 MB
+    resident in every sandbox, to serve one endpoint that now runs Python as an
+    ordinary command. A template that grows a bootstrap process again should
+    have to justify it against those numbers.
     """
-    dockerfile = (
-        Path(__file__).resolve().parent.parent / "sandbox" / "Dockerfile"
-    ).read_text()
-
-    assert "--name python3" in dockerfile
-    assert "--name python " in dockerfile, (
-        "only python3 is registered; execd asks for a kernel named 'python' "
-        "and will report 'no kernel specs found'"
-    )
+    assert Settings().entrypoint_for_template(template) == ["tail", "-f", "/dev/null"]
 
 
-def test_jupyter_flags_live_in_the_entrypoint_not_only_the_image() -> None:
-    """Opensandbox discards the image CMD and runs the create request's list.
+def test_no_template_image_installs_a_python_kernel() -> None:
+    """The kernel stack is gone from the images, not just unused by the code.
 
-    Flags added to the Dockerfile alone silently do nothing, which cost an
-    afternoon: token auth stayed on because `--IdentityProvider.token=` was in
-    the CMD and not in what actually ran.
+    Leaving jupyter-server and ipykernel installed would keep paying the image
+    size and the CVE surface for a path nothing takes, and would let the
+    entrypoint quietly regrow a server that appears to work.
     """
-    entrypoint = Settings().entrypoint_for_template("onvo-pro")
-
-    assert entrypoint[0].endswith("jupyter")
-    assert "--IdentityProvider.token=" in entrypoint
-
-
-def test_sandbox_readiness_does_not_wait_for_a_jupyter_kernel() -> None:
-    """Readiness must not include the kernel, because Onvo never uses it.
-
-    Onvo's client uploads a script and runs it through
-    /v1/sandboxes/{id}/commands, reading only stdout — the Jupyter path is
-    never touched. Waiting for a kernel in `wait_until_ready` therefore charged
-    every sandbox ~6-11s of Jupyter boot and kernel spawn for a capability the
-    only caller does not use, and turned a dashboard refresh from ~15s a batch
-    into ~190s.
-
-    `execute_code` still waits, so callers that do run Python through a kernel
-    get a clear failure rather than a race.
-    """
-    ready = inspect.getsource(OpenSandboxRuntime.wait_until_ready)
-    execute = inspect.getsource(OpenSandboxRuntime.execute_code)
-
-    assert "_wait_python_ready" not in ready, (
-        "wait_until_ready waits for a Jupyter kernel again; that cost is paid "
-        "by every sandbox, including the ones that only ever run commands."
-    )
-    assert "_wait_python_ready" in execute
+    sandbox_dir = Path(__file__).resolve().parent.parent / "sandbox"
+    template_requirements = [
+        sandbox_dir / "requirements-onvo-pro.txt",
+        sandbox_dir / "requirements-onvo-lite.txt",
+        sandbox_dir / "requirements-relaydeck.txt",
+    ]
+    for requirements in template_requirements:
+        installed = [
+            line.split("#", 1)[0].strip().lower()
+            for line in requirements.read_text().splitlines()
+        ]
+        for forbidden in ("jupyter-server", "ipykernel", "jupyter-client"):
+            assert not any(line.startswith(forbidden) for line in installed), (
+                f"{requirements.name} still installs {forbidden}; "
+                "no template runs a kernel any more"
+            )
 
 
 def test_forkrun_is_installed_in_the_sandbox_image() -> None:

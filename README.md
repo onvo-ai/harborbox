@@ -24,13 +24,12 @@ client -> Harborbox API -> PostgreSQL queue -> scheduler -> OpenSandbox -> runti
 - Live available-memory emergency guard
 - FIFO scheduling with bounded backfilling and aging
 - Upstream OpenSandbox lifecycle, execution, filesystem, and snapshot APIs
-- Stateful Python execution through OpenSandbox Code Interpreter
+- Python execution as an ordinary command, with no kernel in the sandbox
 - Queued shell commands
 - Queued argv-safe process execution with per-call secret environments
 - File read, write, list, and remove operations
 - Hard OpenSandbox memory and CPU limits plus bounded Harborbox output and uploads
 - Warm pause, cold pause, resume, kill, and idle cold suspension
-- Sync Python SDK
 - E2B-shaped TypeScript SDK
 - Streaming binary uploads with exact `/workspace` and `/tmp` paths
 - OpenSandbox egress, credential vault, and secure runtime compatibility
@@ -203,54 +202,6 @@ The API joins the explicitly named `harborbox-control` network with the alias
 an external network and use `HARBORBOX_BASE_URL=http://harborbox-api:8000`;
 the host port remains bound to loopback.
 
-## Python SDK
-
-Install the project locally:
-
-```bash
-uv sync
-```
-
-Then:
-
-```python
-from harborbox_sdk import SandboxClient
-
-client = SandboxClient(
-    "http://localhost:8000",
-    api_key="your-api-key",
-)
-
-with client.sandboxes.create(
-    template="onvo-pro",
-    memory_mb=1024,
-    cpu=2,
-) as sandbox:
-    result = sandbox.run_code(
-        """
-x = 40
-print("calculating")
-x + 2
-"""
-    )
-    print(result.text)
-    print(result.logs.stdout)
-
-    command = sandbox.commands.run("python --version")
-    print(command.logs.stdout)
-
-    sandbox.files.write("hello.txt", "persistent workspace")
-    sandbox.files.write_bytes("/tmp/input.bin", b"\x00\x01")
-```
-
-Submit without blocking:
-
-```python
-job = sandbox.run_code("sum(range(10_000_000))", wait=False)
-print(job.status, job.queue_position)
-result = job.wait(timeout=300)
-```
-
 ## TypeScript SDK
 
 Build the server-side SDK:
@@ -305,21 +256,36 @@ host memory - host reserve - platform reserve
 
 For example, an 8 GiB sandbox budget can run eight 1 GiB sandboxes, four 2 GiB
 sandboxes, or any safe combination. Different sandboxes run concurrently.
-Stateful kernel executions remain exclusive within a sandbox. Shell commands
-may overlap up to `HARBORBOX_MAX_CONCURRENT_EXECUTIONS_PER_SANDBOX`; the
-container's hard memory and CPU limits still bound their combined usage.
+Executions within one sandbox may overlap up to
+`HARBORBOX_MAX_CONCURRENT_EXECUTIONS_PER_SANDBOX`; the container's hard memory
+and CPU limits still bound their combined usage.
 
 The `/v1/capacity` endpoint reports current reservations, warm-pool headroom,
 and queue counts.
 
 ### Pause behavior
 
-- `sandbox.pause(memory=True)` delegates to OpenSandbox pause. On Docker, kernel
-  variables and processes survive and the full memory remains reserved.
+- `sandbox.pause(memory=True)` delegates to OpenSandbox pause. On Docker,
+  processes survive and the full memory remains reserved. Resuming is an
+  unfreeze, which is the only resume path that is plausibly sub-second.
 - `sandbox.pause(memory=False)` creates an OpenSandbox filesystem snapshot and
-  terminates the runtime. CPU and memory are released; files survive, while live
-  processes and in-memory interpreter variables do not.
-- Idle sandboxes cold-pause after `idle_timeout_seconds` unless the value is `0`.
+  terminates the runtime. CPU and memory are released; files survive, live
+  processes do not. Resuming builds a new container from the snapshot, which
+  costs seconds.
+
+Idle sandboxes walk down both tiers rather than dropping straight to cold:
+
+```text
+running --(hot_pause_idle_seconds)--> paused_memory --(idle_timeout_seconds)--> paused_cold
+```
+
+Freezing first keeps the container for a sandbox that is used again shortly
+afterwards, while anything genuinely finished still goes cold on the same
+`idle_timeout_seconds` as before. Because a frozen sandbox holds its whole
+memory reservation, the tier is capped by `HARBORBOX_HOT_PAUSE_BUDGET_MB`;
+past the cap, sandboxes go straight to cold. Set
+`HARBORBOX_HOT_PAUSE_IDLE_SECONDS=0` to disable the tier entirely and restore
+the previous behavior. `idle_timeout_seconds: 0` still means "never suspend".
 
 ## Parent-machine protection
 
@@ -355,7 +321,6 @@ POST   /v1/sandboxes/{id}/pause
 POST   /v1/sandboxes/{id}/resume
 DELETE /v1/sandboxes/{id}
 
-POST   /v1/sandboxes/{id}/executions
 POST   /v1/sandboxes/{id}/commands
 POST   /v1/sandboxes/{id}/processes
 GET    /v1/executions/{id}
@@ -387,16 +352,38 @@ status.
 the derived registry. Static entries have a null `spec_hash` and a `status` of
 `ready`.
 
+`POST .../commands` and `.../processes` accept
+`"wait": true`, which holds the connection until the execution finishes and
+answers `200` with the result instead of `202` with a job id. If the execution
+outlives the wait the response is still `202`, so a client that asked to wait
+and ran out of patience simply polls as before. Both SDKs send it by default.
+
 `PUT .../files/content?path=/tmp/file.bin` accepts
 `application/octet-stream` and streams the request through the control plane.
 It does not create a base64 copy of large uploads. File API absolute paths are
 limited to `/workspace` and `/tmp`; other absolute roots and traversal are
 rejected.
 
-Python code without an environment override uses OpenSandbox's persistent
-interpreter context. Code carrying per-call environment variables is executed as
-an isolated `python -c` process so credentials do not remain in the persistent
-interpreter.
+### Execution model
+
+Python runs as an ordinary command. There is no interpreter service in the
+sandbox and no cross-call state: upload a script and run it, or run
+`python -c`, through `POST /v1/sandboxes/{id}/commands`.
+
+`POST /v1/sandboxes/{id}/executions` was removed in 0.3.0 along with the
+Jupyter kernel behind it. The kernel held one namespace per sandbox, which cost
+~3 s of boot and ~197 MB resident in every onvo-pro and onvo-lite sandbox —
+see `scripts/bench/` for the harness and `scripts/bench/results/` for the
+measurements — and the endpoint had no caller: the TypeScript SDK only ever
+read `GET /v1/executions/{id}`, and Onvo uploads a script and runs it through
+`/commands`. `GET /v1/executions/{id}` and its `/events` and `/cancel`
+siblings are unaffected; they serve commands and processes.
+
+Where `/opt/forkrun.py` is present (onvo-pro, onvo-lite) a script is forked
+from a daemon that has already imported pandas, keeping the ~1.5 s import off
+every call. It is transparent — a forked run matches `python script.py`,
+including its environment and exit code — and absent, the script simply runs
+normally.
 
 ## Development
 

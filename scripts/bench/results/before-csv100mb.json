@@ -1,0 +1,59 @@
+{
+  "csv_bytes": 105018115,
+  "script": "analysis.py",
+  "repeats": 5,
+  "python": "/tmp/claude-0/-home-user-harborbox/0b22d8a5-92dc-51b8-94ea-c836fcf2472a/scratchpad/benchvenv/bin/python",
+  "variants": [
+    {
+      "name": "cold",
+      "cold_start_seconds": 4.675848135000024,
+      "boot_seconds": 0.0,
+      "first_execution_seconds": 4.675848135000024,
+      "warm_seconds": 4.6224631499999305,
+      "warm_samples": [
+        4.6224631499999305,
+        4.789231641000015,
+        4.6176575420000745,
+        4.687205331999962,
+        4.459443227000065
+      ],
+      "body_seconds": 4.2103,
+      "substrate_rss_mb": 0.0,
+      "note": "no substrate; every run re-imports pandas"
+    },
+    {
+      "name": "jupyter",
+      "cold_start_seconds": 7.3133805500000335,
+      "boot_seconds": 2.976027421000026,
+      "first_execution_seconds": 4.337353129000007,
+      "warm_seconds": 3.295952697999951,
+      "warm_samples": [
+        3.6273000359999514,
+        3.0948003140000537,
+        3.860993805000021,
+        2.9508276410000462,
+        3.295952697999951
+      ],
+      "body_seconds": NaN,
+      "substrate_rss_mb": 583.9,
+      "note": "server boot 2.04s + kernel spawn 0.94s; shared namespace across runs"
+    },
+    {
+      "name": "forkrun",
+      "cold_start_seconds": 4.869711454000026,
+      "boot_seconds": 0.5515328609999415,
+      "first_execution_seconds": 4.318178593000084,
+      "warm_seconds": 4.318178593000084,
+      "warm_samples": [
+        4.138737529999958,
+        3.620911494999973,
+        4.6597957389999465,
+        5.055924888999925,
+        4.318178593000084
+      ],
+      "body_seconds": 4.4406,
+      "substrate_rss_mb": 0.0,
+      "note": "daemon pre-imports pandas/numpy; each run is a forked pristine child"
+    }
+  ]
+}

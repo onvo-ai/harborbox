@@ -8,7 +8,11 @@ import httpx
 import pytest
 
 if TYPE_CHECKING:
-    from harborbox_sdk import SandboxClient
+    from live_client import SandboxClient
+
+# Allocates well past the sandbox's 128 MB limit. Runs through /commands
+# because POST /v1/sandboxes/{id}/executions no longer exists.
+OOM_COMMAND = "/opt/venv/bin/python -c 'payload = bytearray(384 * 1024 * 1024)'"
 
 # How long a caller should ever have to wait to learn that a memory-hungry
 # script died from an OOM kill. Deliberately tight, not generous: before the
@@ -26,8 +30,8 @@ OOM_FAILURE_BOUND_SECONDS = 15
 def test_oom_is_contained_and_reported(client: SandboxClient) -> None:
     sandbox = client.sandboxes.create(template="onvo-lite", memory_mb=128, cpu=1)
     try:
-        execution = sandbox.run_code(
-            "payload = bytearray(384 * 1024 * 1024)",
+        execution = sandbox.commands.run(
+            OOM_COMMAND,
             wait=False,
         )
         # A hang here (TimeoutError) is itself the regression this test
@@ -83,9 +87,15 @@ def test_oom_is_contained_and_reported(client: SandboxClient) -> None:
         # i.e. the blast radius was the one sandbox that OOM'd, not the host.
         control = client.sandboxes.create(template="onvo-lite", memory_mb=128, cpu=1)
         try:
-            control_execution = control.run_code("1 + 1", wait=True, wait_timeout=30)
+            # Was `run_code("1 + 1")` until the Jupyter kernel and the endpoint
+            # it served were removed; a command is what a caller has now, and
+            # the claim being made here is about the scheduler, not about how
+            # the work is expressed.
+            control_execution = control.commands.run(
+                "/opt/venv/bin/python -c 'print(1 + 1)'", wait=True, wait_timeout=30
+            )
             assert control_execution.status == "succeeded", control_execution.error
-            assert control_execution.text == "2"
+            assert "".join(control_execution.logs.stdout).strip() == "2"
         finally:
             control.kill()
     finally:
@@ -96,8 +106,8 @@ def test_oom_is_contained_and_reported(client: SandboxClient) -> None:
 def test_api_stays_healthy_after_oom(client: SandboxClient) -> None:
     sandbox = client.sandboxes.create(template="onvo-lite", memory_mb=128, cpu=1)
     try:
-        execution = sandbox.run_code(
-            "payload = bytearray(384 * 1024 * 1024)",
+        execution = sandbox.commands.run(
+            OOM_COMMAND,
             wait=False,
         )
         execution.wait(timeout=60)
