@@ -24,8 +24,10 @@ assertion still passes.
 from __future__ import annotations
 
 import time
+from http import HTTPStatus
 from typing import TYPE_CHECKING
 
+import httpx
 import pytest
 
 if TYPE_CHECKING:
@@ -44,6 +46,10 @@ CPU = 0.5
 
 PROBE_PATH = "/tmp/ladder-probe.txt"  # noqa: S108 - the sandbox's own tmpfs
 PROBE_BODY = "written before the pause"
+# Three tries with 1s/2s backoff. Enough for a busy runner to free the
+# capacity the previous test's sandbox just released; short enough that a
+# genuinely broken start still fails the suite rather than hanging it.
+START_ATTEMPTS = 3
 
 
 def _timed(label: str, action: Callable[[], object]) -> float:
@@ -71,11 +77,35 @@ def sandbox(client: SandboxClient) -> Iterator[Sandbox]:
         idle_timeout_seconds=0,
     )
     try:
-        live.files.write(PROBE_PATH, PROBE_BODY)
-        assert live.refresh().status == "running"
+        _start(live)
         yield live
     finally:
         live.kill()
+
+
+def _start(live: Sandbox) -> None:
+    """Force the lazy start, retrying a 503.
+
+    Each test here creates its own sandbox and the runner is 2 cores / 3.7 GB
+    with the whole Compose stack already on it, so the third start in a row can
+    lose the race and come back `503 sandbox failed to start or become ready`.
+    That is the box being busy, not the ladder being broken, and a caller would
+    retry it too.
+    """
+    last: httpx.HTTPStatusError | None = None
+    for attempt in range(START_ATTEMPTS):
+        try:
+            live.files.write(PROBE_PATH, PROBE_BODY)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != HTTPStatus.SERVICE_UNAVAILABLE:
+                raise
+            last = exc
+            time.sleep(2**attempt)
+        else:
+            assert live.refresh().status == "running"
+            return
+    message = f"sandbox never started after {START_ATTEMPTS} attempts: {last}"
+    raise AssertionError(message)
 
 
 @pytest.mark.e2e
