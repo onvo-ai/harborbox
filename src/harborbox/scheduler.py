@@ -233,9 +233,30 @@ def plan_suspensions(
     Idle sandboxes used to go straight from `running` to `paused_cold`, which
     releases everything but makes the next call pay a fresh container built from
     a snapshot. Freezing first keeps the container and its warm interpreter, so a
-    sandbox used again shortly afterwards resumes by unfreezing -- the only
-    resume path that is plausibly sub-second -- while anything genuinely
-    finished still goes cold on the same `idle_timeout_seconds` as before.
+    sandbox used again shortly afterwards resumes by unfreezing rather than
+    rebuilding, while anything genuinely finished still goes cold on the same
+    `idle_timeout_seconds` as before.
+
+    What that is actually worth, measured by `tests/e2e_pause_ladder.py` against
+    a live stack (onvo-lite, 256 MB / 0.5 cpu):
+
+        freeze     65 ms      snapshot   5075 ms
+        unfreeze   97 ms      restore     465 ms
+
+    Read the right-hand column before enabling this. The *pause* side is where
+    the tier is overwhelmingly cheaper -- 65 ms against 5 s, so freezing an idle
+    sandbox costs almost nothing while snapshotting it is the single most
+    expensive thing the scheduler does. The *resume* side is a far narrower win
+    than it was designed on: this docstring used to call unfreezing "the only
+    resume path that is plausibly sub-second", and that is simply false --
+    restoring from a snapshot is 465 ms, also sub-second. The hot tier buys
+    ~370 ms on resume in exchange for holding the sandbox's entire memory
+    reservation until it is used again.
+
+    So it is worth having where a sandbox is likely to be touched again within
+    the minute and memory is not the binding constraint, and worth turning off
+    (`hot_pause_idle_seconds=0`) where it is not. It is not the order-of-
+    magnitude resume win the first version of this claimed.
 
     The freeze tier is bounded by `hot_budget_mb` because a frozen sandbox keeps
     its whole memory reservation (`RESERVED_SANDBOX_STATES` includes
