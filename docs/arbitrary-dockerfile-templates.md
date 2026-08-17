@@ -474,28 +474,55 @@ Ubuntu 23.10 and later ship `kernel.apparmor_restrict_unprivileged_userns=1`,
 which stops an unconfined process creating a user namespace. Rootless BuildKit
 is exactly that process, so it cannot start.
 
-**No compose setting fixes this.** `apparmor=unconfined` is already set on the
-service and does not help — under this restriction "unconfined" is precisely
-the category that is denied; the permission has to come from a profile that
-grants `userns`. The change is on the host and needs root:
+`apparmor=unconfined` is already set on the service and does not help — under
+this restriction "unconfined" is precisely the category being denied.
+
+**The profile BuildKit's own error message suggests does not work here.** It
+tells you to write `/etc/apparmor.d/usr.bin.rootlesskit`, which attaches to
+that path as a *host* binary. The rootlesskit that matters runs inside a
+container, under whatever profile Docker gives that container, and never
+transitions into it. Installed and loaded on this host, the builder kept
+crash-looping with the identical error — that part is solid, because the
+builder does run with `seccomp=unconfined`.
+
+### What fixed it
 
 ```bash
-cat <<'EOT' | sudo tee /etc/apparmor.d/usr.bin.rootlesskit
-abi <abi/4.0>,
-include <tunables/global>
-
-/usr/bin/rootlesskit flags=(unconfined) {
-  userns,
-  include if exists <local/usr.bin.rootlesskit>
-}
-EOT
-sudo systemctl restart apparmor.service
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+echo 'kernel.apparmor_restrict_unprivileged_userns=0' | sudo tee /etc/sysctl.d/99-rootless-userns.conf
 ```
 
-The blunter alternative is `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`
-(persist it in `/etc/sysctl.d/`), which lifts the restriction for every
-unconfined process on the box rather than for `rootlesskit` alone. Prefer the
-profile.
+The builder came up healthy on the next restart, with `using overlayfs` and
+`process-mode:sandbox` — the two values section 10 wanted — and a caller
+Dockerfile then built and ran end to end (section 10.5).
+
+This lifts the restriction for every unconfined process on the box, not just
+this container, which is worth weighing on a shared host.
+
+### What is *not* established, so nobody repeats the experiment badly
+
+`deploy/apparmor/harborbox-buildkit` and the `HARBORBOX_BUILDER_APPARMOR`
+variable are a container profile granting `userns`. They are kept because that
+is the targeted fix in principle — but **whether they work was never actually
+determined here**, and the first version of this section wrongly claimed they
+had been disproven.
+
+The probes behind that claim were confounded: they set only
+`--security-opt apparmor=...` and left Docker's *default seccomp* profile in
+place, and that profile independently blocks `unshare(CLONE_NEWUSER)`. So every
+"denied" they produced is explained by seccomp alone and says nothing about
+AppArmor. A valid probe needs both:
+
+```bash
+docker run --rm --security-opt seccomp=unconfined --security-opt apparmor=<profile> \
+  alpine:3.21 unshare -Ur echo OK
+```
+
+What is real evidence against the profile route on this host: the kernel
+(6.8.0-136-generic) exposes no `userns` entry in
+`/sys/kernel/security/apparmor/features/`, which suggests it has no AppArmor
+userns mediation for a profile rule to hook into. Suggestive, not proven.
+Check that directory before choosing between the profile and the sysctl.
 
 After either, confirm what actually came up:
 
@@ -513,6 +540,40 @@ Until this is done the API stays healthy and every other service runs, but no
 template can be built: `POST /v1/templates` has nowhere to send the build. The
 symptom in Coolify is the application sitting at `restarting:unknown` while its
 `api` container reports healthy.
+
+### 10.5 The chain, verified on the deployed stack
+
+With the builder up, a caller Dockerfile was posted to the deployed API and
+taken all the way to a running command:
+
+```
+POST /v1/templates  {"dockerfile": "FROM debian:bookworm-slim\nRUN echo built-in-prod > /proof.txt"}
+  -> custom-7e5afd13b6d3, status building -> ready in ~4s
+POST /v1/sandboxes  {"template": "custom-7e5afd13b6d3"}
+  -> sbx_..., created
+POST /v1/sandboxes/{id}/commands  "cat /proof.txt; id -u; id -un; pwd"
+  -> exit 0, queued 16ms, startup 862ms, execution 1051ms
+     stdout: built-in-prod / 10001 / sandbox / /workspace
+```
+
+That covers the parts unit tests cannot: BuildKit built it, pushed it to the
+registry over the `build` network, the host daemon pulled it through the
+loopback endpoint, and the conformance layer put the process at uid 10001 in
+`/workspace` with the caller's own layer present.
+
+**One real limitation surfaced.** The first attempt used `FROM alpine:3.21` and
+failed in the conformance layer:
+
+```
+/bin/sh: groupadd: not found
+```
+
+`CONFORMANCE_LAYER` uses `groupadd`/`useradd`, which are Debian-family tools;
+Alpine has `addgroup`/`adduser` from BusyBox. The `FROM` allowlist permits
+`docker.io/library/*`, so a caller may legitimately pick Alpine and get a build
+failure four lines into a layer they did not write. Either detect the base and
+branch, or document Debian-family bases as a requirement and reject others up
+front — the current behaviour is the worst of both.
 
 ## 11. Phase 0 as built
 
