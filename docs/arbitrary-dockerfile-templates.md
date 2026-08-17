@@ -458,6 +458,52 @@ The repository path after the host part must be identical on both sides. Worth
 a test that asserts exactly that, because a mismatch fails only at sandbox
 create, long after the build reported success.
 
+#### This isolation does not hold as deployed
+
+Everything above is true of `compose.yaml`, and
+`test_the_builder_reaches_the_registry_and_nothing_else` asserts it. **It is
+false in the Coolify deployment**, measured on the infrastructure host:
+
+```
+builder networks:  <uuid>=172.22.0.3   <uuid>_build=172.19.0.3
+                   ^^^^^^^^^^^^^^^^^ Coolify's project network, not in compose
+
+from inside the builder:
+  api:8000/health   -> {"status":"ok"}
+  opensandbox:8080  -> HTTP/1.1 401 Unauthorized
+  postgres:5432     -> OPEN
+```
+
+A build step shares buildkitd's network namespace, so a caller-supplied `RUN`
+can reach the control plane and its database. That is precisely what this
+section says must not be possible.
+
+The cause is Coolify, not the compose file: it appends its project network to
+every service of a compose application. The per-application
+`connect_to_docker_network` setting is already **false** for this app and does
+not prevent it, so nothing in this repository can currently switch it off.
+
+What still stands between a hostile build step and damage is credentials, not
+topology — the API requires its key and PostgreSQL its password. That is one
+layer where the design intended two.
+
+Two ways out, neither yet done:
+
+1. **Isolate the build steps rather than the container.** BuildKit can put each
+   build in its own network namespace with `[worker.oci] networkMode = "cni"`
+   and a CNI config that NATs to the internet and routes nowhere else. This is
+   the real fix, because it stops depending on what the orchestrator does to
+   the container. Caveat before trying it: this image has no `slirp4netns`
+   (checked), so rootless CNI may leave build steps with no egress at all —
+   which is what section 10.6 was about. Verify egress still works before
+   shipping it.
+2. **Stop Coolify attaching the network**, if a newer Coolify honours the
+   setting or accepts an override. Cheaper, but it re-breaks the moment
+   somebody redeploys under a version that ignores it.
+
+Until one of them lands, treat the build step as something that can reach the
+control plane, and do not serve untrusted callers on this deployment.
+
 ### 10.4 The Coolify host needs one root change before the builder runs
 
 The OrbStack result did not transfer, exactly as this section warned it might.
