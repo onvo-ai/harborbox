@@ -45,6 +45,14 @@ class Settings(BaseSettings):
     opensandbox_api_key: SecretStr = SecretStr("change-me-opensandbox")
     opensandbox_use_server_proxy: bool = True
     opensandbox_ready_timeout_seconds: float = Field(default=30.0, gt=0)
+    # Bounds the live get_sandbox_info() lookup _detect_memory_exceeded makes
+    # on every runtime error (14 call sites) to work out whether a failure was
+    # an OOM kill. It is a diagnostic, not a critical path: without its own
+    # short bound it inherits ConnectionConfig.request_timeout
+    # (opensandbox_ready_timeout_seconds, 30s by default), which would let a
+    # degraded control plane add up to another 30s on top of every error --
+    # worst exactly when callers can least afford to wait longer.
+    oom_diagnostic_timeout_seconds: float = Field(default=3.0, gt=0)
     opensandbox_snapshot_timeout_seconds: float = Field(default=300.0, gt=0)
     docker_base_url: str | None = None
     sandbox_image: str = "harborbox-sandbox:local"
@@ -65,6 +73,17 @@ class Settings(BaseSettings):
     # rather than tuned — a sandbox that has not got a kernel by now is broken,
     # not slow.
     sandbox_python_ready_timeout_seconds: float = Field(default=120.0, gt=0)
+    # Bounds a single attempt inside that outer deadline. Was a hardcoded 60s
+    # -- nearly the whole outer budget on its own -- until CI evidence from a
+    # cold-resume-via-snapshot showed one attempt occupying the entire
+    # observable window with no second attempt ever logged: a fixed 60s
+    # attempt cap defeats the retry loop's own purpose the moment a single
+    # attempt is merely slow rather than instantly failing. Shorter here
+    # means a transient stall gets an actual retry within the outer budget
+    # instead of exhausting most of it on one attempt, and a genuine hang
+    # surfaces a clear SandboxUnavailableError well before a caller's own
+    # wait budget elapses instead of after it.
+    sandbox_python_ready_attempt_timeout_seconds: float = Field(default=15.0, gt=0)
     sandbox_network: str = "harborbox-net"
     sandbox_egress_network: str | None = None
     sandbox_runtime: str | None = None
@@ -92,6 +111,16 @@ class Settings(BaseSettings):
     # A sandbox starts lazily on its first execution, so `created` is normal
     # briefly. Fifteen minutes is far longer than any legitimate start.
     reaper_stuck_created_after_seconds: int = Field(default=900, ge=60)
+    # `starting` is a RESERVED_SANDBOX_STATES member, so a start that gets
+    # abandoned there -- rather than the primary fix in
+    # `Scheduler._ensure_running` catching it -- holds real capacity, unlike
+    # a stuck `created` row. Shorter than reaper_stuck_created_after_seconds
+    # on purpose: five minutes is generous over every start budget that
+    # feeds into it (opensandbox_ready_timeout_seconds,
+    # lazy_start_wait_timeout_seconds, sandbox_python_ready_timeout_seconds
+    # combined tops out well under this), so anything still `starting` this
+    # long is abandoned, not slow. Defence in depth, not the primary fix.
+    reaper_stuck_starting_after_seconds: int = Field(default=300, ge=30)
     # Long enough that a failure is still there when someone comes to look.
     reaper_failed_retention_hours: int = Field(default=24, ge=1)
 
@@ -138,6 +167,14 @@ class Settings(BaseSettings):
     default_execution_timeout_seconds: int = Field(default=30, ge=1)
     max_execution_timeout_seconds: int = Field(default=600, ge=1)
     default_idle_timeout_seconds: int = Field(default=300, ge=0)
+    # Budget for an HTTP request (a file operation, or a PATCH that touches the
+    # sandbox) that lands on a not-yet-running sandbox and triggers the same
+    # lazy start `create_execution` has always benefited from. Sized to match
+    # the full cold-start budget a first execution gets end to end (container
+    # create + agent health), not the much larger kernel-ready budget below --
+    # these callers never touch the kernel. If it elapses the start is not
+    # aborted, only the caller's wait: see `Scheduler.ensure_sandbox_ready`.
+    lazy_start_wait_timeout_seconds: float = Field(default=60.0, gt=0)
     reaper_poll_seconds: float = Field(default=5.0, gt=0)
     # How many started-but-unassigned sandboxes to keep ready. 0 disables the
     # pool entirely, which is the old behaviour: every caller pays the container

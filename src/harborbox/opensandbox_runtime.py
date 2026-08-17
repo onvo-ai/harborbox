@@ -52,6 +52,19 @@ if TYPE_CHECKING:
 SNAPSHOT_METADATA_KEY = "harborbox.runtime.snapshot_id"
 logger = logging.getLogger(__name__)
 
+# Tokens checked (case-insensitively) against a dead sandbox's live
+# `SandboxStatus.reason`/`.message` -- see `_detect_memory_exceeded`. Kept
+# narrow and OOM-specific on purpose: a bare "137" would also match an
+# unrelated process's own `exit(137)`, so only the qualified forms are
+# included.
+_OOM_SIGNAL_TOKENS = (
+    "oom",
+    "out of memory",
+    "out-of-memory",
+    "exit code 137",
+    "code: 137",
+)
+
 
 @dataclass(frozen=True)
 class _CommandSpec:
@@ -253,7 +266,7 @@ class OpenSandboxRuntime:
             self._sandboxes[sandbox.id] = handle
             return StartedSandbox(id=handle.id, name=handle.id)
         except SandboxException as exc:
-            self._raise_runtime_error(exc, sandbox)
+            await self._raise_runtime_error(exc, sandbox)
 
     async def wait_until_ready(self, sandbox: Sandbox) -> None:
         """Ready means the container answers — deliberately not the kernel.
@@ -283,6 +296,24 @@ class OpenSandboxRuntime:
         Waiting here rather than retrying at execution time keeps the failure
         in one place: by the time an execution is dispatched the sandbox can
         actually run Python, or starting it failed and says so.
+
+        A cold-resume-via-snapshot (see `SNAPSHOT_METADATA_KEY`) can be far
+        slower to answer this probe than a fresh container: CI evidence
+        showed one attempt occupy this loop's entire externally-observable
+        window with no second attempt ever logged, because the per-attempt
+        cap used to be nearly as large as the outer deadline itself. See
+        `sandbox_python_ready_attempt_timeout_seconds` for why that changed.
+
+        A 404 from OpenSandbox (`SandboxApiException` with
+        `status_code == HTTPStatus.NOT_FOUND`) is not one of the transient
+        failures this loop exists to ride out, and is handled separately:
+        CI evidence (task 21, round 3) showed this loop retrying against a
+        sandbox that had already been killed and removed by an external
+        caller (the e2e test's own cleanup, once its client-side wait
+        elapsed) for the rest of its 120s budget, producing nothing but
+        repeated, identical "not found" log lines until the deadline. A
+        sandbox that is gone will never come back; that is answered the
+        moment the first 404 arrives, not after riding out the full budget.
         """
         template = sandbox.metadata_.get("template")
         base = self.settings.base_of_derived_template(template or "") or template
@@ -300,24 +331,32 @@ class OpenSandboxRuntime:
                 # The same call an execution makes, deliberately: a probe on a
                 # different endpoint proved nothing, since only this path goes
                 # through execd to the kernel.
-                # Generous per attempt: the first kernel start pays interpreter
-                # boot and import cost, and a tight cap here just turns a slow
-                # start into a retry storm against a sandbox that is working.
-                async with asyncio.timeout(60):
+                async with asyncio.timeout(
+                    self.settings.sandbox_python_ready_attempt_timeout_seconds
+                ):
                     await interpreter.codes.run(
                         "pass", language=SupportedLanguage.PYTHON
                     )
+            except SandboxApiException as exc:
+                if exc.status_code == HTTPStatus.NOT_FOUND:
+                    message = (
+                        "sandbox's OpenSandbox container was not found while "
+                        f"waiting for its Python kernel -- it will not come "
+                        f"back: {exc}"
+                    )
+                    raise SandboxUnavailableError(message) from exc
+                last = exc
             except Exception as exc:  # noqa: BLE001 - retried until the deadline
                 last = exc
-                logger.warning(
-                    "sandbox %s python not ready yet: %s: %s",
-                    sandbox.id,
-                    type(exc).__name__,
-                    exc,
-                )
-                await asyncio.sleep(1.0)
             else:
                 return
+            logger.warning(
+                "sandbox %s python not ready yet: %s: %s",
+                sandbox.id,
+                type(last).__name__,
+                last,
+            )
+            await asyncio.sleep(1.0)
         message = (
             "sandbox started but its Python kernel never became available after "
             f"{self.settings.sandbox_python_ready_timeout_seconds}s: "
@@ -355,10 +394,18 @@ class OpenSandboxRuntime:
                 )
             return output.response(execution)
         except TimeoutError as exc:
+            # A genuine OOM kill and a script that is merely slow look
+            # identical from here: the kernel process dies silently, nothing
+            # on the execd/kernel side reports it back over this connection,
+            # and `codes.run()` simply never returns until this timeout
+            # fires. Check the sandbox's live status before assuming it was
+            # the latter -- see `_detect_memory_exceeded`.
+            if await self._detect_memory_exceeded(sandbox):
+                raise SandboxMemoryExceededError(sandbox.memory_mb) from exc
             message = f"code execution exceeded {request.timeout_seconds} seconds"
             raise SandboxUnavailableError(message) from exc
         except SandboxException as exc:
-            self._raise_runtime_error(exc, sandbox)
+            await self._raise_runtime_error(exc, sandbox)
 
     async def execute_command(
         self, sandbox: Sandbox, request: AgentCommandRequest
@@ -409,14 +456,14 @@ class OpenSandboxRuntime:
             )
             return output.response(execution)
         except SandboxException as exc:
-            self._raise_runtime_error(exc, sandbox)
+            await self._raise_runtime_error(exc, sandbox)
 
     async def read_file(self, sandbox: Sandbox, path: str) -> FileReadResponse:
         handle = await self._get_handle(sandbox, check_ready=True)
         try:
             content = await handle.files.read_bytes(path)
         except SandboxException as exc:
-            self._raise_runtime_error(exc, sandbox)
+            await self._raise_runtime_error(exc, sandbox)
         try:
             return FileReadResponse(
                 path=path, content=content.decode("utf-8"), encoding="utf-8"
@@ -440,7 +487,7 @@ class OpenSandboxRuntime:
         try:
             await handle.files.write_file(request.path, content)
         except SandboxException as exc:
-            self._raise_runtime_error(exc, sandbox)
+            await self._raise_runtime_error(exc, sandbox)
         return FileReadResponse(
             path=request.path,
             content=request.content,
@@ -466,7 +513,7 @@ class OpenSandboxRuntime:
             try:
                 await handle.files.write_file(path, upload)
             except SandboxException as exc:
-                self._raise_runtime_error(exc, sandbox)
+                await self._raise_runtime_error(exc, sandbox)
         return FileUploadResponse(path=path, size=size)
 
     async def list_files(self, sandbox: Sandbox, path: str) -> FileListResponse:
@@ -476,7 +523,7 @@ class OpenSandboxRuntime:
                 DirectoryListEntry(path=path, depth=1)
             )
         except SandboxException as exc:
-            self._raise_runtime_error(exc, sandbox)
+            await self._raise_runtime_error(exc, sandbox)
         return FileListResponse(
             path=path,
             entries=[
@@ -503,7 +550,7 @@ class OpenSandboxRuntime:
             else:
                 await handle.files.delete_files([path])
         except SandboxException as exc:
-            self._raise_runtime_error(exc, sandbox)
+            await self._raise_runtime_error(exc, sandbox)
 
     async def pause(self, sandbox: Sandbox, *, memory: bool) -> None:
         if not sandbox.container_id:
@@ -535,7 +582,7 @@ class OpenSandboxRuntime:
                 metadata[SNAPSHOT_METADATA_KEY] = snapshot.id
                 sandbox.metadata_ = metadata
         except SandboxException as exc:
-            self._raise_runtime_error(exc, sandbox)
+            await self._raise_runtime_error(exc, sandbox)
         finally:
             await handle.close()
             self._sandboxes.pop(sandbox.id, None)
@@ -554,7 +601,7 @@ class OpenSandboxRuntime:
             self._sandboxes[sandbox.id] = handle
             return StartedSandbox(id=handle.id, name=handle.id)
         except SandboxException as exc:
-            self._raise_runtime_error(exc, sandbox)
+            await self._raise_runtime_error(exc, sandbox)
 
     async def kill(self, sandbox: Sandbox) -> None:
         handle = self._sandboxes.pop(sandbox.id, None)
@@ -567,13 +614,13 @@ class OpenSandboxRuntime:
                 )
             except SandboxApiException as exc:
                 if exc.status_code != HTTPStatus.NOT_FOUND:
-                    self._raise_runtime_error(exc, sandbox)
+                    await self._raise_runtime_error(exc, sandbox)
         if handle is not None:
             try:
                 await handle.kill()
             except SandboxApiException as exc:
                 if exc.status_code != HTTPStatus.NOT_FOUND:
-                    self._raise_runtime_error(exc, sandbox)
+                    await self._raise_runtime_error(exc, sandbox)
             finally:
                 await handle.close()
 
@@ -594,7 +641,7 @@ class OpenSandboxRuntime:
         except SandboxApiException as exc:
             if exc.status_code == HTTPStatus.NOT_FOUND:
                 return None
-            self._raise_runtime_error(exc, sandbox)
+            await self._raise_runtime_error(exc, sandbox)
         state = info.status.state.lower()
         return {
             "running": "running",
@@ -626,7 +673,7 @@ class OpenSandboxRuntime:
                 skip_health_check=not check_ready,
             )
         except SandboxException as exc:
-            self._raise_runtime_error(exc, sandbox)
+            await self._raise_runtime_error(exc, sandbox)
         self._sandboxes[sandbox.id] = handle
         return handle
 
@@ -676,10 +723,94 @@ class OpenSandboxRuntime:
         metadata["harborbox.sandbox_id"] = sandbox.id
         return metadata
 
-    @staticmethod
-    def _raise_runtime_error(exc: SandboxException, sandbox: Sandbox) -> NoReturn:
-        message = str(exc)
-        lowered = message.lower()
-        if "oom" in lowered or "out of memory" in lowered or "exit code 137" in lowered:
+    async def _detect_memory_exceeded(self, sandbox: Sandbox) -> bool:
+        """Best-effort live check for whether `sandbox` died of OOM.
+
+        This is the only OOM signal this backend actually has. Unlike
+        `DockerRuntime`, which inspects `State.OOMKilled`/exit code 137
+        straight from the container runtime after every failure, OpenSandbox
+        exposes no such thing to the client: its whole exception taxonomy
+        (`SandboxError.{INTERNAL_UNKNOWN_ERROR,READY_TIMEOUT,UNHEALTHY,...}`)
+        carries no memory-limit code, and the exception message that used to
+        be substring-matched here can never contain "oom" for any of them --
+        that was dead code. The one place OpenSandbox *does* expose something
+        after the fact is `SandboxStatus.reason`/`.message` on a live
+        `get_sandbox_info` call -- a short machine-readable reason code and a
+        human-readable message the control plane sets for the sandbox's
+        current state.
+
+        This queries that live status and looks for an OOM-shaped reason,
+        regardless of `state` -- it used to return `False` outright whenever
+        `state == "running"` on the theory that a live container could not
+        have died. CI evidence from a real OOM disproved that: the Linux OOM
+        killer targets the memory-hungry *process* (the Jupyter kernel, here)
+        inside the container's cgroup, not necessarily the container's own
+        PID 1 (execd) -- so the kernel dies, the container and its `execd`
+        keep running, and `get_sandbox_info` reports `state: running`
+        throughout. That call is answering "is the container up," which is a
+        different question from "did something inside it just get killed."
+        Whatever `reason`/`message` do or do not say is checked either way
+        now; the old state check was filtering out exactly the case this
+        exists to catch.
+
+        Even so, this remains a real, unresolved limitation, not merely a
+        pending config gap: OpenSandbox's client-visible surface has no
+        process-level signal at all, only this container-level one. If a
+        given deployment's control plane never populates `reason`/`message`
+        with anything OOM-shaped for a process that died inside an
+        otherwise-healthy container -- which is the common case observed in
+        CI, where the failure surfaces as a severed stream
+        (`SandboxException` from a mid-response disconnect) with no
+        exploitable status signal at all -- this cannot fire, and the caller
+        falls back to whatever generic error the failed call already raised.
+        Widening `_OOM_SIGNAL_TOKENS` to match on transport-error text (e.g.
+        "peer closed connection", "incomplete chunked read") was considered
+        and rejected: that symptom is real and suggestive, but not
+        exclusive to OOM -- an ordinary network blip mid-stream would raise
+        the identical exception, and there is no way to tell them apart from
+        here. Matching on it would trade one guess (the original dead
+        substring match on exception text) for another, and mislabel real
+        transport faults as memory errors. This is the best available signal
+        short of either a process-level exit code (which OpenSandbox does
+        not expose to the client today) or a verified read of its
+        diagnostics `get_logs`/`get_events` API for an OOM-killer log line,
+        which this pass could not confirm without a live stack to test it
+        against.
+
+        This is a diagnostic on the error path of all 14 call sites of
+        `_raise_runtime_error`, one of them (`execute_code`'s own timeout
+        branch) already reached by a caller who has been waiting. Without an
+        explicit short bound it would inherit
+        `ConnectionConfig.request_timeout`
+        (`opensandbox_ready_timeout_seconds`, 30s by default), turning a
+        30s script timeout into up to 60s while still holding the
+        execution's CPU reservation -- worst exactly when the control plane
+        is degraded enough to be slow to answer this in the first place.
+        `oom_diagnostic_timeout_seconds` (3s default) bounds it instead, and
+        any failure here -- including that bound itself firing as a
+        `TimeoutError`, not a `SandboxException` -- falls back to `False`
+        rather than ever stalling or escaping as its own, unrelated error.
+        """
+        if not sandbox.container_id:
+            return False
+        try:
+            async with asyncio.timeout(self.settings.oom_diagnostic_timeout_seconds):
+                info = await (await self._get_manager()).get_sandbox_info(
+                    sandbox.container_id
+                )
+        except Exception:  # noqa: BLE001 - a diagnostic must never fail loud
+            # A failed (or too-slow) diagnostic lookup says nothing about why
+            # the original call failed; do not let it mask that error with a
+            # worse one, or stall it further.
+            return False
+        # No `state` check: a container-level "running" does not mean nothing
+        # inside it died -- see the docstring above.
+        haystack = f"{info.status.reason or ''} {info.status.message or ''}".lower()
+        return any(token in haystack for token in _OOM_SIGNAL_TOKENS)
+
+    async def _raise_runtime_error(
+        self, exc: SandboxException, sandbox: Sandbox
+    ) -> NoReturn:
+        if await self._detect_memory_exceeded(sandbox):
             raise SandboxMemoryExceededError(sandbox.memory_mb) from exc
-        raise SandboxUnavailableError(message) from exc
+        raise SandboxUnavailableError(str(exc)) from exc

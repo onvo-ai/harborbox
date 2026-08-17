@@ -7,6 +7,7 @@ from harborbox.reaper import ReapCandidate, ReapPlan, plan_reap
 NOW = datetime(2026, 8, 10, 12, 0, 0, tzinfo=UTC)
 STUCK_AFTER = timedelta(minutes=15)
 FAILED_RETENTION = timedelta(hours=24)
+STUCK_STARTING_AFTER = timedelta(minutes=5)
 
 
 def run(candidates: list[ReapCandidate]) -> ReapPlan:
@@ -15,6 +16,7 @@ def run(candidates: list[ReapCandidate]) -> ReapPlan:
         now=NOW,
         stuck_created_after=STUCK_AFTER,
         failed_retention=FAILED_RETENTION,
+        stuck_starting_after=STUCK_STARTING_AFTER,
     )
 
 
@@ -66,6 +68,55 @@ class TestFailedRetention:
         assert plan.total == 0
 
 
+class TestStuckStarting:
+    """`starting` reserves real capacity, so it gets its own, shorter sweep.
+
+    The primary fix for an abandoned start is `Scheduler._ensure_running`
+    marking it `failed` itself; this is the backstop for whatever gets past
+    that.
+    """
+
+    def test_deletes_a_start_abandoned_past_the_threshold(self) -> None:
+        plan = run([ReapCandidate("sbx_stuck", "starting", at(minutes=10))])
+        assert plan.delete == ("sbx_stuck",)
+        assert plan.prune == ()
+
+    def test_leaves_a_start_still_within_its_budget(self) -> None:
+        plan = run([ReapCandidate("sbx_new", "starting", at(seconds=30))])
+        assert plan.total == 0
+
+    def test_boundary_is_inclusive(self) -> None:
+        plan = run([ReapCandidate("sbx_edge", "starting", at(minutes=5))])
+        assert plan.delete == ("sbx_edge",)
+
+    def test_recent_activity_protects_an_old_row(self) -> None:
+        plan = run(
+            [
+                ReapCandidate(
+                    "sbx_busy",
+                    "starting",
+                    at(hours=1),
+                    last_activity_at=at(seconds=10),
+                )
+            ]
+        )
+        assert plan.total == 0
+
+    def test_a_none_threshold_skips_starting_entirely(self) -> None:
+        """Omitting the threshold leaves `starting` alone altogether.
+
+        `reap_once` always passes one; a caller that omits it gets the
+        pre-existing behaviour rather than an arbitrary implicit cutoff.
+        """
+        plan = plan_reap(
+            [ReapCandidate("sbx_old", "starting", at(days=7))],
+            now=NOW,
+            stuck_created_after=STUCK_AFTER,
+            failed_retention=FAILED_RETENTION,
+        )
+        assert plan.total == 0
+
+
 class TestLeavesEverythingElseAlone:
     def test_never_touches_live_or_pooled_sandboxes(self) -> None:
         """These hold real reservations; reaping them would kill live work."""
@@ -74,7 +125,6 @@ class TestLeavesEverythingElseAlone:
             [
                 ReapCandidate("a", "running", old),
                 ReapCandidate("b", "pooled", old),
-                ReapCandidate("c", "starting", old),
                 ReapCandidate("d", "paused_memory", old),
                 ReapCandidate("e", "pooling", old),
                 ReapCandidate("f", "paused_cold", old),
