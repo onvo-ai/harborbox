@@ -1,6 +1,6 @@
 FROM python:3.12-slim-bookworm
 
-ARG SANDBOX_REQUIREMENTS=sandbox/requirements.txt
+ARG SANDBOX_REQUIREMENTS=sandbox/requirements-onvo-pro.txt
 ARG SANDBOX_APT_PACKAGES=""
 
 ENV PYTHONDONTWRITEBYTECODE=1 \

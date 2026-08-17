@@ -39,7 +39,6 @@ class Settings(BaseSettings):
         "local-development-secret-change-me"
     )
     database_url: str = "postgresql+asyncpg://harborbox:harborbox@postgres/harborbox"
-    runtime_provider: Literal["opensandbox", "docker"] = "opensandbox"
     opensandbox_domain: str = "opensandbox:8080"
     opensandbox_protocol: Literal["http", "https"] = "http"
     opensandbox_api_key: SecretStr = SecretStr("change-me-opensandbox")
@@ -56,8 +55,6 @@ class Settings(BaseSettings):
     sandbox_network: str = "harborbox-net"
     sandbox_egress_network: str | None = None
     sandbox_runtime: str | None = None
-    sandbox_agent_port: int = 8080
-    sandbox_agent_connect_timeout_seconds: float = 30.0
 
     total_memory_mb: int | None = Field(default=None, ge=512)
     host_memory_reserve_percent: int = Field(default=25, ge=5, le=90)

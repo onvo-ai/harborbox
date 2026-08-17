@@ -1,18 +1,20 @@
 """The deployed compose must agree with what the code actually does.
 
-This exists because of a real outage. `compose.internal-tools.yaml` never set
-`HARBORBOX_RUNTIME_PROVIDER`, which was harmless for as long as the API
-constructed `DockerRuntime` directly in its lifespan and never read the setting.
-0.2.0 introduced `create_runtime()`, which honours it — and its default is
-`opensandbox`. The deploy came up healthy, reported the right version, and
-listed all three templates as ready, while every single sandbox creation died at
-`[Errno -3] Temporary failure in name resolution` dialling a service that does
-not run on that host.
+This exists because of a real outage. A deploy came up healthy, reported the
+right version, and listed all three templates as ready, while every single
+sandbox creation died at `[Errno -3] Temporary failure in name resolution`
+dialling an OpenSandbox server that does not run on that host.
 
 Every check that could be done without creating a sandbox passed. So the thing
 worth pinning is not the code and not the YAML in isolation, but the agreement
 between them: feed the compose file's own environment into `Settings` and assert
 the resulting behaviour matches what the host can actually provide.
+
+The outage was originally reached through a runtime-provider setting that chose
+between OpenSandbox and an in-sandbox Docker agent. That setting and that agent
+are gone -- OpenSandbox is the only runtime -- but the failure this pins never
+depended on the choice, only on whether the host answers to the name the API
+dials.
 """
 
 import re
@@ -67,47 +69,30 @@ def built_images(compose: dict) -> set[str]:
     }
 
 
-def test_the_configured_runtime_provider_is_actually_provided(
+def test_the_opensandbox_server_the_api_dials_is_actually_run(
     compose: dict, settings: Settings
 ) -> None:
-    """The outage, pinned — and its mirror image.
+    """The outage, pinned.
 
-    Both halves of this bit once, in opposite directions:
-
-    `opensandbox` needs a server to talk to. The file did not run one, and the
+    OpenSandbox needs a server to talk to. The file did not run one, and the
     API dialled a hostname that did not resolve, so no container was ever
     created.
-
-    `docker` needs images that answer on :8080. 0.2.0's templates ship no
-    agent — no fastapi, no uvicorn, `CMD ["tail","-f","/dev/null"]` — so
-    switching the flag without changing the images produces sandboxes that
-    start, sit there, and fail every execution with "agent did not become
-    ready". That looks like a network fault and is not one.
     """
-    if settings.runtime_provider == "opensandbox":
-        host = settings.opensandbox_domain.split(":")[0]
-        names = set(compose["services"])
-        # `networks:` is a bare list on some services and a mapping on others.
-        aliases = set()
-        for svc in compose["services"].values():
-            nets = svc.get("networks")
-            if not isinstance(nets, dict):
-                continue
-            for net in nets.values():
-                if isinstance(net, dict):
-                    aliases.update(net.get("aliases") or [])
-        assert host in names | aliases, (
-            f"runtime_provider is opensandbox and the API dials {host!r}, but "
-            f"no service or alias in {COMPOSE.name} answers to that name."
-        )
-    else:
-        agent_deps = Path(__file__).resolve().parent.parent / "sandbox"
-        for req in agent_deps.glob("requirements-*.txt"):
-            body = req.read_text()
-            assert "uvicorn" in body, (
-                f"runtime_provider is docker, which polls a harborbox agent on "
-                f":8080, but {req.name} installs no uvicorn to serve it."
-            )
+    host = settings.opensandbox_domain.split(":")[0]
+    names = set(compose["services"])
+    # `networks:` is a bare list on some services and a mapping on others.
+    aliases = set()
+    for svc in compose["services"].values():
+        nets = svc.get("networks")
+        if not isinstance(nets, dict):
+            continue
+        for net in nets.values():
+            if isinstance(net, dict):
+                aliases.update(net.get("aliases") or [])
+    assert host in names | aliases, (
+        f"the API dials {host!r}, but no service or alias in {COMPOSE.name} "
+        f"answers to that name."
+    )
 
 
 def test_every_static_template_resolves_to_an_image_that_gets_built(

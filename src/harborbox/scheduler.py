@@ -12,13 +12,13 @@ from sqlalchemy.orm import selectinload
 
 from harborbox.admission import Capacity, can_admit, reserve_memory
 from harborbox.db import session_factory
+from harborbox.errors import SandboxMemoryExceededError, SandboxUnavailableError
 from harborbox.execution_secrets import open_environment, scrub_environment
 from harborbox.models import Execution, Sandbox, SandboxTemplate, utc_now
 from harborbox.opensandbox_compat import expiration
-from harborbox.runtime import SandboxMemoryExceededError, SandboxUnavailableError
 from harborbox.schemas import (
-    AgentCommandRequest,
-    AgentProcessRequest,
+    RuntimeCommandRequest,
+    RuntimeProcessRequest,
 )
 
 if TYPE_CHECKING:
@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from harborbox.config import Settings
     from harborbox.notify import ExecutionNotifier
     from harborbox.runtime_protocol import SandboxRuntime
-    from harborbox.schemas import AgentExecutionResponse
+    from harborbox.schemas import RuntimeExecutionResult
     from harborbox.template_builder import TemplateBuilder
 
 logger = logging.getLogger(__name__)
@@ -511,12 +511,12 @@ class Scheduler:
         sandbox: Sandbox,
         execution: Execution,
         environment: dict[str, str],
-    ) -> AgentExecutionResponse:
+    ) -> RuntimeExecutionResult:
         """Dispatch to the runtime call matching `execution.kind`."""
         if execution.kind == "command":
             return await self.runtime.execute_command(
                 sandbox,
-                AgentCommandRequest(
+                RuntimeCommandRequest(
                     command=execution.command or "",
                     timeout_seconds=execution.timeout_seconds,
                     max_output_bytes=self.settings.max_output_bytes,
@@ -527,7 +527,7 @@ class Scheduler:
         process_spec = json.loads(execution.command or "{}")
         return await self.runtime.execute_process(
             sandbox,
-            AgentProcessRequest(
+            RuntimeProcessRequest(
                 executable=process_spec["executable"],
                 args=process_spec.get("args", []),
                 stdin=process_spec.get("stdin"),
@@ -539,7 +539,7 @@ class Scheduler:
         )
 
     async def _record_result(
-        self, execution_id: str, response: AgentExecutionResponse
+        self, execution_id: str, response: RuntimeExecutionResult
     ) -> None:
         async with session_factory() as session:
             execution = await session.get(Execution, execution_id)

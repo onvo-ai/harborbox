@@ -30,8 +30,13 @@ jobs:
           POSTGRES_USER: harborbox
           POSTGRES_PASSWORD: harborbox
           POSTGRES_DB: harborbox_test
+        # -d is not optional here: pg_isready defaults the database name to the
+        # user name, so without it the probe asks for a `harborbox` database
+        # that POSTGRES_DB never creates. It still reports healthy -- the server
+        # answering is all pg_isready tests -- but it logs a FATAL every 5s and
+        # never touches the database the tests actually use.
         options: >-
-          --health-cmd "pg_isready -U harborbox"
+          --health-cmd "pg_isready -U harborbox -d harborbox_test"
           --health-interval 5s --health-timeout 5s --health-retries 20
         ports: ["5432:5432"]
 

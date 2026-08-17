@@ -20,12 +20,9 @@ from opensandbox.exceptions import SandboxApiException, SandboxException
 from opensandbox.models.execd import Execution, ExecutionHandlers, RunCommandOpts
 from opensandbox.models.filesystem import DirectoryListEntry
 
-from harborbox.runtime import SandboxMemoryExceededError, SandboxUnavailableError
+from harborbox.errors import SandboxMemoryExceededError, SandboxUnavailableError
 from harborbox.runtime_protocol import StartedSandbox, WarmPoolReservation
 from harborbox.schemas import (
-    AgentCommandRequest,
-    AgentExecutionResponse,
-    AgentProcessRequest,
     ExecutionError,
     ExecutionResult,
     FileEntry,
@@ -34,6 +31,9 @@ from harborbox.schemas import (
     FileUploadResponse,
     FileWriteRequest,
     LogOutput,
+    RuntimeCommandRequest,
+    RuntimeExecutionResult,
+    RuntimeProcessRequest,
 )
 from harborbox.warm_pool import OpenSandboxWarmPools
 
@@ -118,7 +118,7 @@ class _BoundedOutput:
             skip_accumulation=True,
         )
 
-    def response(self, execution: Execution) -> AgentExecutionResponse:
+    def response(self, execution: Execution) -> RuntimeExecutionResult:
         error = self.error
         if error is None and execution.error is not None:
             error = ExecutionError(
@@ -126,7 +126,7 @@ class _BoundedOutput:
                 value=execution.error.value,
                 traceback=list(execution.error.traceback),
             )
-        return AgentExecutionResponse(
+        return RuntimeExecutionResult(
             logs=LogOutput(
                 stdout=self.stdout,
                 stderr=self.stderr,
@@ -265,8 +265,8 @@ class OpenSandboxRuntime:
         await self._get_handle(sandbox, check_ready=True)
 
     async def execute_command(
-        self, sandbox: Sandbox, request: AgentCommandRequest
-    ) -> AgentExecutionResponse:
+        self, sandbox: Sandbox, request: RuntimeCommandRequest
+    ) -> RuntimeExecutionResult:
         return await self._run_command(
             sandbox,
             _CommandSpec(
@@ -279,8 +279,8 @@ class OpenSandboxRuntime:
         )
 
     async def execute_process(
-        self, sandbox: Sandbox, request: AgentProcessRequest
-    ) -> AgentExecutionResponse:
+        self, sandbox: Sandbox, request: RuntimeProcessRequest
+    ) -> RuntimeExecutionResult:
         command = shlex.join([request.executable, *request.args])
         if request.stdin is not None:
             encoded = base64.b64encode(request.stdin.encode("utf-8")).decode("ascii")
@@ -298,7 +298,7 @@ class OpenSandboxRuntime:
 
     async def _run_command(
         self, sandbox: Sandbox, spec: _CommandSpec
-    ) -> AgentExecutionResponse:
+    ) -> RuntimeExecutionResult:
         handle = await self._get_handle(sandbox, check_ready=True)
         output = _BoundedOutput(spec.max_output_bytes)
         try:

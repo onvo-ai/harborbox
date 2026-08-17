@@ -8,7 +8,6 @@ dependencies = [
   "aiosqlite>=0.21.0",
   "asyncpg>=0.30.0",
   "cryptography>=45.0.0",
-  "docker>=7.1.0",
   "fastapi>=0.116.0",
   "httpx>=0.28.0",
   "opensandbox>=0.1.15,<0.2.0",
@@ -98,10 +97,6 @@ packages = ["harborbox"]
 # and modules brings it under the same strict checking as the packages above.
 mypy_path = ["scripts"]
 modules = ["ci_report"]
-
-[[tool.mypy.overrides]]
-module = ["docker", "docker.*"]
-ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 # asyncpg ships no py.typed marker. Only notify.py touches it, for the

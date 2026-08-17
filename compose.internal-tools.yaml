@@ -217,7 +217,6 @@ services:
       # no uvicorn, `CMD ["tail","-f","/dev/null"]` — because execd runs the
       # code. DockerRuntime polls a harborbox agent on :8080 that those images
       # do not contain, so `docker` needs different images, not just this flag.
-      HARBORBOX_RUNTIME_PROVIDER: opensandbox
       HARBORBOX_OPENSANDBOX_DOMAIN: opensandbox:8080
       HARBORBOX_OPENSANDBOX_PROTOCOL: http
       # opensandbox v0.2.2's proxy 500s on execd's streaming /code endpoint

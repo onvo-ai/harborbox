@@ -19,6 +19,7 @@ from harborbox import __version__
 from harborbox.admission import can_admit
 from harborbox.config import Settings, get_settings
 from harborbox.db import create_schema, get_session, session_factory
+from harborbox.errors import SandboxUnavailableError
 from harborbox.execution_secrets import scrub_environment, seal_environment
 from harborbox.models import Execution, Sandbox, SandboxTemplate, utc_now
 from harborbox.notify import ExecutionNotifier
@@ -36,10 +37,9 @@ from harborbox.opensandbox_compat import (
     response_for,
     template_for,
 )
+from harborbox.opensandbox_runtime import OpenSandboxRuntime
 from harborbox.presenters import execution_response
 from harborbox.reaper import reaper_loop
-from harborbox.runtime import SandboxUnavailableError
-from harborbox.runtime_factory import create_runtime
 from harborbox.scheduler import (
     ACTIVE_EXECUTION_STATES,
     RESERVED_SANDBOX_STATES,
@@ -101,7 +101,7 @@ INLINE_WAIT_GRACE_SECONDS = 5
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     await create_schema()
-    runtime = create_runtime(settings)
+    runtime = OpenSandboxRuntime(settings)
     await runtime.start()
     template_builder = TemplateBuilder(settings)
     notifier = ExecutionNotifier(settings)

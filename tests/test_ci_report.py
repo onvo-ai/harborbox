@@ -20,9 +20,10 @@ def test_renders_a_row_per_package_with_coverage_and_counts(tmp_path: Path) -> N
         {
             "files": {
                 "src/harborbox/api.py": {"summary": {"covered_lines": 8, "num_statements": 10}},
-                "src/harborbox_agent/main.py": {
-                    "summary": {"covered_lines": 3, "num_statements": 3}
-                },
+                "src/harborbox/notify.py": {"summary": {"covered_lines": 3, "num_statements": 3}},
+                # Outside `src/<package>`, so it is measured by pytest but must
+                # not land in anyone's row or in the total.
+                "scripts/ci_report.py": {"summary": {"covered_lines": 0, "num_statements": 40}},
             }
         },
     )
@@ -30,10 +31,9 @@ def test_renders_a_row_per_package_with_coverage_and_counts(tmp_path: Path) -> N
 
     report = render_report(tmp_path)
 
-    assert "| `harborbox` | 12 | 80.0% |" in report
-    assert "`harborbox_agent`" in report
-    assert "100.0%" in report
+    assert "| `harborbox` | 12 | 84.6% |" in report
     assert "Total unit test coverage: 84.6%" in report
+    assert "ci_report" not in report.split("<sub>")[0]
 
 
 def test_missing_artifacts_render_as_dashes_not_zeros(tmp_path: Path) -> None:

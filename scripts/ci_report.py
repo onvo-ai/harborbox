@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-PACKAGES = ("harborbox", "harborbox_agent")
+PACKAGES = ("harborbox",)
 
 FOOTNOTE = (
     "<sub>Unit coverage is line coverage from pytest-cov across each package's "
