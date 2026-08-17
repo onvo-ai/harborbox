@@ -9,6 +9,23 @@ configs:
   # which reads like a broken registry rather than a missing daemon setting.
   buildkitd-config:
     content: |
+      # Build steps inherit the *container's* resolver rather than BuildKit's
+      # built-in default of 8.8.8.8.
+      #
+      # 8.8.8.8 is unreachable on hosts that block outbound DNS, and the
+      # infrastructure host does. Every build step then fails to resolve
+      # anything: `pip install pandas==2.2.3` retried five times over 200s and
+      # ended on "No matching distribution found", which reads like a bad pin
+      # rather than a dead resolver. A laptop, where 8.8.8.8 answers, cannot
+      # reproduce it -- the same Dockerfile built fine locally.
+      #
+      # 127.0.0.11 is Docker's embedded DNS. It is valid here because a build
+      # step shares buildkitd's network namespace (worker netmode `host`, and
+      # rootlesskit has no slirp4netns in this image), so "localhost" in a
+      # build step is this container. It forwards to whatever the host uses.
+      [dns]
+        nameservers = ["127.0.0.11"]
+
       [registry."registry:5000"]
         http = true
         insecure = true
