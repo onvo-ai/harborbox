@@ -184,61 +184,71 @@ def test_onvo_pro_sizing_fits_the_configured_cpu_budget(settings: Settings) -> N
     )
 
 
-def test_python_kernelspec_is_registered_under_the_language_name() -> None:
-    """Execd looks a kernel up by the language it was asked for.
+@pytest.mark.parametrize("template", ["relaydeck", "onvo-pro", "onvo-lite"])
+def test_no_template_starts_a_long_lived_process(template: str) -> None:
+    """Every sandbox idles until asked to do something.
 
-    The SDK's default context language is `python`, and execd resolves that
-    against Jupyter's kernelspec *names*. `ipykernel install` registers
-    `python3` only, so execd fetched `/api/kernelspecs`, got a 200 listing
-    python3, found nothing called `python`, and reported `no kernel specs
-    found` — which reads like Jupyter is missing and is really a name mismatch.
-    Registering both names is what made execution work.
+    Templates that ran Python used to boot a Jupyter server here, because execd
+    runs bash itself but proxied Python to a server nothing else would start.
+    Measured (scripts/bench/), that server cost ~3 s of boot and ~197 MB
+    resident in every sandbox, to serve one endpoint that now runs Python as an
+    ordinary command. A template that grows a bootstrap process again should
+    have to justify it against those numbers.
     """
-    dockerfile = (
-        Path(__file__).resolve().parent.parent / "sandbox" / "Dockerfile"
-    ).read_text()
-
-    assert "--name python3" in dockerfile
-    assert "--name python " in dockerfile, (
-        "only python3 is registered; execd asks for a kernel named 'python' "
-        "and will report 'no kernel specs found'"
-    )
+    assert Settings().entrypoint_for_template(template) == ["tail", "-f", "/dev/null"]
 
 
-def test_jupyter_flags_live_in_the_entrypoint_not_only_the_image() -> None:
-    """Opensandbox discards the image CMD and runs the create request's list.
+def test_no_template_image_installs_a_python_kernel() -> None:
+    """The kernel stack is gone from the images, not just unused by the code.
 
-    Flags added to the Dockerfile alone silently do nothing, which cost an
-    afternoon: token auth stayed on because `--IdentityProvider.token=` was in
-    the CMD and not in what actually ran.
+    Leaving jupyter-server and ipykernel installed would keep paying the image
+    size and the CVE surface for a path nothing takes, and would let the
+    entrypoint quietly regrow a server that appears to work.
     """
-    entrypoint = Settings().entrypoint_for_template("onvo-pro")
+    sandbox_dir = Path(__file__).resolve().parent.parent / "sandbox"
+    template_requirements = [
+        sandbox_dir / "requirements-onvo-pro.txt",
+        sandbox_dir / "requirements-onvo-lite.txt",
+        sandbox_dir / "requirements-relaydeck.txt",
+    ]
+    for requirements in template_requirements:
+        installed = [
+            line.split("#", 1)[0].strip().lower()
+            for line in requirements.read_text().splitlines()
+        ]
+        for forbidden in ("jupyter-server", "ipykernel", "jupyter-client"):
+            assert not any(line.startswith(forbidden) for line in installed), (
+                f"{requirements.name} still installs {forbidden}; "
+                "no template runs a kernel any more"
+            )
 
-    assert entrypoint[0].endswith("jupyter")
-    assert "--IdentityProvider.token=" in entrypoint
 
+@pytest.mark.parametrize("dockerfile", ["Dockerfile", "Dockerfile.relaydeck"])
+def test_every_template_image_ships_the_code_runner(dockerfile: str) -> None:
+    """`POST /v1/executions` is served by coderun.py, so it has to be present.
 
-def test_sandbox_readiness_does_not_wait_for_a_jupyter_kernel() -> None:
-    """Readiness must not include the kernel, because Onvo never uses it.
-
-    Onvo's client uploads a script and runs it through
-    /v1/sandboxes/{id}/commands, reading only stdout — the Jupyter path is
-    never touched. Waiting for a kernel in `wait_until_ready` therefore charged
-    every sandbox ~6-11s of Jupyter boot and kernel spawn for a capability the
-    only caller does not use, and turned a dashboard refresh from ~15s a batch
-    into ~190s.
-
-    `execute_code` still waits, so callers that do run Python through a kernel
-    get a clear failure rather than a race.
+    Unlike forkrun, whose absence only costs speed, a missing coderun.py fails
+    every code execution outright -- relaydeck included, which is why it is
+    checked in both Dockerfiles rather than only the pandas ones.
     """
-    ready = inspect.getsource(OpenSandboxRuntime.wait_until_ready)
+    text = (Path(__file__).resolve().parent.parent / "sandbox" / dockerfile).read_text()
+
+    assert "COPY sandbox/coderun.py /opt/coderun.py" in text
+
+
+def test_code_execution_does_not_reach_for_a_kernel() -> None:
+    """`execute_code` runs a command; it does not talk to an interpreter service.
+
+    Pinned at the source level because the failure mode is silent: reintroducing
+    a kernel client here would work in a dev image that still had Jupyter
+    installed and 500 in production, which is the exact shape of the outage
+    this file exists for.
+    """
     execute = inspect.getsource(OpenSandboxRuntime.execute_code)
 
-    assert "_wait_python_ready" not in ready, (
-        "wait_until_ready waits for a Jupyter kernel again; that cost is paid "
-        "by every sandbox, including the ones that only ever run commands."
-    )
-    assert "_wait_python_ready" in execute
+    assert "CodeInterpreter" not in execute
+    assert "_wait_python_ready" not in execute
+    assert "CODE_RUNNER_PATH" in execute
 
 
 def test_forkrun_is_installed_in_the_sandbox_image() -> None:

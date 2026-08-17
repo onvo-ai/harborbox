@@ -1,0 +1,76 @@
+{
+  "csv_bytes": 105018115,
+  "script": "analysis.py",
+  "repeats": 5,
+  "python": "/tmp/claude-0/-home-user-harborbox/0b22d8a5-92dc-51b8-94ea-c836fcf2472a/scratchpad/benchvenv/bin/python",
+  "variants": [
+    {
+      "name": "cold",
+      "cold_start_seconds": 5.674070498999754,
+      "boot_seconds": 0.0,
+      "first_execution_seconds": 5.674070498999754,
+      "warm_seconds": 5.068353828999989,
+      "warm_samples": [
+        5.068353828999989,
+        5.359292192999874,
+        5.094725617999757,
+        4.497294940000302,
+        4.550899999000194
+      ],
+      "body_seconds": 5.2477,
+      "substrate_rss_mb": 0.0,
+      "note": "no substrate; every run re-imports pandas"
+    },
+    {
+      "name": "jupyter",
+      "cold_start_seconds": 7.58195385199997,
+      "boot_seconds": 3.008268730999589,
+      "first_execution_seconds": 4.573685121000381,
+      "warm_seconds": 3.367577283999708,
+      "warm_samples": [
+        3.7060578800001167,
+        3.5504174890002105,
+        3.367577283999708,
+        2.98746391900022,
+        3.0662195529998826
+      ],
+      "body_seconds": NaN,
+      "substrate_rss_mb": 577.6,
+      "note": "server boot 2.07s + kernel spawn 0.94s; shared namespace across runs"
+    },
+    {
+      "name": "forkrun",
+      "cold_start_seconds": 4.149750712999776,
+      "boot_seconds": 0.019358269999884214,
+      "first_execution_seconds": 4.1303924429998915,
+      "warm_seconds": 4.1303924429998915,
+      "warm_samples": [
+        3.803933182000037,
+        4.397060549000344,
+        4.4493485160001,
+        4.084463266999592,
+        4.1303924429998915
+      ],
+      "body_seconds": 3.7132,
+      "substrate_rss_mb": 0.0,
+      "note": "daemon pre-imports pandas/numpy; each run is a forked pristine child"
+    },
+    {
+      "name": "coderun",
+      "cold_start_seconds": 5.129481006000333,
+      "boot_seconds": 0.9517623070005357,
+      "first_execution_seconds": 4.177718698999797,
+      "warm_seconds": 4.177718698999797,
+      "warm_samples": [
+        4.923539327000071,
+        4.536781128999792,
+        3.930413197999769,
+        4.111199943999964,
+        4.177718698999797
+      ],
+      "body_seconds": 4.6919,
+      "substrate_rss_mb": 0.0,
+      "note": "forkrun daemon + coderun runner; what execute_code runs today"
+    }
+  ]
+}

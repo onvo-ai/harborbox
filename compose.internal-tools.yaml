@@ -94,9 +94,10 @@ services:
   #
   # which Trigger surfaced to the dashboard as "Harborbox sandbox failed to
   # become ready" on every widget. A *running* container is the reference prune
-  # honours, so each build target now holds its own image open. `tail -f` and
-  # not the image's own CMD: sandbox/Dockerfile starts a Jupyter server, and
-  # paying ~150MB three times over to pin three tags would be absurd.
+  # honours, so each build target now holds its own image open. The explicit
+  # `tail -f` is now the same thing the image's own CMD does; it is kept
+  # because a keeper container's job is to hold a tag open as cheaply as
+  # possible regardless of what the image decides to run later.
   sandbox-onvo-pro-image:
     image: harborbox-sandbox-onvo-pro:${HARBORBOX_IMAGE_TAG:-local}
     build:

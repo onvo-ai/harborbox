@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from harborbox.config import Settings
+    from harborbox.notify import ExecutionNotifier
     from harborbox.runtime_protocol import SandboxRuntime
     from harborbox.schemas import AgentExecutionResponse
     from harborbox.template_builder import TemplateBuilder
@@ -127,16 +128,93 @@ def _reject_ineligible(execution: Execution, sandbox: Sandbox, now: datetime) ->
     return False
 
 
+@dataclass(frozen=True)
+class IdleSandbox:
+    """The fields the suspension decision needs, so it can be tested plainly."""
+
+    id: str
+    status: str
+    memory_mb: int
+    idle_seconds: float
+    idle_timeout_seconds: int
+
+
+@dataclass(frozen=True)
+class SuspensionPlan:
+    """Which sandboxes to freeze and which to snapshot, this pass."""
+
+    freeze: tuple[str, ...]
+    cool: tuple[str, ...]
+
+
+def plan_suspensions(
+    candidates: list[IdleSandbox],
+    *,
+    hot_idle_seconds: int,
+    hot_budget_mb: int,
+    frozen_memory_mb: int,
+) -> SuspensionPlan:
+    """Decide the idle ladder for one pass: running -> paused_memory -> paused_cold.
+
+    Idle sandboxes used to go straight from `running` to `paused_cold`, which
+    releases everything but makes the next call pay a fresh container built from
+    a snapshot. Freezing first keeps the container and its warm interpreter, so a
+    sandbox used again shortly afterwards resumes by unfreezing -- the only
+    resume path that is plausibly sub-second -- while anything genuinely
+    finished still goes cold on the same `idle_timeout_seconds` as before.
+
+    The freeze tier is bounded by `hot_budget_mb` because a frozen sandbox keeps
+    its whole memory reservation (`RESERVED_SANDBOX_STATES` includes
+    `paused_memory`). Past the cap, freezing would be spending live capacity to
+    speed up a resume that may never come, so those go straight to cold.
+
+    `idle_timeout_seconds == 0` still means "never suspend this sandbox", at
+    either tier.
+    """
+    freeze: list[str] = []
+    cool: list[str] = []
+    budget_used = frozen_memory_mb
+    hot_enabled = hot_idle_seconds > 0 and hot_budget_mb > 0
+
+    for candidate in candidates:
+        if candidate.idle_timeout_seconds == 0:
+            continue
+        going_cold = candidate.idle_seconds >= candidate.idle_timeout_seconds
+        if candidate.status == "paused_memory":
+            # Already frozen: the only move left is down to cold.
+            if going_cold:
+                cool.append(candidate.id)
+            continue
+        if going_cold:
+            cool.append(candidate.id)
+            continue
+        if not hot_enabled or candidate.idle_seconds < hot_idle_seconds:
+            continue
+        if budget_used + candidate.memory_mb > hot_budget_mb:
+            # No headroom to hold this one warm. Leave it running; it will go
+            # cold on its own timeout, and a later pass may find room.
+            continue
+        budget_used += candidate.memory_mb
+        freeze.append(candidate.id)
+
+    return SuspensionPlan(freeze=tuple(freeze), cool=tuple(cool))
+
+
 class Scheduler:
     def __init__(
         self,
         settings: Settings,
         runtime: SandboxRuntime,
         template_builder: TemplateBuilder | None = None,
+        notifier: ExecutionNotifier | None = None,
     ) -> None:
         self.settings = settings
         self.runtime = runtime
         self.template_builder = template_builder
+        # Optional so the many tests that drive a Scheduler directly do not all
+        # have to build one; without it the loop falls back to pure polling,
+        # which is what this replaced.
+        self.notifier = notifier
         self._stop = asyncio.Event()
         self._loop_task: asyncio.Task[None] | None = None
         self._reaper_task: asyncio.Task[None] | None = None
@@ -210,7 +288,17 @@ class Scheduler:
                 raise
             except Exception:
                 logger.exception("scheduler iteration failed")
-            await asyncio.sleep(self.settings.scheduler_poll_seconds)
+            # Woken by an enqueue rather than by the clock. The poll interval
+            # survives as the fallback timeout, so a missed notification costs
+            # the latency it always cost and never stalls the queue -- and a
+            # deferred execution (one that lost on capacity, not on notice)
+            # still gets rescanned on that tick.
+            if self.notifier is not None:
+                await self.notifier.wait_for_queue(
+                    self.settings.scheduler_poll_seconds
+                )
+            else:
+                await asyncio.sleep(self.settings.scheduler_poll_seconds)
 
     async def _admit_available_jobs(self) -> None:
         now = utc_now()
@@ -245,9 +333,11 @@ class Scheduler:
                 if kind == "code":
                     state.active_code_sandboxes.add(sandbox_id)
 
+            rejected_ids: list[str] = []
             for index, execution in enumerate(queued):
                 sandbox = execution.sandbox
                 if _reject_ineligible(execution, sandbox, now):
+                    rejected_ids.append(execution.id)
                     continue
                 active_count = state.active_counts.get(sandbox.id, 0)
                 if not has_sandbox_execution_slot(
@@ -266,6 +356,12 @@ class Scheduler:
                 if stop:
                     break
             await session.commit()
+
+        # Resolved without ever running -- cancelled, or bound to a sandbox that
+        # died. Terminal all the same, so waiters have to be woken or they sit
+        # out the full fallback timeout for a result already written.
+        for execution_id in rejected_ids:
+            await self._notify_finished(execution_id)
 
         for execution_id in admitted_ids:
             task = asyncio.create_task(self._run_execution(execution_id))
@@ -495,6 +591,17 @@ class Scheduler:
             if current_sandbox is not None:
                 current_sandbox.last_activity_at = utc_now()
             await session.commit()
+        await self._notify_finished(execution_id)
+
+    async def _notify_finished(self, execution_id: str) -> None:
+        """Wake anyone blocked on this execution, after the commit that ended it.
+
+        Strictly after: a waiter woken before the commit lands re-reads the old
+        row, sees a non-terminal status and goes back to waiting, which turns
+        the fast path back into the fallback timeout.
+        """
+        if self.notifier is not None:
+            await self.notifier.notify_execution_finished(execution_id)
 
     async def _ensure_running(self, sandbox_id: str) -> None:
         lock = self._sandbox_start_locks.setdefault(sandbox_id, asyncio.Lock())
@@ -571,6 +678,7 @@ class Scheduler:
                 if container_status in {None, "dead", "exited"}:
                     sandbox.status = "failed"
             await session.commit()
+        await self._notify_finished(execution_id)
 
     async def _reaper_loop(self) -> None:
         while not self._stop.is_set():
@@ -634,11 +742,12 @@ class Scheduler:
                     await session.commit()
 
     async def _cold_pause_idle_sandboxes(self) -> None:
+        """Walk idle sandboxes down the ladder: running -> paused_memory -> paused_cold."""
         now = utc_now()
         async with session_factory() as session:
             result = await session.execute(
                 select(Sandbox).where(
-                    Sandbox.status == "running",
+                    Sandbox.status.in_(("running", "paused_memory")),
                     Sandbox.id.not_in(
                         select(Execution.sandbox_id).where(
                             Execution.status.in_(ACTIVE_EXECUTION_STATES)
@@ -648,21 +757,53 @@ class Scheduler:
             )
             sandboxes = list(result.scalars())
 
-        for sandbox in sandboxes:
-            if sandbox.idle_timeout_seconds == 0:
-                continue
-            idle_for = (now - sandbox.last_activity_at).total_seconds()
-            if idle_for < sandbox.idle_timeout_seconds:
-                continue
-            await self.runtime.pause(sandbox, memory=False)
-            async with session_factory() as session:
-                current = await session.get(Sandbox, sandbox.id)
-                if current is not None and current.status == "running":
-                    current.status = "paused_cold"
-                    current.container_id = None
-                    current.container_name = None
-                    current.metadata_ = dict(sandbox.metadata_)
-                    await session.commit()
+        by_id = {sandbox.id: sandbox for sandbox in sandboxes}
+        plan = plan_suspensions(
+            [
+                IdleSandbox(
+                    id=sandbox.id,
+                    status=sandbox.status,
+                    memory_mb=sandbox.memory_mb,
+                    idle_seconds=(now - sandbox.last_activity_at).total_seconds(),
+                    idle_timeout_seconds=sandbox.idle_timeout_seconds,
+                )
+                for sandbox in sandboxes
+            ],
+            hot_idle_seconds=self.settings.hot_pause_idle_seconds,
+            hot_budget_mb=self.settings.hot_pause_budget_mb,
+            frozen_memory_mb=sum(
+                sandbox.memory_mb
+                for sandbox in sandboxes
+                if sandbox.status == "paused_memory"
+            ),
+        )
+
+        for sandbox_id in plan.freeze:
+            await self._suspend(by_id[sandbox_id], memory=True)
+        for sandbox_id in plan.cool:
+            await self._suspend(by_id[sandbox_id], memory=False)
+
+    async def _suspend(self, sandbox: Sandbox, *, memory: bool) -> None:
+        """Pause one sandbox and record the tier it landed in.
+
+        The status is re-read under the write so a sandbox that started running
+        again between the plan and here is left alone: the runtime call has
+        already happened by then, but writing `paused_*` over `running` is what
+        would strand it, since nothing else would ever bring it back.
+        """
+        target = "paused_memory" if memory else "paused_cold"
+        expected = "paused_memory" if target == "paused_cold" else "running"
+        await self.runtime.pause(sandbox, memory=memory)
+        async with session_factory() as session:
+            current = await session.get(Sandbox, sandbox.id)
+            if current is None or current.status not in {expected, "running"}:
+                return
+            current.status = target
+            if not memory:
+                current.container_id = None
+                current.container_name = None
+            current.metadata_ = dict(sandbox.metadata_)
+            await session.commit()
 
     async def _recover_interrupted_jobs(self) -> None:
         async with session_factory() as session:

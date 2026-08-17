@@ -81,6 +81,18 @@ function sleep(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+/** Bounds for the fallback poll loop; see HarborboxConnection.waitForExecution. */
+const MIN_POLL_MS = 20;
+const MAX_POLL_MS = 1_000;
+
+function isTerminal(execution: ExecutionPayload): boolean {
+  return (
+    execution.status === "succeeded" ||
+    execution.status === "failed" ||
+    execution.status === "cancelled"
+  );
+}
+
 class HarborboxConnection {
   readonly baseUrl: string;
   readonly apiKey: string;
@@ -120,26 +132,35 @@ class HarborboxConnection {
     return (await response.json()) as T;
   }
 
+  /**
+   * Poll until an execution finishes.
+   *
+   * The fallback path: submissions now send `wait: true` and the server holds
+   * the connection until the result is ready, so this only runs when the
+   * execution outlives the server's willingness to wait.
+   *
+   * The interval backs off from MIN_POLL_MS to MAX_POLL_MS instead of sitting
+   * at a flat 200 ms, so a result landing just after submission is seen almost
+   * at once and a long execution is not polled hundreds of times.
+   */
   async waitForExecution(
     executionId: string,
     timeoutMs: number,
   ): Promise<ExecutionPayload> {
     const deadline = Date.now() + timeoutMs;
+    let interval = MIN_POLL_MS;
     while (true) {
       const execution = await this.request<ExecutionPayload>(
         `/v1/executions/${executionId}`,
       );
-      if (
-        execution.status === "succeeded" ||
-        execution.status === "failed" ||
-        execution.status === "cancelled"
-      ) {
+      if (isTerminal(execution)) {
         return execution;
       }
       if (Date.now() >= deadline) {
         throw new Error(`execution ${executionId} did not finish in time`);
       }
-      await sleep(200);
+      await sleep(interval);
+      interval = Math.min(interval * 2, MAX_POLL_MS);
     }
   }
 }
@@ -162,13 +183,20 @@ class Commands {
           timeout_seconds: Math.max(1, Math.ceil(timeoutMs / 1000)),
           env: options.envs ?? {},
           cwd: options.cwd ?? null,
+          // Hold the connection server-side and answer the moment the command
+          // finishes, rather than returning a job id for this client to poll.
+          wait: true,
         }),
       },
     );
-    const completed = await this.sandbox.connection.waitForExecution(
-      execution.id,
-      timeoutMs + 60_000,
-    );
+    // Already finished inside the POST in the common case; only a command that
+    // outlived the server's wait falls through to polling.
+    const completed = isTerminal(execution)
+      ? execution
+      : await this.sandbox.connection.waitForExecution(
+          execution.id,
+          timeoutMs + 60_000,
+        );
     this.sandbox.status = "running";
     const result: CommandResult = {
       stdout: (completed.logs?.stdout ?? []).join(""),

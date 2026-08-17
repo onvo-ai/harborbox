@@ -1,0 +1,21 @@
+{
+  "work_ms": 1.0,
+  "results": [
+    {
+      "mode": "poll",
+      "samples": 40,
+      "mean_ms": 251.05,
+      "p50_ms": 200.91,
+      "p95_ms": 401.44,
+      "max_ms": 401.55
+    },
+    {
+      "mode": "notify",
+      "samples": 40,
+      "mean_ms": 1.21,
+      "p50_ms": 1.2,
+      "p95_ms": 1.26,
+      "max_ms": 1.36
+    }
+  ]
+}

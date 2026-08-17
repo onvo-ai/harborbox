@@ -12,7 +12,6 @@ dependencies = [
   "fastapi>=0.116.0",
   "httpx>=0.28.0",
   "opensandbox>=0.1.15,<0.2.0",
-  "opensandbox-code-interpreter>=0.1.2,<0.2.0",
   "pydantic-settings>=2.10.0",
   "sqlalchemy[asyncio]>=2.0.40",
   "uvicorn[standard]>=0.35.0",
@@ -106,6 +105,12 @@ modules = ["ci_report"]
 
 [[tool.mypy.overrides]]
 module = ["docker", "docker.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# asyncpg ships no py.typed marker. Only notify.py touches it, for the
+# LISTEN/NOTIFY connection SQLAlchemy does not expose.
+module = ["asyncpg", "asyncpg.*"]
 ignore_missing_imports = true
 
 [tool.coverage.run]

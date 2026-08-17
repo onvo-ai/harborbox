@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import secrets
 from contextlib import asynccontextmanager
@@ -20,6 +21,7 @@ from harborbox.config import Settings, get_settings
 from harborbox.db import create_schema, get_session, session_factory
 from harborbox.execution_secrets import scrub_environment, seal_environment
 from harborbox.models import Execution, Sandbox, SandboxTemplate, utc_now
+from harborbox.notify import ExecutionNotifier
 from harborbox.opensandbox_compat import (
     INTERNAL_PREFIX,
     OpenSandboxCreate,
@@ -41,6 +43,7 @@ from harborbox.runtime_factory import create_runtime
 from harborbox.scheduler import (
     ACTIVE_EXECUTION_STATES,
     RESERVED_SANDBOX_STATES,
+    TERMINAL_EXECUTION_STATES,
     Scheduler,
     has_sandbox_execution_slot,
 )
@@ -88,6 +91,13 @@ def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex}"
 
 
+# Headroom over the execution's own timeout for an inline `wait=true`. The
+# execution is timed out by the runtime at `timeout_seconds`; this covers the
+# queue wait and the result write on top, so the inline wait does not give up
+# on work that is about to land.
+INLINE_WAIT_GRACE_SECONDS = 5
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
@@ -95,11 +105,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     runtime = create_runtime(settings)
     await runtime.start()
     template_builder = TemplateBuilder(settings)
-    scheduler = Scheduler(settings, runtime, template_builder)
+    notifier = ExecutionNotifier(settings)
+    await notifier.start()
+    scheduler = Scheduler(settings, runtime, template_builder, notifier)
     app.state.settings = settings
     app.state.runtime = runtime
     app.state.scheduler = scheduler
     app.state.template_builder = template_builder
+    app.state.notifier = notifier
     await scheduler.start()
 
     # Reclaims sandboxes nothing will come back for. Started after the
@@ -121,6 +134,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await asyncio.gather(reaper_task, return_exceptions=True)
         await scheduler.stop()
         await template_builder.close()
+        await notifier.close()
         await runtime.close()
 
 
@@ -155,6 +169,10 @@ def scheduler_from(request: Request) -> Scheduler:
 
 def template_builder_from(request: Request) -> TemplateBuilder:
     return request.app.state.template_builder  # type: ignore[no-any-return]
+
+
+def notifier_from(request: Request) -> ExecutionNotifier:
+    return request.app.state.notifier  # type: ignore[no-any-return]
 
 
 async def get_sandbox_or_404(session: AsyncSession, sandbox_id: str) -> Sandbox:
@@ -851,15 +869,83 @@ class _ExecutionSpec:
     environment: dict[str, str]
     cwd: str | None
     timeout_seconds: int | None
+    wait: bool = False
+    wait_timeout_seconds: int | None = None
+
+
+@dataclass
+class _EnqueueContext:
+    """The request-scoped collaborators `enqueue` needs, bundled like the spec.
+
+    `notifier` and `response` are optional so a caller that only wants a job
+    queued -- and every test that does -- can pass neither; without a notifier
+    `wait=true` degrades to the old fire-and-poll behaviour rather than failing.
+    """
+
+    settings: Settings
+    session: AsyncSession
+    notifier: ExecutionNotifier | None = None
+    response: Response | None = None
+
+
+async def _await_execution(
+    *,
+    execution_id: str,
+    notifier: ExecutionNotifier,
+    settings: Settings,
+    # How long the caller is willing to hold the request open. Expiry is a
+    # normal outcome that returns a 202, not a failed operation, so
+    # `asyncio.timeout` at the call site would express the wrong thing.
+    timeout: float,  # noqa: ASYNC109 - see above
+) -> Execution | None:
+    """Block until `execution_id` finishes, or until `timeout`.
+
+    Returns the finished row, or None if the wait ran out -- in which case the
+    caller still has a perfectly good 202 to hand back and the client falls back
+    to polling. That is the whole failure mode: `wait=true` is an optimisation
+    over the poll loop, never a different contract.
+
+    The waiter is registered before the first read, because the execution can
+    finish in the gap between reading a non-terminal status and starting to
+    wait; registering first means that notification is not missed.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    with notifier.execution_waiter(execution_id) as finished:
+        while True:
+            # A fresh session per read: the request-scoped one holds a
+            # transaction snapshot and an identity map, and would keep handing
+            # back the queued row the scheduler has since replaced.
+            async with session_factory() as reader:
+                execution = await reader.get(Execution, execution_id)
+                if execution is None:
+                    return None
+                if execution.status in TERMINAL_EXECUTION_STATES:
+                    reader.expunge(execution)
+                    return execution
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return None
+            finished.clear()
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    finished.wait(),
+                    # Bounded by the scheduler's own fallback interval so a
+                    # missed notification costs one tick, not the whole wait.
+                    timeout=min(remaining, settings.scheduler_poll_seconds),
+                )
 
 
 async def enqueue(
     *,
     sandbox_id: str,
     spec: _ExecutionSpec,
-    settings: Settings,
-    session: AsyncSession,
+    context: _EnqueueContext,
 ) -> ExecutionResponse:
+    settings = context.settings
+    session = context.session
+    notifier = context.notifier
     sandbox = await get_sandbox_or_404(session, sandbox_id)
     if sandbox.status in {"killed", "failed"}:
         raise HTTPException(status_code=409, detail=f"sandbox is {sandbox.status}")
@@ -899,7 +985,36 @@ async def enqueue(
     session.add(execution)
     await session.commit()
     await session.refresh(execution)
-    return await execution_response(session, execution, waiting_for="worker")
+
+    if notifier is None:
+        return await execution_response(session, execution, waiting_for="worker")
+
+    # After the commit, never before: a scheduler woken by this notification
+    # opens its own transaction, and one opened before the commit lands sees no
+    # queued row and goes back to sleep until its fallback tick.
+    await notifier.notify_queued()
+    if not spec.wait:
+        return await execution_response(session, execution, waiting_for="worker")
+
+    finished = await _await_execution(
+        execution_id=execution.id,
+        notifier=notifier,
+        settings=settings,
+        timeout=min(
+            spec.wait_timeout_seconds or timeout + INLINE_WAIT_GRACE_SECONDS,
+            settings.max_execution_timeout_seconds + INLINE_WAIT_GRACE_SECONDS,
+        ),
+    )
+    if finished is None:
+        # Still running. The 202 and the execution id are unchanged, so a client
+        # that asked to wait and ran out of patience just polls like any other.
+        await session.refresh(execution)
+        return await execution_response(session, execution, waiting_for="worker")
+    if context.response is not None:
+        # It really did complete in this request, so this is no longer "accepted
+        # for later" -- saying 202 would misreport a body that carries the result.
+        context.response.status_code = status.HTTP_200_OK
+    return await execution_response(session, finished)
 
 
 @app.post(
@@ -912,6 +1027,7 @@ async def create_execution(
     sandbox_id: str,
     body: CodeExecutionCreate,
     request: Request,
+    response: Response,
     session: AsyncSession = Depends(get_session),
 ) -> ExecutionResponse:
     return await enqueue(
@@ -923,9 +1039,15 @@ async def create_execution(
             environment=body.env,
             cwd=None,
             timeout_seconds=body.timeout_seconds,
+            wait=body.wait,
+            wait_timeout_seconds=body.wait_timeout_seconds,
         ),
-        settings=settings_from(request),
-        session=session,
+        context=_EnqueueContext(
+            settings=settings_from(request),
+            session=session,
+            notifier=notifier_from(request),
+            response=response,
+        ),
     )
 
 
@@ -939,6 +1061,7 @@ async def create_command(
     sandbox_id: str,
     body: CommandCreate,
     request: Request,
+    response: Response,
     session: AsyncSession = Depends(get_session),
 ) -> ExecutionResponse:
     return await enqueue(
@@ -950,9 +1073,15 @@ async def create_command(
             environment=body.env,
             cwd=body.cwd,
             timeout_seconds=body.timeout_seconds,
+            wait=body.wait,
+            wait_timeout_seconds=body.wait_timeout_seconds,
         ),
-        settings=settings_from(request),
-        session=session,
+        context=_EnqueueContext(
+            settings=settings_from(request),
+            session=session,
+            notifier=notifier_from(request),
+            response=response,
+        ),
     )
 
 
@@ -966,6 +1095,7 @@ async def create_process(
     sandbox_id: str,
     body: ProcessCreate,
     request: Request,
+    response: Response,
     session: AsyncSession = Depends(get_session),
 ) -> ExecutionResponse:
     settings = settings_from(request)
@@ -986,9 +1116,15 @@ async def create_process(
             environment=seal_environment(settings, body.env, body.secret_env),
             cwd=body.cwd,
             timeout_seconds=body.timeout_seconds,
+            wait=body.wait,
+            wait_timeout_seconds=body.wait_timeout_seconds,
         ),
-        settings=settings,
-        session=session,
+        context=_EnqueueContext(
+            settings=settings,
+            session=session,
+            notifier=notifier_from(request),
+            response=response,
+        ),
     )
 
 
@@ -1074,25 +1210,41 @@ async def cancel_execution(
     "/v1/executions/{execution_id}/events",
     dependencies=authenticated,
 )
-async def execution_events(execution_id: str) -> StreamingResponse:
+async def execution_events(execution_id: str, request: Request) -> StreamingResponse:
+    notifier = notifier_from(request)
+    settings = settings_from(request)
+
     async def events() -> AsyncIterator[str]:
         previous: str | None = None
-        while True:
-            async with session_factory() as session:
-                execution = await session.get(Execution, execution_id)
-                if execution is None:
-                    yield 'event: error\ndata: {"detail":"execution not found"}\n\n'
-                    return
-                response = await execution_response(session, execution)
-                payload = response.model_dump_json()
-                if payload != previous:
-                    yield f"event: execution\ndata: {payload}\n\n"
-                    previous = payload
-                else:
-                    yield ": keepalive\n\n"
-                if execution.status in {"succeeded", "failed", "cancelled"}:
-                    return
-            await asyncio.sleep(1)
+        # Registered around the whole stream, not per iteration: a completion
+        # arriving between the read and the wait would otherwise be missed, and
+        # the stream would sit out a keepalive interval before reporting a
+        # result it could already see.
+        with notifier.execution_waiter(execution_id) as finished:
+            while True:
+                async with session_factory() as session:
+                    execution = await session.get(Execution, execution_id)
+                    if execution is None:
+                        yield 'event: error\ndata: {"detail":"execution not found"}\n\n'
+                        return
+                    response = await execution_response(session, execution)
+                    payload = response.model_dump_json()
+                    if payload != previous:
+                        yield f"event: execution\ndata: {payload}\n\n"
+                        previous = payload
+                    else:
+                        yield ": keepalive\n\n"
+                    if execution.status in TERMINAL_EXECUTION_STATES:
+                        return
+                finished.clear()
+                with contextlib.suppress(TimeoutError):
+                    # Was a flat one-second tick, which put up to a second
+                    # between an execution finishing and the client hearing
+                    # about it. Now the sleep is only the keepalive floor: a
+                    # notification cuts it short.
+                    await asyncio.wait_for(
+                        finished.wait(), timeout=settings.execution_stream_keepalive_seconds
+                    )
 
     return StreamingResponse(events(), media_type="text/event-stream")
 

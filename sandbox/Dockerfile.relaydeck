@@ -27,6 +27,12 @@ COPY sandbox/requirements-relaydeck.txt /tmp/requirements.txt
 RUN /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt
 
+# Serves POST /v1/executions. No forkrun here: this image carries no pandas,
+# so a preloading daemon would add a resident process to a 256 MB template for
+# nothing. execute_code falls back to running the runner directly when
+# /opt/forkrun.py is absent.
+COPY sandbox/coderun.py /opt/coderun.py
+
 WORKDIR /workspace
 USER 10001:10001
 

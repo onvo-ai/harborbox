@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 import os
+import secrets
 import shlex
 import tempfile
 from dataclasses import dataclass
@@ -13,7 +15,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, NoReturn
 
 import httpx
-from code_interpreter import CodeInterpreter, SupportedLanguage
 from opensandbox import Sandbox as OpenSandbox
 from opensandbox import SandboxManager
 from opensandbox.config import ConnectionConfig
@@ -51,6 +52,50 @@ if TYPE_CHECKING:
 
 SNAPSHOT_METADATA_KEY = "harborbox.runtime.snapshot_id"
 logger = logging.getLogger(__name__)
+
+# Absolute, not `python`: opensandbox runs commands through its own bootstrap
+# and the venv is only on PATH for the image's entrypoint.
+SANDBOX_PYTHON = "/opt/venv/bin/python"
+CODE_RUNNER_PATH = "/opt/coderun.py"
+FORKRUN_PATH = "/opt/forkrun.py"
+
+
+def _split_result_trailer(
+    chunks: list[str], sentinel: str
+) -> tuple[list[str], ExecutionResult | None, ExecutionError | None]:
+    """Pull `coderun.py`'s trailer off the end of stdout.
+
+    Returns the caller-visible stdout with the trailer removed, plus whatever
+    the trailer carried. A missing or unparsable trailer is not an error: output
+    is bounded (`_BoundedOutput`), so a large enough body can push the trailer
+    past the limit, and losing the final-expression echo is a better outcome
+    than failing an execution whose code ran fine.
+    """
+    joined = "".join(chunks)
+    marker = "\n" + sentinel
+    index = joined.rfind(marker)
+    if index == -1:
+        return chunks, None, None
+
+    payload, _, _ = joined[index + len(marker) :].partition("\n")
+    try:
+        decoded = json.loads(payload)
+    except json.JSONDecodeError:
+        return chunks, None, None
+
+    remaining = [joined[:index]] if joined[:index] else []
+    error = decoded.get("error")
+    return (
+        remaining,
+        ExecutionResult(text=decoded["text"]) if decoded.get("text") is not None else None,
+        ExecutionError(
+            name=str(error["name"]),
+            value=str(error["value"]),
+            traceback=[str(line) for line in error.get("traceback", [])],
+        )
+        if error
+        else None,
+    )
 
 
 @dataclass(frozen=True)
@@ -256,109 +301,73 @@ class OpenSandboxRuntime:
             self._raise_runtime_error(exc, sandbox)
 
     async def wait_until_ready(self, sandbox: Sandbox) -> None:
-        """Ready means the container answers — deliberately not the kernel.
+        """Ready means the container answers, which is now all there is to wait for.
 
-        Waiting for Jupyter here cost every sandbox ~6-11s of boot and kernel
-        spawn, and Onvo never uses the kernel: its client uploads a script and
-        runs it through /v1/sandboxes/{id}/commands, reading only stdout. So the
-        whole cost was paid for a capability the one caller does not touch, and
-        it showed up as a ~10x regression on dashboard refreshes.
-
-        `execute_code` waits for the kernel itself, so the callers that do use
-        Python contexts still get a clear failure instead of a race.
+        This used to be a careful distinction: readiness deliberately did not
+        wait for the Jupyter kernel, because doing so cost every sandbox its
+        boot and spawn for a capability the main caller never touched, and
+        `execute_code` paid it instead. With the kernel gone there is no second
+        thing to become ready -- a sandbox that answers can run Python.
         """
         await self._get_handle(sandbox, check_ready=True)
-
-    async def _wait_python_ready(self, sandbox: Sandbox, handle: OpenSandbox) -> None:
-        """Wait for the Jupyter kernel, not just the container.
-
-        opensandbox's health check covers execd, which is up almost
-        immediately. The Jupyter server that execd proxies Python to is started
-        by the sandbox entrypoint *after* execd, and takes an order of
-        magnitude longer to accept connections. execd retries `create_context`
-        for about twelve seconds and then gives up, so a cold sandbox raced its
-        own kernel and returned a 500 that said nothing about why — the only
-        trace being `no kernel specs found` in the sandbox's log.
-
-        Waiting here rather than retrying at execution time keeps the failure
-        in one place: by the time an execution is dispatched the sandbox can
-        actually run Python, or starting it failed and says so.
-        """
-        template = sandbox.metadata_.get("template")
-        base = self.settings.base_of_derived_template(template or "") or template
-        if base in self.settings.templates_without_python:
-            return
-
-        deadline = (
-            asyncio.get_running_loop().time()
-            + self.settings.sandbox_python_ready_timeout_seconds
-        )
-        last: Exception | None = None
-        while asyncio.get_running_loop().time() < deadline:
-            try:
-                interpreter = await CodeInterpreter.create(handle)
-                # The same call an execution makes, deliberately: a probe on a
-                # different endpoint proved nothing, since only this path goes
-                # through execd to the kernel.
-                # Generous per attempt: the first kernel start pays interpreter
-                # boot and import cost, and a tight cap here just turns a slow
-                # start into a retry storm against a sandbox that is working.
-                async with asyncio.timeout(60):
-                    await interpreter.codes.run(
-                        "pass", language=SupportedLanguage.PYTHON
-                    )
-            except Exception as exc:  # noqa: BLE001 - retried until the deadline
-                last = exc
-                logger.warning(
-                    "sandbox %s python not ready yet: %s: %s",
-                    sandbox.id,
-                    type(exc).__name__,
-                    exc,
-                )
-                await asyncio.sleep(1.0)
-            else:
-                return
-        message = (
-            "sandbox started but its Python kernel never became available after "
-            f"{self.settings.sandbox_python_ready_timeout_seconds}s: "
-            # The type matters: several SDK exceptions stringify to nothing.
-            f"{type(last).__name__}: {last}"
-        )
-        raise SandboxUnavailableError(message)
 
     async def execute_code(
         self, sandbox: Sandbox, request: AgentExecutionRequest
     ) -> AgentExecutionResponse:
-        if request.env:
-            return await self._run_command(
-                sandbox,
-                _CommandSpec(
-                    command=shlex.join(["python", "-c", request.code]),
-                    timeout_seconds=request.timeout_seconds,
-                    max_output_bytes=request.max_output_bytes,
-                    environment=request.env,
-                    cwd="/workspace",
-                ),
-            )
-        handle = await self._get_handle(sandbox, check_ready=True)
-        # Paid here rather than at sandbox-ready, so only callers that actually
-        # run Python through a kernel wait for one to exist.
-        await self._wait_python_ready(sandbox, handle)
-        output = _BoundedOutput(request.max_output_bytes)
-        try:
-            interpreter = await CodeInterpreter.create(handle)
-            async with asyncio.timeout(request.timeout_seconds):
-                execution = await interpreter.codes.run(
-                    request.code,
-                    language=SupportedLanguage.PYTHON,
-                    handlers=output.handlers(),
-                )
-            return output.response(execution)
-        except TimeoutError as exc:
-            message = f"code execution exceeded {request.timeout_seconds} seconds"
-            raise SandboxUnavailableError(message) from exc
-        except SandboxException as exc:
-            self._raise_runtime_error(exc, sandbox)
+        """Run Python as an ordinary command, via `coderun.py`.
+
+        There is no kernel behind this any more. execd runs bash directly and
+        only ever proxied Python to a Jupyter server, so serving this endpoint
+        meant starting one in every sandbox: ~3 s of boot and ~197 MB resident
+        before a line of user code ran, on templates whose main caller reaches
+        `/commands` instead. `coderun.py` reproduces the one thing the kernel
+        gave that a script does not -- the final-expression echo -- and
+        `forkrun.py` keeps the pandas import off the per-call path.
+
+        The old per-call-environment special case is gone with the kernel that
+        motivated it. Every execution is now a fresh forked child, so a secret
+        cannot linger in a persistent interpreter; there is no persistent
+        interpreter left to linger in.
+        """
+        sentinel = f"__harborbox_result_{secrets.token_hex(16)}__"
+        code_path = f"/tmp/harborbox-code-{secrets.token_hex(8)}.py"  # noqa: S108
+        encoded = base64.b64encode(request.code.encode("utf-8")).decode("ascii")
+        quoted_path = shlex.quote(code_path)
+        # forkrun is only in the images that carry pandas; relaydeck has no use
+        # for a preloading daemon and does not ship one, so fall back to running
+        # the runner directly rather than assuming it is there.
+        command = (
+            f"printf %s {shlex.quote(encoded)} | base64 -d > {quoted_path} && "
+            f"{{ if [ -f {FORKRUN_PATH} ]; then "
+            f"{SANDBOX_PYTHON} {FORKRUN_PATH} {CODE_RUNNER_PATH}; else "
+            f"{SANDBOX_PYTHON} {CODE_RUNNER_PATH}; fi; }}; "
+            f"rc=$?; rm -f {quoted_path}; exit $rc"
+        )
+        response = await self._run_command(
+            sandbox,
+            _CommandSpec(
+                command=command,
+                timeout_seconds=request.timeout_seconds,
+                max_output_bytes=request.max_output_bytes,
+                environment={
+                    **request.env,
+                    "HARBORBOX_CODE_PATH": code_path,
+                    "HARBORBOX_RESULT_SENTINEL": sentinel,
+                },
+                cwd="/workspace",
+            ),
+        )
+        stdout, result, error = _split_result_trailer(response.logs.stdout, sentinel)
+        return AgentExecutionResponse(
+            logs=LogOutput(
+                stdout=stdout,
+                stderr=response.logs.stderr,
+                truncated=response.logs.truncated,
+            ),
+            results=[result] if result is not None else [],
+            error=error or response.error,
+            exit_code=response.exit_code,
+        )
 
     async def execute_command(
         self, sandbox: Sandbox, request: AgentCommandRequest

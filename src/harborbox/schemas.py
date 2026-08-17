@@ -104,6 +104,8 @@ class CodeExecutionCreate(BaseModel):
     code: str
     timeout_seconds: int | None = Field(default=None, ge=1)
     env: dict[str, str] = Field(default_factory=dict)
+    wait: bool = False
+    wait_timeout_seconds: int | None = Field(default=None, ge=1)
 
 
 class CommandCreate(BaseModel):
@@ -111,6 +113,8 @@ class CommandCreate(BaseModel):
     timeout_seconds: int | None = Field(default=None, ge=1)
     env: dict[str, str] = Field(default_factory=dict)
     cwd: str | None = None
+    wait: bool = False
+    wait_timeout_seconds: int | None = Field(default=None, ge=1)
 
 
 class ProcessCreate(BaseModel):
@@ -121,6 +125,8 @@ class ProcessCreate(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
     secret_env: dict[str, str] = Field(default_factory=dict)
     cwd: str | None = None
+    wait: bool = False
+    wait_timeout_seconds: int | None = Field(default=None, ge=1)
 
 
 class LogOutput(BaseModel):

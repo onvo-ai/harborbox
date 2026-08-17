@@ -25,6 +25,7 @@ Usage:  python forkrun.py <script.py>
 """
 
 import contextlib
+import json
 import os
 import runpy
 import select
@@ -38,7 +39,14 @@ from pathlib import Path
 # Runs only inside the single-tenant sandbox container's tmpfs /tmp (see
 # DockerRuntime._start_sandbox_sync in src/harborbox/runtime.py); a fixed
 # path is fine because nothing outside this one container ever sees it.
-SOCKET_PATH = "/tmp/.harborbox-forkrun.sock"  # noqa: S108
+#
+# Overridable so tests can run a daemon of their own without colliding with a
+# real one. Not a security boundary either way: anything that can set this
+# variable is already running code inside the sandbox.
+SOCKET_PATH = os.environ.get(
+    "HARBORBOX_FORKRUN_SOCKET",
+    "/tmp/.harborbox-forkrun.sock",  # noqa: S108
+)
 
 # Imported once in the daemon and inherited by every child. Kept to what widget
 # templates actually import: anything else is memory every child pays for.
@@ -46,6 +54,23 @@ PRELOAD = ("pandas", "numpy", "json", "datetime", "math")
 
 _READY_TIMEOUT_S = 30.0
 _EXPECTED_ARGC = 2
+
+
+def _apply_request(path: str, argv: "list[str]", env: "dict[str, str] | None") -> None:
+    """Give the child the argv and environment the *client* had, not the daemon's.
+
+    A forked child inherits the daemon's `os.environ`, and the daemon was
+    started by whichever call happened to be first. Without this, a per-call
+    environment -- the credentials `/v1/sandboxes/{id}/commands` injects, or the
+    code path and result sentinel `coderun.py` reads -- is silently invisible to
+    the script, which then runs against whatever the first caller happened to
+    have. Replacing the mapping wholesale is what makes a forked run match
+    `python script.py`.
+    """
+    sys.argv = [path, *argv]
+    if env is not None:
+        os.environ.clear()
+        os.environ.update(env)
 
 
 def _run_in_process(path: str) -> int:
@@ -64,6 +89,33 @@ def _run_in_process(path: str) -> int:
         traceback.print_exc()
         return 1
     return 0
+
+
+def _encode_request(path: str, argv: "list[str]", env: "dict[str, str]") -> bytes:
+    return json.dumps({"path": path, "argv": argv, "env": env}).encode("utf-8")
+
+
+def _decode_request(payload: bytes) -> "tuple[str, list[str], dict[str, str] | None]":
+    """Decode a run request, tolerating the older bare-path framing.
+
+    The daemon outlives the call that spawned it but not the container, so
+    client and daemon are always the same file. The bare-path fallback is for
+    a daemon left running across an in-place file swap during development,
+    where the alternative is a confusing JSON decode error.
+    """
+    try:
+        request = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return payload.decode("utf-8", errors="replace"), [], None
+    if not isinstance(request, dict) or "path" not in request:
+        return payload.decode("utf-8", errors="replace"), [], None
+    return (
+        str(request["path"]),
+        [str(item) for item in request.get("argv", [])],
+        {str(key): str(value) for key, value in request["env"].items()}
+        if isinstance(request.get("env"), dict)
+        else None,
+    )
 
 
 def _recv_exact(sock: socket.socket, count: int) -> bytes:
@@ -117,7 +169,7 @@ def _serve() -> None:
         conn, _ = server.accept()
         try:
             length = struct.unpack("!I", _recv_exact(conn, 4))[0]
-            path = _recv_exact(conn, length).decode("utf-8")
+            path, argv, env = _decode_request(_recv_exact(conn, length))
 
             out_r, out_w = os.pipe()
             err_r, err_w = os.pipe()
@@ -133,6 +185,7 @@ def _serve() -> None:
                     os.dup2(err_w, 2)
                     os.close(out_w)
                     os.close(err_w)
+                    _apply_request(path, argv, env)
                     code = _run_in_process(path)
                     sys.stdout.flush()
                     sys.stderr.flush()
@@ -209,19 +262,21 @@ def main(argv: "list[str]") -> int:
     if len(argv) == _EXPECTED_ARGC and argv[1] == "--serve":
         _serve()
         return 0
-    if len(argv) != _EXPECTED_ARGC:
+    if len(argv) < _EXPECTED_ARGC:
         # This is the script's CLI usage message, not application logging;
         # stdout/stderr is the interface (see module docstring).
-        print("usage: forkrun.py <script.py>", file=sys.stderr)  # noqa: T201
+        print("usage: forkrun.py <script.py> [args...]", file=sys.stderr)  # noqa: T201
         return 2
 
     path = str(Path(argv[1]).resolve())
+    script_argv = argv[2:]
     sock = _connect()
     if sock is None:
+        _apply_request(path, script_argv, None)
         return _run_in_process(path)
 
     try:
-        encoded = path.encode("utf-8")
+        encoded = _encode_request(path, script_argv, dict(os.environ))
         sock.sendall(struct.pack("!I", len(encoded)) + encoded)
         rc, out_len, err_len = struct.unpack("!iII", _recv_exact(sock, 12))
         stdout = _recv_exact(sock, out_len)
@@ -231,6 +286,7 @@ def main(argv: "list[str]") -> int:
     # the documented fallback behaviour, narrowed to what this exchange can
     # actually raise.
     except (OSError, EOFError, struct.error):
+        _apply_request(path, script_argv, None)
         return _run_in_process(path)
     finally:
         with contextlib.suppress(OSError):

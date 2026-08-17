@@ -11,6 +11,41 @@ if TYPE_CHECKING:
 
 TERMINAL_STATES = {"succeeded", "failed", "cancelled"}
 
+# Bounds for `Execution.wait`'s fallback polling. It starts tight so a result
+# that lands just after submission is picked up almost at once, and backs off so
+# a long execution is not polled hundreds of times to no purpose.
+MIN_POLL_INTERVAL = 0.02
+MAX_POLL_INTERVAL = 1.0
+
+# Extra seconds allowed on an inline-wait HTTP request, over the execution
+# budget the server is being asked to wait for. Without it the client's own
+# request timeout would fire first and turn a working inline wait into a
+# spurious connection error.
+INLINE_WAIT_HTTP_MARGIN = 15.0
+
+# Assumed server-side execution budget when the caller names no timeout. Matches
+# `Settings.default_execution_timeout_seconds`; only used to size the client's
+# own HTTP timeout, so drift costs a fallback to polling, never a wrong result.
+DEFAULT_INLINE_WAIT_SECONDS = 30.0
+
+
+def _inline_wait_options(
+    *, wait: bool, wait_timeout: float | None, timeout: int | None
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Split inline-wait settings into request-body fields and httpx kwargs.
+
+    The body half asks the server to hold the connection; the httpx half widens
+    this one request's timeout so the client does not give up while the server
+    is still legitimately waiting. Shared by `run_code` and `commands.run`
+    because getting only one of the two halves right is a silent bug.
+    """
+    body: dict[str, Any] = {"wait": wait}
+    if not wait:
+        return body, {}
+    body["wait_timeout_seconds"] = math.ceil(wait_timeout) if wait_timeout else None
+    budget = wait_timeout or timeout or DEFAULT_INLINE_WAIT_SECONDS
+    return body, {"timeout": budget + INLINE_WAIT_HTTP_MARGIN}
+
 
 @dataclass(frozen=True)
 class Logs:
@@ -100,15 +135,31 @@ class Execution:
         self,
         timeout: float | None = None,
         *,
-        poll_interval: float = 0.2,
+        poll_interval: float | None = None,
         raise_on_error: bool = False,
     ) -> Execution:
+        """Poll until this execution finishes.
+
+        This is the fallback path now: `run_code` and `commands.run` ask the
+        server to hold the connection instead, and only land here when the
+        execution outlives the server's willingness to wait. It stays public
+        because a caller who submitted with `wait=False` still needs it.
+
+        The interval backs off from `MIN_POLL_INTERVAL` to `MAX_POLL_INTERVAL`
+        rather than sitting at a flat 200 ms, so a result that arrives just
+        after submission is seen almost immediately while a long execution is
+        not polled hundreds of times. Passing `poll_interval` pins it flat, as
+        before.
+        """
         deadline = time.monotonic() + timeout if timeout is not None else None
+        interval = poll_interval if poll_interval is not None else MIN_POLL_INTERVAL
         while self.status not in TERMINAL_STATES:
             if deadline is not None and time.monotonic() >= deadline:
                 timeout_message = f"execution {self.id} did not finish in time"
                 raise TimeoutError(timeout_message)
-            time.sleep(poll_interval)
+            time.sleep(interval)
+            if poll_interval is None:
+                interval = min(interval * 2, MAX_POLL_INTERVAL)
             self.refresh()
         if raise_on_error and self.status != "succeeded":
             message = self.error.value if self.error else self.status
@@ -139,6 +190,9 @@ class Commands:
         wait: bool = True,
         wait_timeout: float | None = None,
     ) -> Execution:
+        body, request_options = _inline_wait_options(
+            wait=wait, wait_timeout=wait_timeout, timeout=timeout
+        )
         execution = Execution(
             self._sandbox._client,
             self._sandbox._client._request(
@@ -149,10 +203,14 @@ class Commands:
                     "timeout_seconds": timeout,
                     "env": env or {},
                     "cwd": cwd,
+                    **body,
                 },
+                **request_options,
             ),
         )
-        return execution.wait(wait_timeout) if wait else execution
+        if not wait or execution.status in TERMINAL_STATES:
+            return execution
+        return execution.wait(wait_timeout)
 
 
 class Files:
@@ -227,6 +285,13 @@ class Sandbox:
         wait: bool = True,
         wait_timeout: float | None = None,
     ) -> Execution:
+        # Let the server hold the connection until the result is ready. It
+        # answers as soon as the execution finishes, so the common case is one
+        # round trip instead of a poll loop whose interval was most of the
+        # latency on fast code.
+        body, request_options = _inline_wait_options(
+            wait=wait, wait_timeout=wait_timeout, timeout=timeout
+        )
         execution = Execution(
             self._client,
             self._client._request(
@@ -236,10 +301,16 @@ class Sandbox:
                     "code": code,
                     "timeout_seconds": timeout,
                     "env": env or {},
+                    **body,
                 },
+                **request_options,
             ),
         )
-        return execution.wait(wait_timeout) if wait else execution
+        if not wait or execution.status in TERMINAL_STATES:
+            return execution
+        # The server gave up waiting before the execution finished. Falling back
+        # to polling keeps the same contract for slow work.
+        return execution.wait(wait_timeout)
 
     def refresh(self) -> Sandbox:
         self._apply(self._client._request("GET", f"/v1/sandboxes/{self.id}"))

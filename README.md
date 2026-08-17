@@ -24,7 +24,7 @@ client -> Harborbox API -> PostgreSQL queue -> scheduler -> OpenSandbox -> runti
 - Live available-memory emergency guard
 - FIFO scheduling with bounded backfilling and aging
 - Upstream OpenSandbox lifecycle, execution, filesystem, and snapshot APIs
-- Stateful Python execution through OpenSandbox Code Interpreter
+- Python execution as an ordinary command, with no kernel in the sandbox
 - Queued shell commands
 - Queued argv-safe process execution with per-call secret environments
 - File read, write, list, and remove operations
@@ -314,12 +314,27 @@ and queue counts.
 
 ### Pause behavior
 
-- `sandbox.pause(memory=True)` delegates to OpenSandbox pause. On Docker, kernel
-  variables and processes survive and the full memory remains reserved.
+- `sandbox.pause(memory=True)` delegates to OpenSandbox pause. On Docker,
+  processes survive and the full memory remains reserved. Resuming is an
+  unfreeze, which is the only resume path that is plausibly sub-second.
 - `sandbox.pause(memory=False)` creates an OpenSandbox filesystem snapshot and
-  terminates the runtime. CPU and memory are released; files survive, while live
-  processes and in-memory interpreter variables do not.
-- Idle sandboxes cold-pause after `idle_timeout_seconds` unless the value is `0`.
+  terminates the runtime. CPU and memory are released; files survive, live
+  processes do not. Resuming builds a new container from the snapshot, which
+  costs seconds.
+
+Idle sandboxes walk down both tiers rather than dropping straight to cold:
+
+```text
+running --(hot_pause_idle_seconds)--> paused_memory --(idle_timeout_seconds)--> paused_cold
+```
+
+Freezing first keeps the container for a sandbox that is used again shortly
+afterwards, while anything genuinely finished still goes cold on the same
+`idle_timeout_seconds` as before. Because a frozen sandbox holds its whole
+memory reservation, the tier is capped by `HARBORBOX_HOT_PAUSE_BUDGET_MB`;
+past the cap, sandboxes go straight to cold. Set
+`HARBORBOX_HOT_PAUSE_IDLE_SECONDS=0` to disable the tier entirely and restore
+the previous behavior. `idle_timeout_seconds: 0` still means "never suspend".
 
 ## Parent-machine protection
 
@@ -387,16 +402,30 @@ status.
 the derived registry. Static entries have a null `spec_hash` and a `status` of
 `ready`.
 
+`POST .../executions`, `.../commands` and `.../processes` accept
+`"wait": true`, which holds the connection until the execution finishes and
+answers `200` with the result instead of `202` with a job id. If the execution
+outlives the wait the response is still `202`, so a client that asked to wait
+and ran out of patience simply polls as before. Both SDKs send it by default.
+
 `PUT .../files/content?path=/tmp/file.bin` accepts
 `application/octet-stream` and streams the request through the control plane.
 It does not create a base64 copy of large uploads. File API absolute paths are
 limited to `/workspace` and `/tmp`; other absolute roots and traversal are
 rejected.
 
-Python code without an environment override uses OpenSandbox's persistent
-interpreter context. Code carrying per-call environment variables is executed as
-an isolated `python -c` process so credentials do not remain in the persistent
-interpreter.
+Python code runs as an ordinary command through `/opt/coderun.py`, which
+reproduces the one thing a Jupyter kernel provided that a plain script does
+not: the value of a trailing expression, returned in `results[0].text`. There
+is no persistent interpreter, so the old special case for per-call environment
+variables is gone -- every execution is a fresh forked child and a secret has
+nowhere to linger. Where `/opt/forkrun.py` is present (onvo-pro, onvo-lite) the
+child is forked from a daemon that has already imported pandas, which keeps the
+~1.5 s import off every call.
+
+Removing the kernel took ~3 s of boot and ~197 MB of resident memory out of
+every onvo-pro and onvo-lite sandbox; see `scripts/bench/` for the harness and
+`scripts/bench/results/` for the measurements.
 
 ## Development
 
