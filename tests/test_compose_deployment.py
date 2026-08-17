@@ -425,3 +425,33 @@ def test_the_api_can_reach_the_registry_it_deletes_from(compose: dict) -> None:
     )
 
     assert shared
+
+
+LOCAL_COMPOSE = Path(__file__).resolve().parent.parent / "compose.yaml"
+
+
+def test_the_bundled_local_stack_can_actually_construct_its_settings() -> None:
+    """compose.yaml's own defaults must boot, and nothing was checking that.
+
+    Every other test in this module reads compose.internal-tools.yaml, so a
+    validator that rejected the *local* defaults passed the whole suite and
+    then refused to start: `warm pool leaves no CPU headroom`, on `docker
+    compose up` with no .env at all.
+    """
+    compose = yaml.safe_load(LOCAL_COMPOSE.read_text())
+    env = {
+        key: resolve(value)
+        for key, value in compose["services"]["api"]["environment"].items()
+        if ":?" not in str(value)
+    }
+    prefix = "HARBORBOX_"
+
+    settings = Settings(
+        **{
+            key[len(prefix) :].lower(): _decode(value)
+            for key, value in env.items()
+            if key.startswith(prefix)
+        }
+    )
+
+    assert settings.warm_pool_sizes

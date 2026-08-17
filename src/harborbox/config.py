@@ -398,14 +398,21 @@ class Settings(BaseSettings):
         Onvo Lite hit exactly this: pool 3.0, ceiling 4.0, onvo-lite needs 2.0.
         The check above passed it.
 
-        "Largest" now has to account for templates this config has never seen:
-        a product builds its own image and sizes it per request, so the biggest
-        thing that can ask for admission is bounded by `max_sandbox_cpu`, not
-        by anything registered here.
+        "Largest" is the biggest template this configuration knows about: the
+        registered base, plus anything named in the warm pool. Deliberately not
+        `max_sandbox_cpu` -- that is a per-sandbox *ceiling*, not a size anyone
+        asks for, and treating it as the largest template makes the check
+        refuse the bundled defaults (a 1.0 pool against a 4.0 budget fails on a
+        4.0 "largest"). A product sizes its own template per request and is
+        bounded by admission at runtime, which is the right place for it.
         """
         largest_template_cpu = max(
+            (self.resources_for_template(template)[1] for template in self.warm_pool_sizes),
+            default=0.0,
+        )
+        largest_template_cpu = max(
+            largest_template_cpu,
             *(cpu for _, cpu in self.template_resources.values()),
-            self.max_sandbox_cpu,
         )
         if (
             self.max_parallel_cpu is not None
