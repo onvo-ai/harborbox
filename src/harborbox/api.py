@@ -19,7 +19,7 @@ from harborbox import __version__
 from harborbox.admission import can_admit
 from harborbox.config import Settings, get_settings
 from harborbox.db import create_schema, get_session, session_factory
-from harborbox.errors import SandboxUnavailableError
+from harborbox.errors import SandboxStartTimeoutError, SandboxUnavailableError
 from harborbox.execution_secrets import scrub_environment, seal_environment
 from harborbox.models import Execution, Sandbox, SandboxTemplate, utc_now
 from harborbox.notify import ExecutionNotifier
@@ -46,6 +46,7 @@ from harborbox.scheduler import (
     TERMINAL_EXECUTION_STATES,
     Scheduler,
     has_sandbox_execution_slot,
+    lazy_start_action,
     plan_pause,
 )
 from harborbox.schemas import (
@@ -198,12 +199,73 @@ def opensandbox_error(detail: str, status_code: int = 422) -> HTTPException:
     )
 
 
-def require_running(sandbox: Sandbox) -> None:
-    if sandbox.status != "running":
+async def ensure_ready(
+    sandbox: Sandbox, request: Request, session: AsyncSession
+) -> Sandbox:
+    """Bring `sandbox` to `running` before an operation that needs it there.
+
+    File I/O and the status-configuring PATCH used to require `running`
+    outright and 409 otherwise -- but nothing except `create_execution` /
+    `create_command` / `create_process` ever started a sandbox, so a sandbox
+    whose first call was a file write (Onvo's own pattern: create, upload,
+    transform) 409'd every time. This lazily starts it instead, admission-
+    checked the same way `resume_sandbox` already checks capacity before
+    starting one, and bounded by `lazy_start_wait_timeout_seconds` so a slow
+    or stuck runtime surfaces as a clear 503 rather than hanging the request.
+    """
+    action = lazy_start_action(sandbox.status)
+    if action == "unavailable":
         raise HTTPException(
             status_code=409,
             detail=f"sandbox must be running; current status is {sandbox.status}",
         )
+    if action == "ready":
+        return sandbox
+
+    settings = settings_from(request)
+    scheduler = scheduler_from(request)
+    if sandbox.status not in RESERVED_SANDBOX_STATES:
+        capacity = await scheduler.capacity()
+        decision = can_admit(
+            capacity,
+            incremental_memory_mb=sandbox.memory_mb,
+            incremental_cpu=sandbox.cpu,
+            emergency_available_memory_mb=settings.emergency_available_memory_mb,
+        )
+        if not decision.admitted:
+            raise HTTPException(
+                status_code=429,
+                detail=f"insufficient {decision.waiting_for} capacity",
+                headers={"Retry-After": "1"},
+            )
+        # Reserve up front, in the same transaction as the decision above, so
+        # a second concurrent request against this same `created` sandbox
+        # sees `starting` (a RESERVED_SANDBOX_STATES member) and does not
+        # double-count its memory/cpu against capacity.
+        sandbox.status = "starting"
+        await session.commit()
+
+    try:
+        await scheduler.ensure_sandbox_ready(
+            sandbox.id, timeout_seconds=settings.lazy_start_wait_timeout_seconds
+        )
+    except SandboxStartTimeoutError as exc:
+        # Not a failure: the start is still going in the background (see
+        # `Scheduler.ensure_sandbox_ready`). A retry either finds `running`
+        # or waits on the same in-flight start again.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except SandboxUnavailableError as exc:
+        # Mirrors `resume_sandbox`'s own handling of the same exception, with
+        # one refinement: refresh first, so a sandbox the scheduler already
+        # discovered was concurrently killed keeps `killed` rather than this
+        # overwriting it with `failed`.
+        await session.refresh(sandbox)
+        if sandbox.status not in {"killed", "failed"}:
+            sandbox.status = "failed"
+            await session.commit()
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    await session.refresh(sandbox)
+    return sandbox
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -517,11 +579,26 @@ async def get_sandbox(
 async def update_sandbox(
     sandbox_id: str,
     body: SandboxUpdate,
+    request: Request,
     session: AsyncSession = Depends(get_session),
 ) -> Sandbox:
     sandbox = await get_sandbox_or_404(session, sandbox_id)
-    if sandbox.status in {"killed", "failed"}:
+    if lazy_start_action(sandbox.status) == "unavailable":
         raise HTTPException(status_code=409, detail=f"cannot update {sandbox.status}")
+    # A never-started sandbox is lazily started here, the same way the file
+    # endpoints do: an idle timeout only means anything once the sandbox is
+    # actually running (the reaper only ever cold-pauses `running`
+    # sandboxes), and a caller configuring it is, in practice, about to use
+    # the sandbox (this is exactly Onvo's own pattern: create, configure,
+    # then run). A caller who *explicitly paused* the sandbox is a different
+    # story: `paused_cold`/`paused_memory` are left exactly as this endpoint
+    # always left them -- a metadata PATCH must not have the side effect of
+    # spinning a container back up and restarting idle accounting on a
+    # sandbox someone deliberately put to sleep. Only file I/O, where there
+    # is no way to serve the request without a live container, revives a
+    # paused sandbox.
+    if sandbox.status in {"created", "starting"}:
+        sandbox = await ensure_ready(sandbox, request, session)
     if body.idle_timeout_seconds is not None:
         sandbox.idle_timeout_seconds = body.idle_timeout_seconds
     sandbox.last_activity_at = utc_now()
@@ -1218,7 +1295,7 @@ async def read_file(
     session: AsyncSession = Depends(get_session),
 ) -> FileReadResponse:
     sandbox = await get_sandbox_or_404(session, sandbox_id)
-    require_running(sandbox)
+    sandbox = await ensure_ready(sandbox, request, session)
     try:
         return await runtime_from(request).read_file(sandbox, path)
     except httpx.HTTPStatusError as exc:
@@ -1237,7 +1314,7 @@ async def write_file(
     session: AsyncSession = Depends(get_session),
 ) -> FileReadResponse:
     sandbox = await get_sandbox_or_404(session, sandbox_id)
-    require_running(sandbox)
+    sandbox = await ensure_ready(sandbox, request, session)
     try:
         return await runtime_from(request).write_file(sandbox, body)
     except httpx.HTTPStatusError as exc:
@@ -1256,7 +1333,7 @@ async def upload_file_content(
     session: AsyncSession = Depends(get_session),
 ) -> FileUploadResponse:
     sandbox = await get_sandbox_or_404(session, sandbox_id)
-    require_running(sandbox)
+    sandbox = await ensure_ready(sandbox, request, session)
     content_length = request.headers.get("content-length")
     max_bytes = settings_from(request).max_upload_bytes
     if content_length and int(content_length) > max_bytes:
@@ -1283,7 +1360,7 @@ async def list_files(
     session: AsyncSession = Depends(get_session),
 ) -> FileListResponse:
     sandbox = await get_sandbox_or_404(session, sandbox_id)
-    require_running(sandbox)
+    sandbox = await ensure_ready(sandbox, request, session)
     try:
         return await runtime_from(request).list_files(sandbox, path)
     except httpx.HTTPStatusError as exc:
@@ -1302,7 +1379,7 @@ async def remove_file(
     session: AsyncSession = Depends(get_session),
 ) -> Response:
     sandbox = await get_sandbox_or_404(session, sandbox_id)
-    require_running(sandbox)
+    sandbox = await ensure_ready(sandbox, request, session)
     try:
         await runtime_from(request).remove_file(sandbox, path)
     except httpx.HTTPStatusError as exc:

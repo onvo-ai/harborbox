@@ -6,7 +6,7 @@ carrying rows from five days earlier, and the local instance had accumulated
 enough noise to make a real fault ("which of these is my stuck one?") genuinely
 hard to read.
 
-Two distinct leaks, deliberately handled differently:
+Three distinct leaks, deliberately handled differently:
 
 * **`created` that never started.** A sandbox is created, then started lazily by
   its first execution. If that start fails — a bad image, no capacity, a Docker
@@ -17,9 +17,22 @@ Two distinct leaks, deliberately handled differently:
   only a record. They are pruned on a longer horizon so a recent failure is
   still there to be inspected, which is exactly when someone wants it.
 
-Neither state reserves CPU or memory (see `RESERVED_SANDBOX_STATES`), so this is
-housekeeping rather than a capacity fix — the capacity bug it was mistaken for
-is guarded in `Settings.validate_warm_pool_budget`.
+* **`starting` that never finished starting.** Unlike the two states above,
+  `starting` *is* a `RESERVED_SANDBOX_STATES` member — it holds real memory
+  and CPU reservation. `Scheduler._ensure_running` is the primary fix for
+  this (it marks a sandbox `failed` itself the moment its own start errors,
+  regardless of whether the original caller is still around to notice), but
+  this sweep is the backstop for whatever gets past that -- a process
+  restart mid-start is already recovered by `Scheduler._recover_interrupted_jobs`
+  on boot, so what is left for this to catch is narrow, but "the one thing
+  that holds a capacity reservation forever" is exactly the kind of leak
+  that deserves a second layer.
+
+`created` and `failed` reserve nothing (see `RESERVED_SANDBOX_STATES`), so
+reclaiming those is housekeeping rather than a capacity fix — the capacity
+bug they were once mistaken for is guarded in
+`Settings.validate_warm_pool_budget`. `starting` is the exception: reclaiming
+it *is* a capacity fix, which is why it gets its own, shorter threshold.
 """
 
 from __future__ import annotations
@@ -71,6 +84,7 @@ def plan_reap(
     now: datetime,
     stuck_created_after: timedelta,
     failed_retention: timedelta,
+    stuck_starting_after: timedelta | None = None,
 ) -> ReapPlan:
     """Decide what to reclaim.
 
@@ -78,6 +92,11 @@ def plan_reap(
     sandbox touched recently is one someone may still be waiting on, and the
     cost of waiting another cycle is far lower than the cost of deleting a
     sandbox out from under a live execution.
+
+    `stuck_starting_after` defaults to `None` (skip `starting` entirely)
+    rather than reusing `stuck_created_after` -- `starting` reserves real
+    capacity and deserves its own, shorter threshold; callers that care
+    about reclaiming it (`reap_once`) pass one explicitly.
     """
     delete: list[str] = []
     prune: list[str] = []
@@ -94,6 +113,12 @@ def plan_reap(
             delete.append(c.id)
         elif c.status == "failed" and age >= failed_retention:
             prune.append(c.id)
+        elif (
+            c.status == "starting"
+            and stuck_starting_after is not None
+            and age >= stuck_starting_after
+        ):
+            delete.append(c.id)
 
     return ReapPlan(delete=tuple(delete), prune=tuple(prune))
 
@@ -109,7 +134,9 @@ async def reap_once(
     async with session_factory() as session:
         rows = (
             await session.execute(
-                select(Sandbox).where(Sandbox.status.in_(("created", "failed")))
+                select(Sandbox).where(
+                    Sandbox.status.in_(("created", "failed", "starting"))
+                )
             )
         ).scalars().all()
 
@@ -128,6 +155,9 @@ async def reap_once(
                 seconds=settings.reaper_stuck_created_after_seconds
             ),
             failed_retention=timedelta(hours=settings.reaper_failed_retention_hours),
+            stuck_starting_after=timedelta(
+                seconds=settings.reaper_stuck_starting_after_seconds
+            ),
         )
         if plan.total == 0:
             return plan

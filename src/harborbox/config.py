@@ -44,6 +44,14 @@ class Settings(BaseSettings):
     opensandbox_api_key: SecretStr = SecretStr("change-me-opensandbox")
     opensandbox_use_server_proxy: bool = True
     opensandbox_ready_timeout_seconds: float = Field(default=30.0, gt=0)
+    # Bounds the live get_sandbox_info() lookup _detect_memory_exceeded makes
+    # on every runtime error (14 call sites) to work out whether a failure was
+    # an OOM kill. It is a diagnostic, not a critical path: without its own
+    # short bound it inherits ConnectionConfig.request_timeout
+    # (opensandbox_ready_timeout_seconds, 30s by default), which would let a
+    # degraded control plane add up to another 30s on top of every error --
+    # worst exactly when callers can least afford to wait longer.
+    oom_diagnostic_timeout_seconds: float = Field(default=3.0, gt=0)
     opensandbox_snapshot_timeout_seconds: float = Field(default=300.0, gt=0)
     docker_base_url: str | None = None
     sandbox_image: str = "harborbox-sandbox:local"
@@ -77,6 +85,16 @@ class Settings(BaseSettings):
     # A sandbox starts lazily on its first execution, so `created` is normal
     # briefly. Fifteen minutes is far longer than any legitimate start.
     reaper_stuck_created_after_seconds: int = Field(default=900, ge=60)
+    # `starting` is a RESERVED_SANDBOX_STATES member, so a start that gets
+    # abandoned there -- rather than the primary fix in
+    # `Scheduler._ensure_running` catching it -- holds real capacity, unlike
+    # a stuck `created` row. Shorter than reaper_stuck_created_after_seconds
+    # on purpose: five minutes is generous over every start budget that
+    # feeds into it (opensandbox_ready_timeout_seconds and
+    # lazy_start_wait_timeout_seconds combined top out well under this), so
+    # anything still `starting` this long is abandoned, not slow. Defence in
+    # depth, not the primary fix.
+    reaper_stuck_starting_after_seconds: int = Field(default=300, ge=30)
     # Long enough that a failure is still there when someone comes to look.
     reaper_failed_retention_hours: int = Field(default=24, ge=1)
 
@@ -147,6 +165,14 @@ class Settings(BaseSettings):
     # needs. Freezing stops at this total and everything above it goes straight
     # to cold. 0 disables the tier the same way as above.
     hot_pause_budget_mb: int = Field(default=2048, ge=0)
+    # Budget for an HTTP request (a file operation, or a PATCH that touches the
+    # sandbox) that lands on a not-yet-running sandbox and triggers the same
+    # lazy start command and process creation have always benefited from. Sized
+    # to match the full cold-start budget a first execution gets end to end:
+    # container create plus health check, which since the kernel's removal is
+    # all there is to wait for. If it elapses the start is not aborted, only the
+    # caller's wait: see `Scheduler.ensure_sandbox_ready`.
+    lazy_start_wait_timeout_seconds: float = Field(default=60.0, gt=0)
     reaper_poll_seconds: float = Field(default=5.0, gt=0)
     # How many started-but-unassigned sandboxes to keep ready. 0 disables the
     # pool entirely, which is the old behaviour: every caller pays the container

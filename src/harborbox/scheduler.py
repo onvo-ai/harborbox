@@ -5,14 +5,18 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import selectinload
 
 from harborbox.admission import Capacity, can_admit, reserve_memory
 from harborbox.db import session_factory
-from harborbox.errors import SandboxMemoryExceededError, SandboxUnavailableError
+from harborbox.errors import (
+    SandboxMemoryExceededError,
+    SandboxStartTimeoutError,
+    SandboxUnavailableError,
+)
 from harborbox.execution_secrets import open_environment, scrub_environment
 from harborbox.models import Execution, Sandbox, SandboxTemplate, utc_now
 from harborbox.opensandbox_compat import expiration
@@ -55,7 +59,41 @@ RESERVED_SANDBOX_STATES = (
 # to track a future class rename without a coordinated API change.
 ERROR_NAME_SANDBOX_UNAVAILABLE = "SandboxUnavailable"
 
+# Same wire-contract reasoning as ERROR_NAME_SANDBOX_UNAVAILABLE above: this is
+# what `execution.error.name` carries over the API, kept as an explicit
+# constant rather than a literal scattered across `_run_execution` so the two
+# never drift independently of each other again.
+ERROR_NAME_MEMORY_LIMIT_EXCEEDED = "MemoryLimitExceeded"
+
 TERMINAL_EXECUTION_STATES = ("succeeded", "failed", "cancelled")
+
+
+def lazy_start_action(status: str) -> Literal["ready", "start", "unavailable"]:
+    """Whether a request needing a running sandbox should proceed, start, or fail.
+
+    Used by API endpoints that touch the runtime directly -- file I/O and the
+    status-configuring PATCH -- which used to hard-require `running` and 409
+    otherwise. Nothing but `create_execution`/`create_command`/`create_process`
+    ever started a sandbox, so a sandbox whose first call was a file write
+    (Onvo's own pattern: create, upload, transform) 409'd every time, even
+    though `_ensure_running` already knows how to bring one up.
+
+    Mirrors `may_start_execution`'s terminal check: `killed`/`failed`
+    sandboxes never come back, so nothing should try to start one. `pooled`/
+    `pooling` are unavailable too, but for a different reason: those rows
+    are warm-pool internals, not yet adopted by any caller, and
+    `_ensure_running_locked` has no branch for them -- it would raise
+    `SandboxUnavailableError("sandbox is pooled")`, and with it a warm-pool
+    row would get marked `failed` by `_ensure_running`'s own cleanup,
+    destroying it for a request that has no business touching it at all.
+    Every other non-running status (`created`, `starting`, `paused_cold`,
+    `paused_memory`) is exactly what `_ensure_running_locked` handles.
+    """
+    if status == "running":
+        return "ready"
+    if status in {"killed", "failed", "pooled", "pooling"}:
+        return "unavailable"
+    return "start"
 
 
 def may_start_execution(
@@ -228,6 +266,22 @@ def plan_suspensions(
 
 
 class Scheduler:
+    """Owns admission, lazy start, and the idle/reap sweeps for one process.
+
+    The whole mutual-exclusion story here -- `_sandbox_start_locks`,
+    `_pending_starts`, the single-start guarantee `ensure_sandbox_ready`
+    documents -- is an in-process `asyncio.Lock`/task-dedup scheme. That is
+    only sufficient because deployment runs exactly one of this process per
+    Postgres database (`Dockerfile.api`'s `uvicorn` has no `--workers`, and
+    there is no multi-replica story yet). A second replica, or a second
+    worker process, sharing the same database would race two `Scheduler`
+    instances with two independent, unrelated lock dicts against the same
+    sandbox row and could produce two containers for one sandbox. Scaling
+    beyond one process needs a database-level lock (e.g. `SELECT ... FOR
+    UPDATE` on the sandbox row, the same pattern `_admit_available_jobs`
+    already uses for admission) in place of, or alongside, this.
+    """
+
     def __init__(
         self,
         settings: Settings,
@@ -247,6 +301,12 @@ class Scheduler:
         self._reaper_task: asyncio.Task[None] | None = None
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._sandbox_start_locks: dict[str, asyncio.Lock] = {}
+        # Keyed by sandbox_id, tracks a lazy start triggered outside the
+        # execution path (see `ensure_sandbox_ready`) so a second concurrent
+        # caller reattaches to the same in-flight start instead of racing
+        # `_ensure_running`'s lock to spawn a duplicate task, and so the task
+        # is not garbage-collected while nothing else holds a reference to it.
+        self._pending_starts: dict[str, asyncio.Task[None]] = {}
         self._last_template_sweep: float | None = None
 
     async def start(self) -> None:
@@ -267,6 +327,8 @@ class Scheduler:
             await asyncio.gather(*tasks, return_exceptions=True)
         if self._running_tasks:
             await asyncio.gather(*self._running_tasks.values(), return_exceptions=True)
+        if self._pending_starts:
+            await asyncio.gather(*self._pending_starts.values(), return_exceptions=True)
 
     async def capacity(self) -> Capacity:
         total_memory_mb = await self.runtime.total_memory_mb()
@@ -479,7 +541,9 @@ class Scheduler:
             response = await self._execute_request(sandbox, execution, environment)
             await self._record_result(execution_id, response)
         except SandboxMemoryExceededError as exc:
-            await self._fail_execution(execution_id, "MemoryLimitExceeded", str(exc))
+            await self._fail_execution(
+                execution_id, ERROR_NAME_MEMORY_LIMIT_EXCEEDED, str(exc)
+            )
         except SandboxUnavailableError as exc:
             await self._fail_execution(
                 execution_id, ERROR_NAME_SANDBOX_UNAVAILABLE, str(exc)
@@ -612,10 +676,101 @@ class Scheduler:
         if self.notifier is not None:
             await self.notifier.notify_execution_finished(execution_id)
 
+    async def ensure_sandbox_ready(
+        self, sandbox_id: str, *, timeout_seconds: float
+    ) -> None:
+        """Lazily bring `sandbox_id` to `running`, bounded by `timeout_seconds`.
+
+        The entry point for callers outside the execution path -- see
+        `lazy_start_action` -- that need a running sandbox right now rather
+        than queueing an execution for one. Goes through `_ensure_running`,
+        the same per-sandbox lock `_run_execution` uses, so a request that
+        lands on a `created` sandbox at the same moment a queued execution
+        admits it can never produce two containers for one sandbox: both
+        wait on the same lock, and whichever loses re-reads `running` from
+        the database and does nothing.
+
+        A second concurrent caller for the same sandbox reattaches to the one
+        in-flight task via `_pending_starts` rather than spawning another —
+        belt-and-suspenders alongside the lock, and what keeps a start alive
+        against garbage collection while it runs in the background (see
+        below).
+
+        On timeout, the underlying start is not cancelled: `asyncio.shield`
+        keeps `_ensure_running` running in `_pending_starts` after this call
+        raises, because aborting it mid-`start_sandbox` would strand a
+        container the sandbox row never learns about. The caller gets a
+        clear, bounded error and can retry; the retry either finds `running`
+        already or reattaches to the same task.
+        """
+        task = self._pending_starts.get(sandbox_id)
+        if task is None or task.done():
+            task = asyncio.create_task(self._ensure_running(sandbox_id))
+            self._pending_starts[sandbox_id] = task
+            task.add_done_callback(self._clear_pending_start(sandbox_id, task))
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
+        except TimeoutError as exc:
+            message = (
+                f"sandbox did not become ready within {timeout_seconds:.0f}s "
+                "(the start is continuing in the background; retry)"
+            )
+            raise SandboxStartTimeoutError(message) from exc
+
+    def _clear_pending_start(
+        self, sandbox_id: str, task: asyncio.Task[None]
+    ) -> Callable[[asyncio.Task[None]], None]:
+        def callback(_done: asyncio.Task[None]) -> None:
+            if self._pending_starts.get(sandbox_id) is task:
+                self._pending_starts.pop(sandbox_id, None)
+
+        return callback
+
     async def _ensure_running(self, sandbox_id: str) -> None:
         lock = self._sandbox_start_locks.setdefault(sandbox_id, asyncio.Lock())
         async with lock:
-            await self._ensure_running_locked(sandbox_id)
+            try:
+                await self._ensure_running_locked(sandbox_id)
+            except Exception:
+                # Must be recorded here, not left to the caller: a caller
+                # reached through `ensure_sandbox_ready` may already be gone
+                # (a 503 was returned on timeout while this kept running in
+                # the background via `asyncio.shield`), and nothing else
+                # would ever notice `starting` -- which reserves capacity in
+                # `RESERVED_SANDBOX_STATES` -- was never going anywhere.
+                logger.exception(
+                    "sandbox %s failed to start or become ready", sandbox_id
+                )
+                await self._mark_start_failed(sandbox_id)
+                raise
+
+    async def _mark_start_failed(self, sandbox_id: str) -> None:
+        """Best-effort: mark a sandbox `failed` after its start blew up.
+
+        Mirrors `_fail_execution`'s own check rather than assuming the
+        error means the container is dead -- `wait_until_ready` can fail on
+        an otherwise-healthy, already-`running` sandbox (a transient network
+        blip against one mid-execution), and that must not be reported as a
+        dead sandbox. Only a runtime-confirmed dead/missing container earns
+        the write. Deliberately swallows its own failures: this already runs
+        inside an `except` block, and losing capacity-leak protection to a
+        second, unrelated error here would be worse than logging and moving
+        on -- the reaper's `starting` sweep is the backstop if this can't
+        complete either.
+        """
+        try:
+            async with session_factory() as session:
+                sandbox = await session.get(Sandbox, sandbox_id)
+                if sandbox is None or sandbox.status in {"killed", "failed"}:
+                    return
+                container_status = await self.runtime.container_status(sandbox)
+                if container_status in {None, "dead", "exited"}:
+                    sandbox.status = "failed"
+                    await session.commit()
+        except Exception:
+            logger.exception(
+                "sandbox %s: could not record its own start failure", sandbox_id
+            )
 
     async def _ensure_running_locked(self, sandbox_id: str) -> None:
         async with session_factory() as session:
