@@ -45,6 +45,13 @@ configs:
   # which reads like a broken registry rather than a missing daemon setting.
   buildkitd-config:
     content: |
+      # See compose.yaml: BuildKit's default resolver for build steps is
+      # 8.8.8.8, which this host blocks, so every build that fetches anything
+      # fails to resolve. 127.0.0.11 is Docker's embedded DNS, reachable
+      # because a build step shares buildkitd's network namespace.
+      [dns]
+        nameservers = ["127.0.0.11"]
+
       [registry."registry:5000"]
         http = true
         insecure = true
