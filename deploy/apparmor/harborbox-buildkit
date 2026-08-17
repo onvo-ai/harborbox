@@ -1,0 +1,64 @@
+# AppArmor profile for the rootless BuildKit container.
+#
+# Ubuntu 23.10+ sets `kernel.apparmor_restrict_unprivileged_userns=1`, which
+# stops an *unconfined* process creating a user namespace. Rootless BuildKit is
+# exactly that, so the builder cannot start:
+#
+#   [rootlesskit:parent] error: failed to start the child:
+#     fork/exec /proc/self/exe: permission denied
+#
+# `security_opt: apparmor=unconfined` does not help -- under this restriction
+# unconfined is precisely the category being denied. Measured on the host: a
+# container started with `apparmor=unconfined` and one started with Docker's
+# default profile both fail `unshare -Ur`.
+#
+# A profile attached to `/usr/bin/rootlesskit` does not help either. That
+# matches a host binary; the rootlesskit here runs inside a container Docker
+# starts under its own profile, and never transitions into it.
+#
+# So the permission has to arrive as the container's own profile. That is all
+# this file does: carry `userns` and otherwise get out of the way.
+#
+# It is deliberately not a confinement boundary. The builder's isolation comes
+# from the user namespace itself, from seccomp, and from the network topology
+# (it joins `build` and nothing else) -- not from AppArmor, which it had none
+# of before this. This profile is strictly more permissive than nothing only in
+# that it permits `userns`; every other rule below restores what `unconfined`
+# already allowed.
+#
+# Install on each host that runs the builder:
+#
+#   sudo cp deploy/apparmor/harborbox-buildkit /etc/apparmor.d/harborbox-buildkit
+#   sudo apparmor_parser -r -W /etc/apparmor.d/harborbox-buildkit
+#
+# then point the service at it, in the deployment's environment:
+#
+#   HARBORBOX_BUILDER_APPARMOR=harborbox-buildkit
+#
+# Hosts without AppArmor (macOS, and any kernel without it) need neither: the
+# variable defaults to `unconfined` and the builder starts as it always did.
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+profile harborbox-buildkit flags=(attach_disconnected,mediate_deleted) {
+  # The reason this profile exists.
+  userns,
+
+  # Everything else, unrestricted -- equivalent to the `unconfined` this
+  # replaces. Narrowing it is possible but would be new confinement invented
+  # here rather than a fix for the userns restriction, and a wrong rule shows
+  # up as a build failing deep in a RUN step.
+  capability,
+  file,
+  network,
+  mount,
+  umount,
+  remount,
+  pivot_root,
+  ptrace,
+  signal,
+  unix,
+  dbus,
+}

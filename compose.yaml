@@ -172,7 +172,14 @@ services:
         target: /home/user/.config/buildkit/buildkitd.toml
     security_opt:
       - seccomp=unconfined
-      - apparmor=unconfined
+      # `unconfined` everywhere AppArmor is absent or unrestricted, which is
+      # every developer machine. On Ubuntu 23.10+ that is not enough -- the
+      # kernel refuses user namespaces to unconfined processes and buildkitd
+      # cannot start at all -- so those hosts set
+      # HARBORBOX_BUILDER_APPARMOR=harborbox-buildkit after installing
+      # deploy/apparmor/harborbox-buildkit, which is the same thing plus the
+      # one permission the restriction withholds.
+      - apparmor=${HARBORBOX_BUILDER_APPARMOR:-unconfined}
       - systempaths=unconfined
     devices:
       - /dev/fuse
