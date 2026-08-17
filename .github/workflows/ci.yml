@@ -141,8 +141,16 @@ jobs:
       - name: Start the stack
         run: docker compose up -d --wait
 
+      # --capture=tee-sys, not the default: pytest replays a test's stdout only
+      # when it fails, so e2e_pause_ladder's measured transition times -- the
+      # entire reason that suite exists -- were invisible on a green run, and
+      # e2e_smoke's own summary print had the same problem. tee-sys passes
+      # output through to the job log *and* keeps capturing it, so the json
+      # report is unaffected.
       - name: Run the e2e suites
-        run: uv run pytest -m e2e --json-report --json-report-file=e2e-results.json
+        run: >-
+          uv run pytest -m e2e --capture=tee-sys
+          --json-report --json-report-file=e2e-results.json
 
       - name: Stack logs on failure
         if: failure()
