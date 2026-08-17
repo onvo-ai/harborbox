@@ -458,29 +458,61 @@ The repository path after the host part must be identical on both sides. Worth
 a test that asserts exactly that, because a mismatch fails only at sandbox
 create, long after the build reported success.
 
-### 10.4 Still to verify on the Coolify host
+### 10.4 The Coolify host needs one root change before the builder runs
 
-The OrbStack result does not transfer automatically — it is a purpose-built VM
-with a permissive kernel. On the Coolify host, run:
+The OrbStack result did not transfer, exactly as this section warned it might.
+On `infrastructure` (91.99.169.190) the builder crash-looped from the first
+deploy:
 
-```bash
-cat /proc/sys/user/max_user_namespaces; ls -l /dev/fuse
+```
+[rootlesskit:parent] error: failed to start the child: fork/exec /proc/self/exe: permission denied
+[rootlesskit:parent] This error might have happened because
+  /proc/sys/kernel/apparmor_restrict_unprivileged_userns is set to 1
 ```
 
-```bash
-docker run -d --name bk-probe --security-opt seccomp=unconfined --security-opt apparmor=unconfined --security-opt systempaths=unconfined --device /dev/fuse moby/buildkit:rootless
-```
+Ubuntu 23.10 and later ship `kernel.apparmor_restrict_unprivileged_userns=1`,
+which stops an unconfined process creating a user namespace. Rootless BuildKit
+is exactly that process, so it cannot start.
+
+**No compose setting fixes this.** `apparmor=unconfined` is already set on the
+service and does not help — under this restriction "unconfined" is precisely
+the category that is denied; the permission has to come from a profile that
+grants `userns`. The change is on the host and needs root:
 
 ```bash
-docker logs bk-probe 2>&1 | grep -E 'snapshotter|process-mode|error'
+cat <<'EOT' | sudo tee /etc/apparmor.d/usr.bin.rootlesskit
+abi <abi/4.0>,
+include <tunables/global>
+
+/usr/bin/rootlesskit flags=(unconfined) {
+  userns,
+  include if exists <local/usr.bin.rootlesskit>
+}
+EOT
+sudo systemctl restart apparmor.service
 ```
 
-Wanted: `max_user_namespaces` non-zero, `/dev/fuse` present, `using overlayfs`
-(not `fuse-overlayfs`), and `process-mode:sandbox`. If it reports
-`fuse-overlayfs`, builds still work but are slower. If buildkitd will not start
-without `--oci-worker-no-process-sandbox`, that is a material weakening — build
-steps stop being isolated from buildkitd — and Phase 1 should not ship for
-untrusted callers on that host without revisiting this.
+The blunter alternative is `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`
+(persist it in `/etc/sysctl.d/`), which lifts the restriction for every
+unconfined process on the box rather than for `rootlesskit` alone. Prefer the
+profile.
+
+After either, confirm what actually came up:
+
+```bash
+docker logs <builder-container> 2>&1 | grep -E 'snapshotter|process-mode|error'
+```
+
+Wanted: `using overlayfs` (not `fuse-overlayfs`) and `process-mode:sandbox`.
+`fuse-overlayfs` still builds, only slower. If buildkitd will not start without
+`--oci-worker-no-process-sandbox`, that is a material weakening — build steps
+stop being isolated from buildkitd — and Phase 1 should not serve untrusted
+callers on that host without revisiting it.
+
+Until this is done the API stays healthy and every other service runs, but no
+template can be built: `POST /v1/templates` has nowhere to send the build. The
+symptom in Coolify is the application sitting at `restarting:unknown` while its
+`api` container reports healthy.
 
 ## 11. Phase 0 as built
 

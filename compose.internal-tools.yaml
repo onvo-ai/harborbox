@@ -134,17 +134,37 @@ services:
   # Delete must be enabled or the template collector reclaims nothing; it
   # removes manifests, and the registry frees the blobs on its own
   # `garbage-collect` pass.
+  # See compose.yaml: the htpasswd is generated into a volume at boot rather
+  # than bound from `./auth`, which is gitignored and so absent on any host
+  # that has not run the local script -- Docker then binds an empty directory
+  # and the registry crash-loops on the missing file.
+  registry-auth:
+    image: httpd:2-alpine
+    command:
+      - sh
+      - -c
+      - htpasswd -Bbn "$$REGISTRY_USERNAME" "$$REGISTRY_PASSWORD" > /auth/htpasswd
+    environment:
+      REGISTRY_USERNAME: ${HARBORBOX_REGISTRY_USERNAME:-harborbox}
+      REGISTRY_PASSWORD: ${HARBORBOX_REGISTRY_PASSWORD:?set a registry password}
+    volumes:
+      - harborbox-registry-auth:/auth
+    restart: "no"
+    # No network: it hashes a string and writes a file. See compose.yaml.
+    network_mode: none
+
   registry:
     image: registry:3
+    depends_on:
+      registry-auth:
+        condition: service_completed_successfully
     environment:
       REGISTRY_AUTH: htpasswd
       REGISTRY_AUTH_HTPASSWD_REALM: Registry
       REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
       REGISTRY_STORAGE_DELETE_ENABLED: "true"
     volumes:
-      # Generate with:
-      #   docker run --rm httpd:2-alpine htpasswd -Bbn <user> <password> > auth/htpasswd
-      - ./auth:/auth:ro
+      - harborbox-registry-auth:/auth:ro
       - harborbox-registry:/var/lib/registry
     ports:
       - "127.0.0.1:${HARBORBOX_REGISTRY_PORT:-5050}:5000"
@@ -485,6 +505,7 @@ volumes:
   harborbox-postgres:
   opensandbox-state:
   harborbox-registry:
+  harborbox-registry-auth:
   harborbox-buildkit:
   harborbox-buildkit-run:
   harborbox-contexts:
