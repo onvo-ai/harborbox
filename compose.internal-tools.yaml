@@ -23,12 +23,32 @@
 # Since 0.2.0 this runs `opensandbox/server`, as compose.yaml does. That is not
 # optional: 0.2.0's template images ship no harborbox agent — no fastapi, no
 # uvicorn, `CMD ["tail","-f","/dev/null"]` — because execd runs the code, so
-# the old DockerRuntime path has nothing to talk to. The API keeps the docker
-# socket anyway, for building derived templates.
+# the old DockerRuntime path has nothing to talk to.
+#
+# The API no longer holds the docker socket. Template images are built on the
+# rootless `builder` service, which the API drives over a unix socket in a
+# shared volume, and the results land in the local `registry` rather than in
+# this host's image store. opensandbox still holds the socket -- something has
+# to create sandbox containers -- but the control plane does not.
+#
+# This host ships one image, not three. Products own a Dockerfile and POST it
+# to /v1/templates, which is the only way to build.
 
 name: harborbox
 
 configs:
+  # BuildKit resolves `FROM` itself, and that resolution does NOT inherit the
+  # `registry.insecure=true` Harborbox puts on the build output -- that flag
+  # only covers the push. Without this the first product Dockerfile to build
+  # FROM the base dies on
+  #   http: server gave HTTP response to HTTPS client
+  # which reads like a broken registry rather than a missing daemon setting.
+  buildkitd-config:
+    content: |
+      [registry."registry:5000"]
+        http = true
+        insecure = true
+
   # Mirrors compose.yaml's config, with two deliberate differences for this
   # host: no egress section, because sandboxes here must reach nothing, and a
   # narrower port range, since the Trigger stack shares these ephemeral ports.
@@ -63,68 +83,23 @@ configs:
       mode = "direct"
 
 services:
-  # One build per static template. 0.2.0 made `template` required on
-  # POST /v1/sandboxes and resolves each name to its own image, so the single
-  # `harborbox-sandbox-onvo` image this used to build no longer satisfies any
-  # request — `image_for_template` would raise for every one of them.
+  # The one image this repository builds. Harborbox used to build a tailored
+  # image per product here, each pinning that product's Python dependencies in
+  # the Harborbox repo; products own a Dockerfile and POST it now.
   #
-  # All three are tagged, for the same reason the single one was: a second
-  # deploy on this host builds the same names, and left at `local` the Coolify
-  # build would retag the images the hand-rolled stack launches sandboxes from,
-  # changing them without anyone deciding to.
-  #
-  # Derived templates (POST /v1/templates) are built at runtime by the API from
-  # these bases, which is why HARBORBOX_TEMPLATE_IMAGE_PREFIX and
-  # HARBORBOX_TEMPLATE_VERSION below must agree with the tags built here.
-  #
-  # **These three idle forever instead of exiting, and that is the whole point.**
-  # They used to be `entrypoint: /bin/true` + `restart: "no"`: build the image,
-  # exit 0, done. That lost the images every night. This server has Coolify's
-  # *forced* docker cleanup on `0 0 * * *` (`force_docker_cleanup: true`, so the
-  # 80% disk threshold never gets a vote), which prunes stopped containers and
-  # then runs `docker image prune -af` — delete every image no container refers
-  # to. Nothing refers to these: the API launches sandboxes from them at runtime
-  # through opensandbox, which is a `docker create` against a name, not a
-  # standing reference. So at 00:00 UTC the tags vanished, and the next sandbox
-  # create fell through to a registry pull of a locally-built name:
-  #
-  #   Failed to pull image harborbox-sandbox-onvo-pro:coolify: 404 ...
-  #   pull access denied for harborbox-sandbox-onvo-pro, repository does not
-  #   exist or may require 'docker login'
-  #
-  # which Trigger surfaced to the dashboard as "Harborbox sandbox failed to
-  # become ready" on every widget. A *running* container is the reference prune
-  # honours, so each build target now holds its own image open. The explicit
-  # `tail -f` is now the same thing the image's own CMD does; it is kept
-  # because a keeper container's job is to hold a tag open as cheaply as
-  # possible regardless of what the image decides to run later.
-  sandbox-onvo-pro-image:
-    image: harborbox-sandbox-onvo-pro:${HARBORBOX_IMAGE_TAG:-local}
+  # It still idles rather than exiting, and that is deliberate. Coolify's
+  # forced cleanup on `0 0 * * *` prunes stopped containers and then runs
+  # `docker image prune -af`, deleting every image no container refers to.
+  # Nothing refers to this one: sandboxes are created from it by name through
+  # opensandbox, which is a `docker create`, not a standing reference. A
+  # *running* container is the reference prune honours. Less critical than it
+  # was -- the image now comes back from the registry rather than being lost --
+  # but a nightly re-pull is still pointless.
+  sandbox-base-image:
+    image: 127.0.0.1:${HARBORBOX_REGISTRY_PORT:-5050}/harborbox-sandbox-base:${HARBORBOX_IMAGE_TAG:-local}
     build:
       context: .
       dockerfile: sandbox/Dockerfile
-      args:
-        SANDBOX_REQUIREMENTS: sandbox/requirements-onvo-pro.txt
-    entrypoint: ["tail", "-f", "/dev/null"]
-    restart: unless-stopped
-    mem_limit: 32m
-
-  sandbox-onvo-lite-image:
-    image: harborbox-sandbox-onvo-lite:${HARBORBOX_IMAGE_TAG:-local}
-    build:
-      context: .
-      dockerfile: sandbox/Dockerfile
-      args:
-        SANDBOX_REQUIREMENTS: sandbox/requirements-onvo-lite.txt
-    entrypoint: ["tail", "-f", "/dev/null"]
-    restart: unless-stopped
-    mem_limit: 32m
-
-  sandbox-relaydeck-image:
-    image: harborbox-sandbox-relaydeck:${HARBORBOX_IMAGE_TAG:-local}
-    build:
-      context: .
-      dockerfile: sandbox/Dockerfile.relaydeck
     entrypoint: ["tail", "-f", "/dev/null"]
     restart: unless-stopped
     mem_limit: 32m
@@ -148,6 +123,95 @@ services:
     restart: unless-stopped
     networks:
       - control
+
+  # Holds every template image the API builds. Two consumers reach it by two
+  # different addresses: BuildKit pushes over the `build` network, and the
+  # host's Docker daemon pulls through the published port when opensandbox
+  # creates a sandbox. Loopback only -- nothing off-host has business here, and
+  # 127.0.0.1 is also what lets the daemon accept plain HTTP without editing
+  # its `insecure-registries`.
+  #
+  # Delete must be enabled or the template collector reclaims nothing; it
+  # removes manifests, and the registry frees the blobs on its own
+  # `garbage-collect` pass.
+  registry:
+    image: registry:3
+    environment:
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: Registry
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+    volumes:
+      # Generate with:
+      #   docker run --rm httpd:2-alpine htpasswd -Bbn <user> <password> > auth/htpasswd
+      - ./auth:/auth:ro
+      - harborbox-registry:/var/lib/registry
+    ports:
+      - "127.0.0.1:${HARBORBOX_REGISTRY_PORT:-5050}:5000"
+    healthcheck:
+      test: ["CMD", "/bin/registry", "--version"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 256
+    restart: unless-stopped
+    networks:
+      # Dual-homed on purpose. `build` is how BuildKit pushes; `control` is how
+      # the API deletes manifests when the template collector reclaims an image.
+      # Docker does not route between bridge networks, so this does not let the
+      # builder reach anything on `control`.
+      - build
+      - control
+
+  # Rootless BuildKit: where a product's Dockerfile becomes an image. It holds
+  # no Docker socket, so a build step is an unprivileged process in a user
+  # namespace rather than root on this host.
+  #
+  # Three things here are load-bearing and were verified on a live stack; see
+  # docs/arbitrary-dockerfile-templates.md section 10:
+  #
+  #   1. `systempaths=unconfined` rather than the `--oci-worker-no-process-sandbox`
+  #      flag most rootless BuildKit guides use. Both start buildkitd
+  #      unprivileged; only this one keeps the per-step process sandbox.
+  #   2. It joins `build` and nothing else. Under `network_mode: host` a build
+  #      step reached a service published on host loopback -- here, PostgreSQL
+  #      and the API.
+  #   3. Native overlayfs needs /dev/fuse and user namespaces. Check
+  #      `docker logs` for `using overlayfs`; `fuse-overlayfs` works, slower.
+  builder:
+    image: moby/buildkit:rootless
+    configs:
+      - source: buildkitd-config
+        target: /home/user/.config/buildkit/buildkitd.toml
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+      - systempaths=unconfined
+    devices:
+      - /dev/fuse
+    volumes:
+      # The API drives buildkitd over this socket instead of TCP, so the two
+      # share no network -- and a build step, which runs in buildkitd's network
+      # namespace, therefore cannot reach the control plane.
+      #
+      # /run/user/1000 specifically: the image already owns that path as uid
+      # 1000, which a fresh named volume inherits. Anywhere else buildkitd gets
+      # a root-owned directory and dies with `bind: permission denied`.
+      - harborbox-buildkit-run:/run/user/1000
+      - harborbox-buildkit:/home/user/.local/share/buildkit
+    healthcheck:
+      test: ["CMD", "buildctl", "debug", "workers"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    mem_limit: 2g
+    memswap_limit: 2g
+    pids_limit: 4096
+    restart: unless-stopped
+    networks:
+      - build
 
   opensandbox:
     image: opensandbox/server:v0.2.2
@@ -189,11 +253,7 @@ services:
       # idles by design to complete would hang every deploy forever. Compose
       # builds all images before it starts any container, so a started keeper
       # already proves its image was built.
-      sandbox-onvo-pro-image:
-        condition: service_started
-      sandbox-onvo-lite-image:
-        condition: service_started
-      sandbox-relaydeck-image:
+      sandbox-base-image:
         condition: service_started
       postgres:
         condition: service_healthy
@@ -227,12 +287,38 @@ services:
       HARBORBOX_OPENSANDBOX_API_KEY: ${SERVICE_PASSWORD_64_OPENSANDBOXAPI:?refusing to start with no opensandbox key - the API would fail every sandbox create against the runtime.}
       # Static template images, built above. These three names are what
       # `image_for_template` resolves for onvo-pro/onvo-lite/relaydeck.
-      HARBORBOX_ONVO_PRO_IMAGE: harborbox-sandbox-onvo-pro:${HARBORBOX_IMAGE_TAG:-local}
-      HARBORBOX_ONVO_LITE_IMAGE: harborbox-sandbox-onvo-lite:${HARBORBOX_IMAGE_TAG:-local}
-      HARBORBOX_RELAYDECK_IMAGE: harborbox-sandbox-relaydeck:${HARBORBOX_IMAGE_TAG:-local}
       # Derived templates are named `<base>-<12 hex>` and their image name is a
       # pure function of prefix + version, so these must match the tags built
       # above or a derived template resolves to an image nobody built.
+      HARBORBOX_BASE_IMAGE: harborbox-sandbox-base:${HARBORBOX_IMAGE_TAG:-local}
+      # Pools by template name. A product that wants its own image kept warm
+      # adds it here: {"base":1,"custom-abc123def456":2}. Warm starts are worth
+      # roughly 3 seconds, which is why this stayed configurable when products
+      # stopped having a template each.
+      HARBORBOX_WARM_POOL: ${HARBORBOX_WARM_POOL:-{"base":1}}
+      #
+      # Builds run on the rootless builder, over a socket, not on this
+      # container's daemon -- it no longer has one.
+      HARBORBOX_BUILDER_ADDRESS: unix:///run/user/1000/buildkit/buildkitd.sock
+      # Two addresses for one registry, and the difference is not cosmetic.
+      # BuildKit dials it from the `build` network, so it uses the service
+      # name. The reference the API stores is resolved by the *Docker daemon*
+      # when opensandbox creates a sandbox, and the daemon is on the host,
+      # where `registry` means nothing -- so the pull side goes through the
+      # published port on loopback. Everything after the host part must stay
+      # identical; see docs/arbitrary-dockerfile-templates.md section 10.3.
+      HARBORBOX_REGISTRY_PUSH_ENDPOINT: registry:5000
+      HARBORBOX_REGISTRY_PULL_ENDPOINT: 127.0.0.1:${HARBORBOX_REGISTRY_PORT:-5050}
+      HARBORBOX_REGISTRY_USERNAME: ${HARBORBOX_REGISTRY_USERNAME:-harborbox}
+      HARBORBOX_REGISTRY_PASSWORD: ${HARBORBOX_REGISTRY_PASSWORD:?set a registry password}
+      # BuildKit has no implicit "localhost is insecure" rule the way the
+      # Docker daemon does, so plain HTTP has to be declared.
+      HARBORBOX_REGISTRY_INSECURE: "true"
+      # Repository prefixes a product's `FROM` may name. What a build installs
+      # is unbounded by construction; what it starts from is the control.
+      HARBORBOX_TEMPLATE_FROM_ALLOWLIST: ${HARBORBOX_TEMPLATE_FROM_ALLOWLIST:-["docker.io/library"]}
+      HARBORBOX_TEMPLATE_CONTEXT_ROOT: /var/lib/harborbox/build-contexts
+      HARBORBOX_TEMPLATE_MAX_CONCURRENT_BUILDS: ${HARBORBOX_TEMPLATE_MAX_CONCURRENT_BUILDS:-2}
       HARBORBOX_TEMPLATE_IMAGE_PREFIX: harborbox-sandbox
       HARBORBOX_TEMPLATE_VERSION: ${HARBORBOX_IMAGE_TAG:-local}
       HARBORBOX_SANDBOX_NETWORK: ${HARBORBOX_SANDBOX_NETWORK:-harborbox-net}
@@ -283,12 +369,9 @@ services:
       # before), and the cause is per-sandbox startup, not queueing — an
       # isolated cold create-and-execute is ~6s while executions themselves run
       # in ~200ms. A burst of 43 widgets pays that startup 43 times. Unresolved.
-      HARBORBOX_WARM_POOL_ONVO_PRO: ${HARBORBOX_WARM_POOL_ONVO_PRO:-1}
       # Was 0, so every Lite sandbox cold-started — ~6.5s of provisioning on
       # the critical path of a user's first query. One warm slot covers the
       # common case of a single analysis at a time.
-      HARBORBOX_WARM_POOL_ONVO_LITE: ${HARBORBOX_WARM_POOL_ONVO_LITE:-1}
-      HARBORBOX_WARM_POOL_RELAYDECK: ${HARBORBOX_WARM_POOL_RELAYDECK:-0}
       #
       # Per-template sizing, pinned to what this host was already running.
       # 0.2.0 takes resources from the resolved template, not from
@@ -296,8 +379,6 @@ services:
       # 1024 MB / 2.0 CPU. Left alone that silently halves concurrency here:
       # MAX_PARALLEL_CPU is 10, so 2.0 CPU per sandbox halves how many fit.
       # Onvo's widget code has run in 768 MB / 1 CPU all along.
-      HARBORBOX_ONVO_PRO_TEMPLATE_MEMORY_MB: ${HARBORBOX_ONVO_SANDBOX_MEMORY_MB:-768}
-      HARBORBOX_ONVO_PRO_TEMPLATE_CPU: ${HARBORBOX_ONVO_SANDBOX_CPU:-1}
       #
       # onvo-lite was never pinned, so it inherited the old 2.0 CPU default
       # while onvo-pro was pinned to 1.0 right above — the two Onvo sandboxes
@@ -305,8 +386,6 @@ services:
       # real datasource analysis, DuckDB profiling took ~2.5s at 1.0 CPU and the
       # run was dominated by the model, not compute. At 2.0 the host fits two
       # concurrent Lite analyses; at 1.0 it fits four.
-      HARBORBOX_ONVO_LITE_TEMPLATE_MEMORY_MB: ${HARBORBOX_ONVO_LITE_SANDBOX_MEMORY_MB:-1024}
-      HARBORBOX_ONVO_LITE_TEMPLATE_CPU: ${HARBORBOX_ONVO_LITE_SANDBOX_CPU:-1}
       HARBORBOX_DEFAULT_IDLE_TIMEOUT_SECONDS: ${HARBORBOX_ONVO_IDLE_TIMEOUT_SECONDS:-180}
       # Leave headroom for the Trigger stack, which shares this host.
       HARBORBOX_HOST_MEMORY_RESERVE_PERCENT: ${HARBORBOX_HOST_MEMORY_RESERVE_PERCENT:-25}
@@ -316,12 +395,11 @@ services:
       # HARBORBOX_OPENSANDBOX_USE_SERVER_PROXY above.
       - "host.docker.internal:host-gateway"
     volumes:
-      # Still required, though no longer for running sandboxes — opensandbox
-      # does that now. The API builds derived template images (POST
-      # /v1/templates) with docker directly, so it keeps the socket. This is
-      # the privileged thing Harborbox needs, and the reason it belongs on a
-      # host running internal tooling rather than customer-facing apps.
-      - /var/run/docker.sock:/var/run/docker.sock
+      # The builder's socket, and only that. This replaces the docker socket
+      # the API used to hold: it can ask for an image build, and it cannot
+      # start a container on this host.
+      - harborbox-buildkit-run:/run/user/1000
+      - harborbox-contexts:/var/lib/harborbox/build-contexts
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 3s
@@ -406,9 +484,17 @@ services:
 volumes:
   harborbox-postgres:
   opensandbox-state:
+  harborbox-registry:
+  harborbox-buildkit:
+  harborbox-buildkit-run:
+  harborbox-contexts:
 
 networks:
   control:
+  # The builder and the registry, and nothing else. A build step runs inside
+  # buildkitd's network namespace, so what the builder can reach is what
+  # product-supplied build steps can reach.
+  build:
   # Declared external because Coolify rewrites managed network definitions and
   # silently dropped this one — the API then created sandboxes against a network
   # that did not exist, and every sandbox went straight to `failed` with nothing

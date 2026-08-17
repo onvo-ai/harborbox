@@ -1,2 +1,0 @@
-# Relaydeck only needs its CLI/runtime dependencies. OpenSandbox injects execd,
-# which runs commands directly and needs nothing installed here.

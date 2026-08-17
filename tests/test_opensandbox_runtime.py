@@ -32,7 +32,7 @@ def sandbox_record(**overrides: Any) -> Sandbox:  # noqa: ANN401
         "cpu": 1.5,
         "pids_limit": 128,
         "idle_timeout_seconds": 60,
-        "metadata_": {"template": "onvo-pro", "team": "test"},
+        "metadata_": {"template": "base", "team": "test"},
         "created_at": datetime.now(UTC),
         "updated_at": datetime.now(UTC),
         "last_activity_at": datetime.now(UTC),
@@ -137,13 +137,70 @@ async def test_start_delegates_image_and_resource_limits_to_opensandbox(
     started = await runtime.start_sandbox(sandbox)
 
     assert started.id == "osb-runtime-1"
-    assert captured["args"] == ("harborbox-sandbox-onvo-pro:local",)
+    assert captured["args"] == ("harborbox-sandbox-base:local",)
     assert captured["kwargs"]["resource"] == {
         "cpu": "1.5",
         "memory": "768Mi",
     }
     assert captured["kwargs"]["metadata"]["harborbox.sandbox_id"] == "sbx-test"
     assert captured["kwargs"]["timeout"] is None
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_start_sends_registry_credentials_when_one_is_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Registry auth reaches opensandbox per create call, not from its config file.
+
+    There is no server-side credential store to fall back on, so an image on a
+    private registry is unpullable unless every create carries the auth.
+    """
+    captured: dict[str, Any] = {}
+
+    class FakeOpenSandbox:
+        @classmethod
+        async def create(cls, *args: Any, **_kwargs: Any) -> FakeHandle:  # noqa: ANN401
+            captured["args"] = args
+            return FakeHandle()
+
+    monkeypatch.setattr(runtime_module, "OpenSandbox", FakeOpenSandbox)
+    runtime = OpenSandboxRuntime(
+        Settings(
+            registry_pull_endpoint="127.0.0.1:5050",
+            registry_username="harborbox",
+            registry_password="s3cret",  # noqa: S106 - a fixture, not a credential
+        )
+    )
+
+    await runtime.start_sandbox(sandbox_record())
+
+    spec = captured["args"][0]
+    assert spec.image == "127.0.0.1:5050/harborbox-sandbox-base:local"
+    assert spec.auth is not None
+    assert spec.auth.username == "harborbox"
+    assert spec.auth.password == "s3cret"  # noqa: S105 - as above
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_start_sends_a_bare_image_when_no_registry_is_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeOpenSandbox:
+        @classmethod
+        async def create(cls, *args: Any, **_kwargs: Any) -> FakeHandle:  # noqa: ANN401
+            captured["args"] = args
+            return FakeHandle()
+
+    monkeypatch.setattr(runtime_module, "OpenSandbox", FakeOpenSandbox)
+    runtime = OpenSandboxRuntime(Settings())
+
+    await runtime.start_sandbox(sandbox_record())
+
+    assert captured["args"] == ("harborbox-sandbox-base:local",)
     await runtime.close()
 
 

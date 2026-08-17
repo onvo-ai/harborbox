@@ -7,6 +7,7 @@ import secrets
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC
+from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -17,6 +18,7 @@ from sqlalchemy import func, select, update
 
 from harborbox import __version__
 from harborbox.admission import can_admit
+from harborbox.build_contexts import BuildContextError, BuildContextStore
 from harborbox.config import Settings, get_settings
 from harborbox.db import create_schema, get_session, session_factory
 from harborbox.errors import SandboxStartTimeoutError, SandboxUnavailableError
@@ -50,6 +52,7 @@ from harborbox.scheduler import (
     plan_pause,
 )
 from harborbox.schemas import (
+    BuildContextResponse,
     CapacityResponse,
     CommandCreate,
     ExecutionResponse,
@@ -105,7 +108,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await create_schema()
     runtime = OpenSandboxRuntime(settings)
     await runtime.start()
-    template_builder = TemplateBuilder(settings)
+    context_store = BuildContextStore(settings, root=Path(settings.template_context_root))
+    template_builder = TemplateBuilder(settings, context_store)
     notifier = ExecutionNotifier(settings)
     await notifier.start()
     scheduler = Scheduler(settings, runtime, template_builder, notifier)
@@ -113,6 +117,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.runtime = runtime
     app.state.scheduler = scheduler
     app.state.template_builder = template_builder
+    app.state.context_store = context_store
     app.state.notifier = notifier
     await scheduler.start()
 
@@ -170,6 +175,10 @@ def scheduler_from(request: Request) -> Scheduler:
 
 def template_builder_from(request: Request) -> TemplateBuilder:
     return request.app.state.template_builder  # type: ignore[no-any-return]
+
+
+def context_store_from(request: Request) -> BuildContextStore:
+    return request.app.state.context_store  # type: ignore[no-any-return]
 
 
 def notifier_from(request: Request) -> ExecutionNotifier:
@@ -305,13 +314,51 @@ def derived_template_response(
         version=settings.template_version,
         memory_mb=template.memory_mb,
         cpu=template.cpu,
-        # Derived templates cold-start by design: a per-team pool would trade the
-        # bounded image count this design buys for an unbounded pool count.
-        warm_pool=0,
+        # Zero unless this template is named in HARBORBOX_WARM_POOL. Pooling
+        # every image a product built would trade a bounded image count for an
+        # unbounded pool count, so it stays opt-in -- but a product's own image
+        # is exactly the thing worth keeping warm, and this is the field an
+        # operator checks to confirm the pool they configured took effect.
+        warm_pool=settings.warm_pool_sizes.get(template.name, 0),
         error=template.error,
         created_at=template.created_at,
         updated_at=template.updated_at,
     )
+
+
+@app.post(
+    "/v1/build-contexts",
+    response_model=BuildContextResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=authenticated,
+)
+async def create_build_context(request: Request) -> BuildContextResponse:
+    """Store a tarball a caller-supplied Dockerfile can COPY from.
+
+    The body is a gzipped tar, sent raw rather than as multipart: there is
+    exactly one part, and multipart would add a parser between hostile bytes
+    and the tar validation for no benefit.
+
+    Content-addressed and idempotent -- the same archive uploaded twice is one
+    stored context and one digest, which is also what lets an unchanged context
+    keep a template's hash stable across re-uploads.
+    """
+    settings = settings_from(request)
+    payload = await request.body()
+    if not payload:
+        raise HTTPException(status_code=422, detail="build context is empty")
+    if len(payload) > settings.template_max_context_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"build context exceeds {settings.template_max_context_bytes} bytes"
+            ),
+        )
+    try:
+        digest = context_store_from(request).save(payload)
+    except BuildContextError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return BuildContextResponse(digest=digest, bytes=len(payload))
 
 
 @app.get(
@@ -349,22 +396,15 @@ async def create_template(
     settings = settings_from(request)
     try:
         spec = validate_template_spec(
-            settings,
-            base=body.base,
-            apt=body.apt,
-            npm=body.npm,
-            env=body.env,
+            settings, dockerfile=body.dockerfile, context=body.context
         )
     except TemplateSpecError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    # A team with no sandbox-backed tools keeps the base template, and with it
-    # the base template's warm pool. Nothing is built for it.
-    if spec.is_empty:
-        response.status_code = status.HTTP_200_OK
-        return static_template_response(settings, spec.base)
-
-    default_memory_mb, default_cpu = settings.resources_for_template(spec.base)
+    # A template brings no sizing of its own, so it takes the deployment-wide
+    # sandbox defaults unless the caller sizes it explicitly.
+    default_memory_mb = settings.default_sandbox_memory_mb
+    default_cpu = settings.default_sandbox_cpu
     memory_mb = body.memory_mb or default_memory_mb
     cpu = body.cpu or default_cpu
     if memory_mb > settings.max_sandbox_memory_mb:
@@ -398,7 +438,7 @@ async def create_template(
     if template is None:
         template = SandboxTemplate(
             name=spec.name,
-            base=spec.base,
+            base="",
             spec_hash=spec.spec_hash,
             spec=spec.as_json(),
             image=settings.derived_template_image(spec.name),

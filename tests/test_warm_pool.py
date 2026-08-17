@@ -50,14 +50,14 @@ async def test_pool_only_claims_an_exact_template_resource_profile() -> None:
     pools = OpenSandboxWarmPools(settings, ConnectionConfig())
     handle = FakeWarmHandle()
     fake = FakePool(handle)
-    pools._pools["relaydeck"] = fake  # type: ignore[assignment]
-    pools._active_targets["relaydeck"] = 2
-    pools._last_demand["relaydeck"] = asyncio.get_running_loop().time()
+    pools._pools["base"] = fake  # type: ignore[assignment]
+    pools._active_targets["base"] = 1
+    pools._last_demand["base"] = asyncio.get_running_loop().time()
     pools._started = True
 
-    acquired = await pools.acquire(template="relaydeck", memory_mb=256, cpu=0.5)
+    acquired = await pools.acquire(template="base", memory_mb=512, cpu=1.0)
     mismatched = await pools.acquire(
-        template="relaydeck", memory_mb=512, cpu=0.5
+        template="base", memory_mb=1024, cpu=1.0
     )
 
     assert acquired is handle
@@ -71,15 +71,15 @@ async def test_inactive_pool_scales_to_zero_and_refills_on_demand() -> None:
     pools = OpenSandboxWarmPools(settings, ConnectionConfig())
     handle = FakeWarmHandle()
     fake = FakePool(handle)
-    pools._pools["relaydeck"] = fake  # type: ignore[assignment]
-    pools._active_targets["relaydeck"] = 2
-    pools._last_demand["relaydeck"] = asyncio.get_running_loop().time() - 2
+    pools._pools["base"] = fake  # type: ignore[assignment]
+    pools._active_targets["base"] = 1
+    pools._last_demand["base"] = asyncio.get_running_loop().time() - 2
     pools._started = True
 
     await pools._scale_down_inactive()
-    acquired = await pools.acquire(template="relaydeck", memory_mb=256, cpu=0.5)
+    acquired = await pools.acquire(template="base", memory_mb=512, cpu=1.0)
 
-    assert fake.resized == [0, 2]
+    assert fake.resized == [0, 1]
     assert acquired is handle
 
 
@@ -89,11 +89,12 @@ def test_configured_pool_is_included_in_admission_reservation() -> None:
 
     reservation = pools.reservation()
 
-    expected_memory_mb = 1536
-    # relaydeck 2x0.5 + onvo-pro 1x1.0. Was 3.0 when the onvo templates
-    # defaulted to 2.0 CPU each.
-    expected_cpu = 2.0
-    expected_sandboxes = 3
+    # One base slot at the default 512 MiB / 1.0 CPU. This used to be three
+    # pools across three product templates; products bring their own images
+    # now and name them in HARBORBOX_WARM_POOL if they want one pooled.
+    expected_memory_mb = 512
+    expected_cpu = 1.0
+    expected_sandboxes = 1
     assert reservation.memory_mb == expected_memory_mb
     assert reservation.cpu == expected_cpu
     assert reservation.sandboxes == expected_sandboxes

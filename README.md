@@ -17,8 +17,8 @@ client -> Harborbox API -> PostgreSQL queue -> scheduler -> OpenSandbox -> runti
 ## What is included
 
 - Durable PostgreSQL execution queue
-- Mandatory dependency-baked templates built with Docker BuildKit
-- Content-hashed derived templates so callers with identical requirements share one image
+- Templates are Dockerfiles the caller owns, built with rootless BuildKit
+- Content-hashed templates, so identical Dockerfiles share one image
 - PostgreSQL-coordinated adaptive warm pools using the official OpenSandbox SDK
 - Parallel weighted admission based on hard memory reservations
 - Live available-memory emergency guard
@@ -50,14 +50,32 @@ socket reported by:
 docker context inspect --format '{{.Endpoints.docker.Host}}'
 ```
 
-Remove the `unix://` prefix. Then build the immutable runtime templates, build
-the API, and start:
+Remove the `unix://` prefix. The bundled registry uses basic auth, so create a
+credentials file for it before the first start:
 
 ```bash
-./scripts/build-templates.sh
-docker compose build api
-docker compose up -d
+mkdir -p auth && docker run --rm httpd:2-alpine htpasswd -Bbn harborbox "$HARBORBOX_REGISTRY_PASSWORD" > auth/htpasswd
 ```
+
+Use the same username and password you set for `HARBORBOX_REGISTRY_USERNAME`
+and `HARBORBOX_REGISTRY_PASSWORD` in `.env`. Then start the registry, build the
+immutable runtime templates and push them to it, build the API, and start:
+
+```bash
+docker compose up -d registry
+```
+
+```bash
+./scripts/build-templates.sh --push
+```
+
+```bash
+docker compose build api && docker compose up -d
+```
+
+The templates must be pushed, not merely built: the builder resolves each
+derived template's `FROM` over its own network and cannot see the host daemon's
+local image store.
 
 The health endpoint is available at `http://localhost:8000/health` and API docs
 at `http://localhost:8000/docs`.
@@ -66,31 +84,57 @@ The sandbox image services are behind an inactive `build` profile. They are
 image build targets, not runtime services. Normal startup runs PostgreSQL,
 Harborbox and the pinned OpenSandbox server.
 
-OpenSandbox receives the host Docker socket in the bundled single-host setup.
-That grants the OpenSandbox service host-level Docker control. Harborbox's API
-also receives the socket, because `POST /v1/templates` builds derived template
-images itself; both services therefore hold host-level Docker control. Point
-both at the same daemon, so an image the API builds is visible to the sandbox
-runtime under either runtime provider. If you do not use derived templates,
-remove the socket mount from the `api` service and set
-`HARBORBOX_TEMPLATE_GC_ENABLED=false`; the template endpoints then fail with a
-recorded build error instead of running. For a stricter deployment, run
-OpenSandbox on a separate worker host or Kubernetes cluster and point the
-`HARBORBOX_OPENSANDBOX_*` settings at it.
+OpenSandbox receives the host Docker socket in the bundled single-host setup,
+which grants that service host-level Docker control. **Harborbox's API does
+not.** It builds derived template images by driving a rootless BuildKit daemon
+(`builder`) over a unix socket in a shared volume, so the control plane can ask
+for an image and cannot start a container. A leaked `HARBORBOX_API_KEY` is
+therefore not by itself arbitrary code execution on the host.
+
+Three properties of that arrangement are deliberate, and each was verified
+against a live stack rather than assumed — the evidence is in
+`docs/arbitrary-dockerfile-templates.md` section 10:
+
+- **The builder joins only the `build` network**, with the registry. Build
+  steps run inside buildkitd's own network namespace, so any network the
+  builder can reach is one a caller's build step can reach. Under
+  `network_mode: host` a build step reached a service on host loopback, which
+  on a single-host deployment means PostgreSQL and the API itself.
+- **The API drives it over a socket, not TCP**, which is what lets the two
+  share no network at all.
+- **The registry has two addresses for one store.** BuildKit dials
+  `registry:5000` over the build network; the reference Harborbox stores and
+  hands to OpenSandbox is `127.0.0.1:5050`, because the *Docker daemon*
+  resolves it from the host, where `registry` means nothing. Everything after
+  the host part must stay identical, or the build succeeds and the sandbox
+  create that follows fails on a missing image.
+
+Leaving `HARBORBOX_BUILDER_ADDRESS` unset keeps the previous behaviour: builds
+go through a mounted Docker socket against the local daemon, and the API holds
+host-level Docker control again. If you use neither, set
+`HARBORBOX_TEMPLATE_GC_ENABLED=false` and the template endpoints fail with a
+recorded build error instead of running.
+
+For a stricter deployment, run OpenSandbox on a separate worker host or
+Kubernetes cluster and point the `HARBORBOX_OPENSANDBOX_*` settings at it. None
+of the above makes this an isolation boundary for hostile code: sandboxes are
+still ordinary containers sharing the host kernel.
 
 ## Templates and warm starts
 
-Every sandbox must specify one registered template. There is no generic image
-fallback: this keeps dependency contents, resource sizing, and startup behavior
-predictable. The bundled templates are declared in `templates/manifest.yaml`:
+Every sandbox must specify one template. There is no generic image fallback:
+this keeps dependency contents, resource sizing, and startup behaviour
+predictable.
 
-- `relaydeck`: lightweight CLI and stdio MCP execution
-- `onvo-pro`: pandas and NumPy
-- `onvo-lite`: database drivers and broader data tooling
+This repository ships exactly one image, `base` -- a minimal Debian with the
+sandbox user and a writable `/workspace`, declared in
+`templates/manifest.yaml`. It exists to be something worth starting `FROM` and
+to give the warm pool somewhere to live. Everything else is a Dockerfile a
+product sent.
 
 Templates follow the same core model as E2B templates: Docker installs every
 dependency during the build, and runtime requests only reference the resulting
-versioned image. Build all templates with:
+versioned image. Build the base with:
 
 ```bash
 HARBORBOX_TEMPLATE_VERSION=2026.08.03 ./scripts/build-templates.sh
@@ -116,91 +160,92 @@ Harborbox claims an exact template/resource match; a custom memory or CPU size
 uses the same prebuilt image but follows the direct creation path. Pooled
 sandboxes are disposable and are never returned to the pool after use.
 
-Defaults are two 256 MiB Relaydeck sandboxes, one 1 GiB Onvo Pro sandbox, and no
-hot Onvo Lite sandbox. After five minutes without demand, idle pools scale to
-zero. The next request uses the direct path while the pool refills in the
+Pools are keyed by template name in `HARBORBOX_WARM_POOL`, so a product's own
+`custom-<hash>` image can be pooled exactly like the base:
+`{"base":1,"custom-abc123def456":2}`. A warm start is worth roughly three
+seconds, which is why this stayed configurable when products stopped having a
+template each. The default is one base sandbox. After five minutes without
+demand, idle pools scale to zero. The next request uses the direct path while the pool refills in the
 background. Warm-pool maximums remain part of admission headroom so a refill
 cannot push the host over its aggregate memory or CPU cap.
 
-## Derived templates
+## Templates are Dockerfiles
 
-A tool that needs a binary in the sandbox — Chromium for Playwright, `psql` for
-Postgres — should not force that binary on every tenant. `POST /v1/templates`
-layers a caller-supplied requirement set onto one of the static bases above and
-returns a content-hashed template:
+`POST /v1/templates` takes a Dockerfile. That is the only way to build an
+image, and the only shape this endpoint accepts.
+
+Harborbox used to take an allowlisted `{base, apt, npm, env}` spec and generate
+the Dockerfile itself, with a tailored base image per product baked into this
+repository. That put every product's dependency upgrades behind a Harborbox
+release, and it meant this repo had to know which pandas version Onvo wanted.
+Products own their images now.
 
 ```bash
 curl -sX POST localhost:8000/v1/templates -H "X-API-Key: $HARBORBOX_API_KEY" \
   -H 'Content-Type: application/json' -d '{
-    "base": "relaydeck",
-    "apt": ["chromium", "fonts-liberation"],
-    "npm": ["@playwright/mcp@0.0.78"],
-    "env": {"PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1"}
+    "dockerfile": "FROM debian:bookworm-slim\nRUN apt-get update && apt-get install -y jq\n"
   }'
 ```
 
-The name is `<base>-<hash>`, where the hash is the first 12 hex characters of
-the SHA-256 of the canonical spec — `base`, deduplicated and sorted `apt` and
-`npm`, and key-sorted `env`. Callers with identical requirements therefore share
-one image, so the image count is bounded by distinct requirement combinations
-rather than by customer count. Resource overrides are deliberately excluded from
-the hash, which makes the stored `memory_mb`/`cpu` a default hint only; pass
-sizing explicitly on `POST /v1/sandboxes` when it matters per caller.
+The name is `custom-<hash>`, hashed over the Dockerfile and the build context
+together, so the endpoint stays idempotent on exactly the same terms as a
+package spec: identical input returns `200` with the existing template, new
+input returns `201` and starts a build, and a spec whose last build failed is
+retried.
 
-The call is idempotent: an identical spec returns `200` with the existing
-template, a new one returns `201` and starts an asynchronous build, and a spec
-whose previous build failed is retried. Poll `GET /v1/templates/{name}` for
-`status` (`building`, `ready`, `failed`) and, on failure, a readable `error`
-carrying the tail of the build log. An empty spec is not a template at all: it
-returns the base unchanged and nothing is built.
+To `COPY` anything, upload a build context first. It is a gzipped tar posted
+raw, stored content-addressed, and referenced by digest:
 
-Because the Dockerfile is generated from request input, package names are
-treated as hostile. Each is rejected for shell metacharacters, checked against a
-strict regex, and then checked against `HARBORBOX_TEMPLATE_APT_ALLOWLIST` or
-`HARBORBOX_TEMPLATE_NPM_ALLOWLIST`; list lengths, environment variable count,
-name shape and value size are all capped. The generated Dockerfile declares
-`ENV` before the install layers — install steps read the environment, and
-`PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD` only suppresses Playwright's browser download
-if it is set before `npm install -g` runs — takes `USER root` for the installs
-and restores `USER 10001:10001` at the end.
+```bash
+tar -czf ctx.tar.gz -C ./my-files .
+```
 
-Derived templates cold-start by design. Warm pools stay configured for the
-static templates only: pooling per requirement set would trade the bounded image
-count for an unbounded pool count. A caller with no extra requirements stays on
-its base template and keeps that pool.
+```bash
+curl -sX POST localhost:8000/v1/build-contexts -H "X-API-Key: $HARBORBOX_API_KEY" \
+  -H 'Content-Type: application/gzip' --data-binary @ctx.tar.gz
+```
 
-Builds go through BuildKit, invoked as `docker build -` with the generated
-Dockerfile on stdin and **no build context at all**, which is why the API image
-ships the Docker CLI and the buildx plugin. Sending no context is deliberate: a
-Dockerfile generated from API input cannot then `COPY` or `ADD` anything off the
-build host. It is also the only option that works — Docker Engine 29 removed the
-classic builder that the docker-py build API talks to, and calls to it hang
-rather than fail.
+Pass the returned digest as `context`. Without one the build gets an empty
+context and any `COPY` fails, which is the safe default: a Dockerfile with no
+context cannot reach anything on the build host.
 
-Rebuilding a base image does not propagate to derived images until their spec
-changes; `HARBORBOX_TEMPLATE_VERSION` is the lever for forcing that. Derived
-images that no sandbox has used for `HARBORBOX_TEMPLATE_GC_MAX_IDLE_DAYS` are
-removed by a sweep inside the existing reaper loop. `DELETE /v1/templates/{name}`
-removes one immediately and refuses static names with `409`.
+`./scripts/try-custom-template.sh` runs that whole path end to end -- context
+upload, build, sandbox, and a command proving a non-allowlisted package and a
+copied file both arrived.
 
-## Onvo Lite image
+### What still constrains a Dockerfile
 
-The Onvo Lite image contains DuckDB, pandas, NumPy, the supported database
-drivers, Excel support, and Google Sheets dependencies. OpenSandbox provides
-the execution daemon and network controls. Harborbox configures a
-20-minute idle lifetime, and two concurrent shell executions in one project
-sandbox. The default sandbox reservation is 1 GiB so it remains usable on a
-4 GiB local Docker VM. On a larger production host, set
-`HARBORBOX_ONVO_SANDBOX_MEMORY_MB=2048` and raise concurrency only after load
-testing.
+Package allowlists mean nothing once `RUN` is arbitrary, so what is checked is
+the shape of the build rather than its contents:
 
-Configure destination-level restrictions and credential injection through
-OpenSandbox's egress and Credential Vault facilities.
+- **`HARBORBOX_TEMPLATE_FROM_ALLOWLIST`** — repository prefixes a `FROM` may
+  name, matched after Docker's implicit `docker.io/library/` expansion, on
+  *every* `FROM` rather than the first. This is the supply-chain control and
+  the difference between "any Dockerfile" and "any Dockerfile starting from an
+  image we vetted". Harborbox's own static bases are always allowed.
+- **`HARBORBOX_TEMPLATE_MAX_DOCKERFILE_BYTES`** and `_INSTRUCTIONS`, and
+  `_MAX_CONTEXT_BYTES` / `_MAX_CONTEXT_FILES`. The context byte cap applies
+  both to the upload and to the sum of the members' declared sizes, so an
+  archive that compresses to nothing and expands to gigabytes is refused
+  without being expanded.
+- **`HARBORBOX_TEMPLATE_MAX_CONCURRENT_BUILDS`** — builds queue instead of all
+  starting at once.
+- Uploaded contexts may hold only regular files, directories, and symlinks that
+  stay inside the tree. Absolute paths, `..` traversal, and device nodes are
+  refused at upload.
+- BuildKit refuses privileged build steps at the daemon: `RUN --security=insecure`
+  fails even if `--allow security.insecure` reached the command line, because
+  buildkitd is not started with that entitlement.
 
-The API joins the explicitly named `harborbox-control` network with the alias
-`harborbox-api`. A separately composed Onvo container can join that network as
-an external network and use `HARBORBOX_BASE_URL=http://harborbox-api:8000`;
-the host port remains bound to loopback.
+Harborbox appends a conformance layer to whatever you wrote -- uid/gid 10001,
+a writable `/workspace` as `WORKDIR`, and `USER 10001:10001` last. This is the
+analogue of E2B injecting `envd`: you decide what the image contains, Harborbox
+guarantees it can still be run as a sandbox. **Your own trailing `USER` is
+overridden**, and `FROM scratch` will not work -- no shell means no commands.
+
+A template cold-starts unless it is named in `HARBORBOX_WARM_POOL`. That is the
+right default: pooling every image a product ever built would trade a bounded
+image count for an unbounded pool count.
 
 ## TypeScript SDK
 
@@ -217,7 +262,7 @@ It implements the E2B-shaped surface used by Onvo Lite:
 ```typescript
 import { Sandbox } from "@harborbox/sdk";
 
-const sandbox = await Sandbox.create("onvo-lite", {
+const sandbox = await Sandbox.create("base", {
   timeoutMs: 20 * 60_000,
 });
 
@@ -342,9 +387,8 @@ Except for `/health`, requests require:
 X-API-Key: <HARBORBOX_API_KEY>
 ```
 
-`POST /v1/sandboxes` requires `template` to name either a statically configured
-template — `relaydeck`, `onvo-pro`, `onvo-lite` — or a derived template
-registered through `POST /v1/templates`. An unknown name is a `422`; a known
+`POST /v1/sandboxes` requires `template` to name either the statically
+configured `base` or a template registered through `POST /v1/templates`. An unknown name is a `422`; a known
 name whose image is still building or has failed is a `409` carrying the build
 status.
 
@@ -372,18 +416,20 @@ sandbox and no cross-call state: upload a script and run it, or run
 
 `POST /v1/sandboxes/{id}/executions` was removed in 0.3.0 along with the
 Jupyter kernel behind it. The kernel held one namespace per sandbox, which cost
-~3 s of boot and ~197 MB resident in every onvo-pro and onvo-lite sandbox —
+~3 s of boot and ~197 MB resident in every sandbox that ran Python —
 see `scripts/bench/` for the harness and `scripts/bench/results/` for the
 measurements — and the endpoint had no caller: the TypeScript SDK only ever
 read `GET /v1/executions/{id}`, and Onvo uploads a script and runs it through
 `/commands`. `GET /v1/executions/{id}` and its `/events` and `/cancel`
 siblings are unaffected; they serve commands and processes.
 
-Where `/opt/forkrun.py` is present (onvo-pro, onvo-lite) a script is forked
-from a daemon that has already imported pandas, keeping the ~1.5 s import off
-every call. It is transparent — a forked run matches `python script.py`,
-including its environment and exit code — and absent, the script simply runs
-normally.
+Where `/opt/forkrun.py` is present a script is forked from a daemon that has
+already imported its heavy modules, keeping the ~1.5 s import off every call.
+It is transparent — a forked run matches `python script.py`, including its
+environment and exit code — and absent, the script simply runs normally.
+Harborbox no longer ships it: a product that wants the fast Python path
+installs it in its own Dockerfile, which is the same move as owning the rest
+of the image.
 
 ## Development
 

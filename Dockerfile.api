@@ -6,10 +6,40 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# The Docker CLI and the buildx plugin, for POST /v1/templates. Derived template
-# images are built through BuildKit: Docker Engine 29 removed the classic
-# builder that the docker-py build API talks to. The daemon itself is not
-# installed here — the API uses the socket mounted by compose.yaml.
+# buildctl, for POST /v1/templates. Derived template images are built on the
+# rootless `builder` service, which the API drives over a unix socket in a
+# shared volume — see compose.internal-tools.yaml. This container holds no
+# Docker socket and cannot start anything itself.
+#
+# Pinned: buildctl and buildkitd negotiate, but a client newer than the daemon
+# can ask for frontend features it does not have, and the failure surfaces as a
+# confusing solve error rather than a version complaint. Keep this in step with
+# the `builder` service's image tag.
+ARG BUILDKIT_VERSION=v0.32.2
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && case "$(dpkg --print-architecture)" in \
+         amd64) BUILDKIT_ARCH=amd64 ;; \
+         arm64) BUILDKIT_ARCH=arm64 ;; \
+         *) echo "unsupported architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL \
+      "https://github.com/moby/buildkit/releases/download/${BUILDKIT_VERSION}/buildkit-${BUILDKIT_VERSION}.linux-${BUILDKIT_ARCH}.tar.gz" \
+      -o /tmp/buildkit.tgz \
+    && tar -xzf /tmp/buildkit.tgz -C /usr/local/bin --strip-components=1 bin/buildctl \
+    && rm /tmp/buildkit.tgz \
+    && buildctl --version \
+    && apt-get purge -y curl \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
+# The Docker CLI and the buildx plugin remain for the pre-registry fallback:
+# with HARBORBOX_BUILDER_ADDRESS unset, TemplateBuilder still builds through a
+# mounted Docker socket against the local daemon. Deployments that set a
+# builder never invoke these.
+#
+# Not docker-py even on that path: Docker Engine 29 removed the classic builder
+# its build API talks to, and calls to it hang rather than fail.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
     && install -m 0755 -d /etc/apt/keyrings \

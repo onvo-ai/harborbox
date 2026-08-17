@@ -253,7 +253,7 @@ class OpenSandboxRuntime:
             elif handle is None:
                 template = sandbox.metadata_.get("template")
                 handle = await OpenSandbox.create(
-                    self.settings.image_for_template(template),
+                    self.settings.image_spec_for_template(template),
                     entrypoint=self.settings.entrypoint_for_template(template),
                     **kwargs,
                 )
