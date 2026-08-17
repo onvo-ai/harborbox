@@ -145,6 +145,35 @@ class SuspensionPlan:
     cool: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class PausePlan:
+    """What an explicit pause request should do: land on `target`, maybe via the runtime."""
+
+    target: str
+    call_runtime: bool
+
+
+def plan_pause(status: str, *, memory: bool) -> PausePlan | None:
+    """Resolve a pause request, or None when the sandbox cannot be paused at all.
+
+    Four cases, and the third is the one that was missing. A `created` sandbox
+    has no container yet, so it goes cold by bookkeeping alone. A `running` one
+    is paused for real. A `paused_memory` one asked for `memory=false` is also
+    paused for real -- it is the ladder's second rung, and skipping it left a
+    frozen sandbox holding its whole memory reservation while the caller was
+    told the cold pause had happened. Everything else already at rest is a
+    no-op, so asking twice is safe.
+    """
+    target = "paused_memory" if memory else "paused_cold"
+    if status == "created":
+        return PausePlan(target="paused_cold", call_runtime=False)
+    if status == "running" or (status == "paused_memory" and not memory):
+        return PausePlan(target=target, call_runtime=True)
+    if status in {"paused_memory", "paused_cold"}:
+        return PausePlan(target=status, call_runtime=False)
+    return None
+
+
 def plan_suspensions(
     candidates: list[IdleSandbox],
     *,

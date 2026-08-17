@@ -9,7 +9,7 @@ grows without bound -- a frozen sandbox still holds its whole reservation.
 
 from __future__ import annotations
 
-from harborbox.scheduler import IdleSandbox, plan_suspensions
+from harborbox.scheduler import IdleSandbox, plan_pause, plan_suspensions
 
 HOT_IDLE = 60
 COLD_IDLE = 300
@@ -142,3 +142,45 @@ def test_disabling_the_hot_tier_restores_the_old_behaviour() -> None:
 
 def test_a_zero_budget_also_disables_the_hot_tier() -> None:
     assert plan([sandbox("a", idle_seconds=HOT_IDLE + 1)], hot_budget_mb=0) == ((), ())
+
+
+def pause_plan(status: str, *, memory: bool) -> tuple[str, bool] | None:
+    """Flatten `plan_pause` to (target, call_runtime) so the cases read as a table."""
+    plan = plan_pause(status, memory=memory)
+    return None if plan is None else (plan.target, plan.call_runtime)
+
+
+def test_a_running_sandbox_pauses_into_either_tier() -> None:
+    assert pause_plan("running", memory=True) == ("paused_memory", True)
+    assert pause_plan("running", memory=False) == ("paused_cold", True)
+
+
+def test_a_frozen_sandbox_asked_to_go_cold_actually_goes_cold() -> None:
+    """The rung the API used to skip.
+
+    `paused_memory` fell through to the "already at rest, nothing to do" branch
+    whatever `memory` said, so a cold pause on a frozen sandbox answered 200
+    with the sandbox still frozen -- still holding its whole reservation, which
+    is the one thing the cold tier exists to release.
+    """
+    assert pause_plan("paused_memory", memory=False) == ("paused_cold", True)
+
+
+def test_pausing_something_already_in_that_tier_does_nothing() -> None:
+    assert pause_plan("paused_memory", memory=True) == ("paused_memory", False)
+    assert pause_plan("paused_cold", memory=False) == ("paused_cold", False)
+    # Asking a cold sandbox to freeze cannot be honoured -- there is no
+    # container to freeze -- and waking it to freeze it would be absurd, so it
+    # stays where it is rather than erroring.
+    assert pause_plan("paused_cold", memory=True) == ("paused_cold", False)
+
+
+def test_a_sandbox_with_no_container_goes_cold_without_touching_the_runtime() -> None:
+    assert pause_plan("created", memory=True) == ("paused_cold", False)
+    assert pause_plan("created", memory=False) == ("paused_cold", False)
+
+
+def test_a_dead_or_busy_sandbox_cannot_be_paused() -> None:
+    for status in ("killed", "failed", "starting"):
+        assert pause_plan(status, memory=True) is None, status
+        assert pause_plan(status, memory=False) is None, status

@@ -46,6 +46,7 @@ from harborbox.scheduler import (
     TERMINAL_EXECUTION_STATES,
     Scheduler,
     has_sandbox_execution_slot,
+    plan_pause,
 )
 from harborbox.schemas import (
     CapacityResponse,
@@ -549,16 +550,15 @@ async def pause_sandbox(
     )
     if active:
         raise HTTPException(status_code=409, detail="sandbox has an active execution")
-    if sandbox.status == "created":
-        sandbox.status = "paused_cold"
-    elif sandbox.status == "running":
-        await runtime_from(request).pause(sandbox, memory=body.memory)
-        sandbox.status = "paused_memory" if body.memory else "paused_cold"
-        if not body.memory:
-            sandbox.container_id = None
-            sandbox.container_name = None
-    elif sandbox.status not in {"paused_memory", "paused_cold"}:
+    plan = plan_pause(sandbox.status, memory=body.memory)
+    if plan is None:
         raise HTTPException(status_code=409, detail=f"cannot pause {sandbox.status}")
+    if plan.call_runtime:
+        await runtime_from(request).pause(sandbox, memory=body.memory)
+    sandbox.status = plan.target
+    if plan.target == "paused_cold":
+        sandbox.container_id = None
+        sandbox.container_name = None
     await session.commit()
     await session.refresh(sandbox)
     return sandbox
