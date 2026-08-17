@@ -1,6 +1,18 @@
 name: harborbox
 
 configs:
+  # BuildKit resolves `FROM` itself, and that resolution does NOT inherit the
+  # `registry.insecure=true` Harborbox puts on the build output -- that flag
+  # only covers the push. Without this the first product Dockerfile to build
+  # FROM the base dies on
+  #   http: server gave HTTP response to HTTPS client
+  # which reads like a broken registry rather than a missing daemon setting.
+  buildkitd-config:
+    content: |
+      [registry."registry:5000"]
+        http = true
+        insecure = true
+
   opensandbox-config:
     content: |
       [server]
@@ -38,30 +50,14 @@ configs:
 services:
   # Image build target only. The inactive profile keeps it out of the normal
   # runtime stack and out of OrbStack's container list.
-  sandbox-onvo-pro-image:
+  sandbox-base-image:
     profiles: ["build"]
-    image: ${HARBORBOX_TEMPLATE_IMAGE_PREFIX:-harborbox-sandbox}-onvo-pro:${HARBORBOX_TEMPLATE_VERSION:-local}
+    image: 127.0.0.1:${HARBORBOX_REGISTRY_PORT:-5050}/${HARBORBOX_TEMPLATE_IMAGE_PREFIX:-harborbox-sandbox}-onvo-pro:${HARBORBOX_TEMPLATE_VERSION:-local}
     build:
       context: .
       dockerfile: sandbox/Dockerfile
-      args:
-        SANDBOX_REQUIREMENTS: sandbox/requirements-onvo-pro.txt
 
-  sandbox-onvo-lite-image:
-    profiles: ["build"]
-    image: ${HARBORBOX_TEMPLATE_IMAGE_PREFIX:-harborbox-sandbox}-onvo-lite:${HARBORBOX_TEMPLATE_VERSION:-local}
-    build:
-      context: .
-      dockerfile: sandbox/Dockerfile
-      args:
-        SANDBOX_REQUIREMENTS: sandbox/requirements-onvo-lite.txt
 
-  sandbox-relaydeck-image:
-    profiles: ["build"]
-    image: ${HARBORBOX_TEMPLATE_IMAGE_PREFIX:-harborbox-sandbox}-relaydeck:${HARBORBOX_TEMPLATE_VERSION:-local}
-    build:
-      context: .
-      dockerfile: sandbox/Dockerfile.relaydeck
 
   postgres:
     image: postgres:17-alpine
@@ -82,6 +78,94 @@ services:
     restart: unless-stopped
     networks:
       - control
+
+  # Derived template images live here. BuildKit pushes over the `build`
+  # network as `registry:5000`; the host's Docker daemon pulls through the
+  # published port as `127.0.0.1:5050` when opensandbox creates a sandbox.
+  # Everything after the host part is identical between the two, which is the
+  # invariant the whole split rests on -- see
+  # docs/arbitrary-dockerfile-templates.md section 10.3.
+  #
+  # Loopback-only, and that is also what lets the daemon accept plain HTTP
+  # without an `insecure-registries` edit. Delete must be enabled or the
+  # template collector cannot reclaim anything.
+  registry:
+    image: registry:3
+    environment:
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: Registry
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+    volumes:
+      # Generate with:
+      #   mkdir -p auth && docker run --rm httpd:2-alpine \
+      #     htpasswd -Bbn "$HARBORBOX_REGISTRY_USERNAME" "$HARBORBOX_REGISTRY_PASSWORD" > auth/htpasswd
+      - ./auth:/auth:ro
+      - harborbox-registry:/var/lib/registry
+    ports:
+      - "127.0.0.1:${HARBORBOX_REGISTRY_PORT:-5050}:5000"
+    healthcheck:
+      test: ["CMD", "/bin/registry", "--version"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    mem_limit: 256m
+    memswap_limit: 256m
+    restart: unless-stopped
+    networks:
+      # Dual-homed on purpose. `build` is how BuildKit pushes; `control` is how
+      # the API deletes manifests when the template collector reclaims an image.
+      # Docker does not route between bridge networks, so this does not let the
+      # builder reach anything on `control`.
+      - build
+      - control
+
+  # Rootless BuildKit: where caller-supplied template specs become images. It
+  # holds no Docker socket, so a build step is an unprivileged process in a
+  # user namespace rather than root on this host.
+  #
+  # Three things here are load-bearing and were verified on a live stack; see
+  # docs/arbitrary-dockerfile-templates.md section 10:
+  #
+  #   1. `systempaths=unconfined` rather than the `--oci-worker-no-process-sandbox`
+  #      flag most rootless BuildKit guides use. Both start buildkitd
+  #      unprivileged; only this one keeps the per-step process sandbox.
+  #   2. It joins `build` and nothing else. Under `network_mode: host` a build
+  #      step reached a service published on host loopback.
+  #   3. Native overlayfs needs /dev/fuse and user namespaces. Check
+  #      `docker logs` for `using overlayfs`; `fuse-overlayfs` also works, slower.
+  builder:
+    image: moby/buildkit:rootless
+    configs:
+      - source: buildkitd-config
+        target: /home/user/.config/buildkit/buildkitd.toml
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+      - systempaths=unconfined
+    devices:
+      - /dev/fuse
+    volumes:
+      # The API drives buildkitd over this socket instead of TCP, so the two
+      # need no shared network -- and a build step, which runs in buildkitd's
+      # network namespace, therefore cannot reach the control plane.
+      #
+      # /run/user/1000 specifically: the image already owns that path as uid
+      # 1000, which a fresh named volume inherits. Anywhere else buildkitd gets
+      # a root-owned directory and dies with `bind: permission denied`.
+      - harborbox-buildkit-run:/run/user/1000
+      - harborbox-contexts:/var/lib/harborbox/build-contexts
+      - harborbox-buildkit:/home/user/.local/share/buildkit
+    healthcheck:
+      test: ["CMD", "buildctl", "debug", "workers"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    mem_limit: 2g
+    memswap_limit: 2g
+    restart: unless-stopped
+    networks:
+      - build
 
   opensandbox:
     image: opensandbox/server:v0.2.2
@@ -132,36 +216,39 @@ services:
       HARBORBOX_OPENSANDBOX_USE_SERVER_PROXY: ${HARBORBOX_OPENSANDBOX_USE_SERVER_PROXY:-false}
       HARBORBOX_OPENSANDBOX_READY_TIMEOUT_SECONDS: ${HARBORBOX_OPENSANDBOX_READY_TIMEOUT_SECONDS:-30}
       HARBORBOX_OPENSANDBOX_SNAPSHOT_TIMEOUT_SECONDS: ${HARBORBOX_OPENSANDBOX_SNAPSHOT_TIMEOUT_SECONDS:-300}
-      HARBORBOX_SANDBOX_IMAGE: ${HARBORBOX_TEMPLATE_IMAGE_PREFIX:-harborbox-sandbox}-onvo-lite:${HARBORBOX_TEMPLATE_VERSION:-local}
-      HARBORBOX_ONVO_PRO_IMAGE: ${HARBORBOX_TEMPLATE_IMAGE_PREFIX:-harborbox-sandbox}-onvo-pro:${HARBORBOX_TEMPLATE_VERSION:-local}
-      HARBORBOX_ONVO_LITE_IMAGE: ${HARBORBOX_TEMPLATE_IMAGE_PREFIX:-harborbox-sandbox}-onvo-lite:${HARBORBOX_TEMPLATE_VERSION:-local}
-      HARBORBOX_RELAYDECK_IMAGE: ${HARBORBOX_TEMPLATE_IMAGE_PREFIX:-harborbox-sandbox}-relaydeck:${HARBORBOX_TEMPLATE_VERSION:-local}
+      HARBORBOX_BASE_IMAGE: harborbox-sandbox-base:${HARBORBOX_IMAGE_TAG:-local}
+      # Pools by template name. A product that wants its own image kept
+      # warm adds it here: {"base":1,"custom-abc123def456":2}.
+      HARBORBOX_WARM_POOL: ${HARBORBOX_WARM_POOL:-{"base":1}}
       HARBORBOX_TEMPLATE_IMAGE_PREFIX: ${HARBORBOX_TEMPLATE_IMAGE_PREFIX:-harborbox-sandbox}
       HARBORBOX_TEMPLATE_VERSION: ${HARBORBOX_TEMPLATE_VERSION:-local}
-      HARBORBOX_TEMPLATE_APT_ALLOWLIST: ${HARBORBOX_TEMPLATE_APT_ALLOWLIST:-["ca-certificates","chromium","default-mysql-client","fonts-liberation","fonts-noto-core","postgresql-client","redis-tools"]}
-      HARBORBOX_TEMPLATE_NPM_ALLOWLIST: ${HARBORBOX_TEMPLATE_NPM_ALLOWLIST:-["@playwright/mcp"]}
-      HARBORBOX_TEMPLATE_MAX_APT_PACKAGES: ${HARBORBOX_TEMPLATE_MAX_APT_PACKAGES:-40}
-      HARBORBOX_TEMPLATE_MAX_NPM_PACKAGES: ${HARBORBOX_TEMPLATE_MAX_NPM_PACKAGES:-20}
-      HARBORBOX_TEMPLATE_MAX_ENV_VARS: ${HARBORBOX_TEMPLATE_MAX_ENV_VARS:-32}
+      # Builds run on the rootless builder, over a socket, not on this
+      # container's daemon -- it no longer has one.
+      HARBORBOX_BUILDER_ADDRESS: unix:///run/user/1000/buildkit/buildkitd.sock
+      HARBORBOX_REGISTRY_PUSH_ENDPOINT: registry:5000
+      HARBORBOX_REGISTRY_PULL_ENDPOINT: 127.0.0.1:${HARBORBOX_REGISTRY_PORT:-5050}
+      HARBORBOX_REGISTRY_USERNAME: ${HARBORBOX_REGISTRY_USERNAME:-harborbox}
+      HARBORBOX_REGISTRY_PASSWORD: ${HARBORBOX_REGISTRY_PASSWORD:-change-me-registry}
+      # BuildKit has no implicit "localhost is insecure" rule the way the
+      # Docker daemon does, so plain HTTP has to be declared.
+      HARBORBOX_REGISTRY_INSECURE: ${HARBORBOX_REGISTRY_INSECURE:-true}
       HARBORBOX_TEMPLATE_BUILD_TIMEOUT_SECONDS: ${HARBORBOX_TEMPLATE_BUILD_TIMEOUT_SECONDS:-1800}
+      # Caller-supplied Dockerfiles. Off unless a deployment opts in: an
+      # arbitrary RUN is a different trust class from an allowlisted package
+      # name. HARBORBOX_TEMPLATE_FROM_ALLOWLIST is what still constrains the
+      # result -- what a build installs is unbounded, what it starts from is not.
+      HARBORBOX_TEMPLATE_FROM_ALLOWLIST: ${HARBORBOX_TEMPLATE_FROM_ALLOWLIST:-["docker.io/library"]}
+      HARBORBOX_TEMPLATE_CONTEXT_ROOT: /var/lib/harborbox/build-contexts
+      HARBORBOX_TEMPLATE_MAX_CONCURRENT_BUILDS: ${HARBORBOX_TEMPLATE_MAX_CONCURRENT_BUILDS:-2}
       HARBORBOX_TEMPLATE_GC_ENABLED: ${HARBORBOX_TEMPLATE_GC_ENABLED:-true}
       HARBORBOX_TEMPLATE_GC_MAX_IDLE_DAYS: ${HARBORBOX_TEMPLATE_GC_MAX_IDLE_DAYS:-14}
       HARBORBOX_TEMPLATE_GC_INTERVAL_SECONDS: ${HARBORBOX_TEMPLATE_GC_INTERVAL_SECONDS:-3600}
       HARBORBOX_WARM_POOL_ENABLED: ${HARBORBOX_WARM_POOL_ENABLED:-true}
-      HARBORBOX_WARM_POOL_RELAYDECK: ${HARBORBOX_WARM_POOL_RELAYDECK:-2}
-      HARBORBOX_WARM_POOL_ONVO_PRO: ${HARBORBOX_WARM_POOL_ONVO_PRO:-1}
-      HARBORBOX_WARM_POOL_ONVO_LITE: ${HARBORBOX_WARM_POOL_ONVO_LITE:-0}
       HARBORBOX_WARM_POOL_WARMUP_CONCURRENCY: ${HARBORBOX_WARM_POOL_WARMUP_CONCURRENCY:-2}
       HARBORBOX_WARM_POOL_RECONCILE_SECONDS: ${HARBORBOX_WARM_POOL_RECONCILE_SECONDS:-2}
       HARBORBOX_WARM_POOL_IDLE_TTL_SECONDS: ${HARBORBOX_WARM_POOL_IDLE_TTL_SECONDS:-900}
       HARBORBOX_WARM_POOL_RELEASE_AFTER_INACTIVITY_SECONDS: ${HARBORBOX_WARM_POOL_RELEASE_AFTER_INACTIVITY_SECONDS:-300}
       HARBORBOX_WARM_POOL_RELEASE_ON_SHUTDOWN: ${HARBORBOX_WARM_POOL_RELEASE_ON_SHUTDOWN:-true}
-      HARBORBOX_RELAYDECK_TEMPLATE_MEMORY_MB: ${HARBORBOX_RELAYDECK_TEMPLATE_MEMORY_MB:-256}
-      HARBORBOX_RELAYDECK_TEMPLATE_CPU: ${HARBORBOX_RELAYDECK_TEMPLATE_CPU:-0.5}
-      HARBORBOX_ONVO_PRO_TEMPLATE_MEMORY_MB: ${HARBORBOX_ONVO_PRO_TEMPLATE_MEMORY_MB:-1024}
-      HARBORBOX_ONVO_PRO_TEMPLATE_CPU: ${HARBORBOX_ONVO_PRO_TEMPLATE_CPU:-2}
-      HARBORBOX_ONVO_LITE_TEMPLATE_MEMORY_MB: ${HARBORBOX_ONVO_LITE_TEMPLATE_MEMORY_MB:-1024}
-      HARBORBOX_ONVO_LITE_TEMPLATE_CPU: ${HARBORBOX_ONVO_LITE_TEMPLATE_CPU:-2}
       HARBORBOX_SANDBOX_NETWORK: harborbox-net
       HARBORBOX_SANDBOX_EGRESS_NETWORK: harborbox-egress
       HARBORBOX_SANDBOX_RUNTIME: ${HARBORBOX_SANDBOX_RUNTIME:-}
@@ -187,12 +274,11 @@ services:
       HARBORBOX_MAX_UPLOAD_BYTES: ${HARBORBOX_MAX_UPLOAD_BYTES:-157286400}
       HARBORBOX_DEFAULT_IDLE_TIMEOUT_SECONDS: ${HARBORBOX_ONVO_IDLE_TIMEOUT_SECONDS:-1200}
     volumes:
-      # Required by POST /v1/templates: the API builds derived template images
-      # itself. This grants the API host-level Docker control, which it did not
-      # previously have — see the deployment notes in README.md. Set
-      # HARBORBOX_TEMPLATE_GC_ENABLED and the template endpoints aside and drop
-      # this mount if you do not use derived templates.
-      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+      # The builder's socket, and nothing else. This replaces the Docker socket
+      # the API used to mount for POST /v1/templates: it can ask the rootless
+      # builder for an image build, and it cannot start a container on this
+      # host. See the deployment notes in README.md.
+      - harborbox-buildkit-run:/run/user/1000
     ports:
       - "127.0.0.1:${HARBORBOX_PORT:-8000}:8000"
     extra_hosts:
@@ -214,7 +300,16 @@ services:
 volumes:
   harborbox-postgres:
   opensandbox-state:
+  harborbox-registry:
+  harborbox-buildkit:
+  harborbox-buildkit-run:
+  harborbox-contexts:
 
 networks:
   control:
     name: harborbox-control
+  # The builder and the registry, and nothing else. A build step runs inside
+  # buildkitd's network namespace, so what the builder can reach is what
+  # caller-supplied build steps can reach.
+  build:
+    name: harborbox-build

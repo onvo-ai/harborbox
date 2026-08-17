@@ -2,30 +2,17 @@ import re
 from functools import lru_cache
 from typing import Literal
 
+from opensandbox.models.sandboxes import SandboxImageAuth, SandboxImageSpec
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Derived template names are `<static base>-<12 hex chars>`. The suffix is the
-# truncated canonical-spec digest, so a derived image name is a pure function of
-# the template name: image resolution never needs to read the database.
-DERIVED_TEMPLATE_SUFFIX = re.compile(r"^[0-9a-f]{12}$")
+# The one statically registered template. Everything else is a Dockerfile a
+# product brought itself.
+BASE_TEMPLATE = "base"
 
-# Every name here is verified to resolve on Debian bookworm, which is what the
-# static base images are built from. An allowlisted name that does not exist on
-# bookworm would only ever surface as a failed build.
-DEFAULT_APT_ALLOWLIST = frozenset(
-    {
-        "ca-certificates",
-        "chromium",
-        "default-mysql-client",
-        "fonts-liberation",
-        "fonts-noto-core",
-        "postgresql-client",
-        "redis-tools",
-    }
-)
-DEFAULT_NPM_ALLOWLIST = frozenset({"@playwright/mcp"})
-
+# A template built from a caller's Dockerfile. The digest keeps the image name a
+# pure function of the template name, so resolution never reads the database.
+CUSTOM_TEMPLATE_NAME = re.compile(r"^custom-[0-9a-f]{12}$")
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -54,12 +41,35 @@ class Settings(BaseSettings):
     oom_diagnostic_timeout_seconds: float = Field(default=3.0, gt=0)
     opensandbox_snapshot_timeout_seconds: float = Field(default=300.0, gt=0)
     docker_base_url: str | None = None
-    sandbox_image: str = "harborbox-sandbox:local"
-    onvo_pro_image: str = "harborbox-sandbox-onvo-pro:local"
-    onvo_lite_image: str = "harborbox-sandbox-onvo-lite:local"
-    relaydeck_image: str = "harborbox-sandbox-relaydeck:local"
+    # The one image Harborbox ships. Products no longer get a template each:
+    # they own a Dockerfile and POST it, which is the only way to build now.
+    # This exists to be something to build FROM, and to give a warm pool
+    # somewhere to live.
+    base_image: str = "harborbox-sandbox-base:local"
     template_image_prefix: str = "harborbox-sandbox"
     template_version: str = "local"
+
+    # Address of the rootless BuildKit daemon, e.g. "tcp://builder:1234". Set
+    # it and template builds stop touching the Docker socket entirely; leave it
+    # unset and they keep going through `docker build -` against the local
+    # daemon, which is the pre-registry behaviour.
+    builder_address: str | None = None
+    # Both endpoints address the same registry and must agree on everything
+    # after the host part; see Settings.push_image_for_template and
+    # docs/arbitrary-dockerfile-templates.md section 10.3. Unset on both means
+    # no registry: images stay in the local daemon's store.
+    #
+    # The push endpoint is how the builder dials the registry over the build
+    # network; the pull endpoint is how the *Docker daemon* reaches it from the
+    # host, which is why they differ in the bundled Compose deployment.
+    registry_push_endpoint: str | None = None
+    registry_pull_endpoint: str | None = None
+    registry_username: str | None = None
+    registry_password: str | None = None
+    # BuildKit does not inherit the Docker daemon's implicit
+    # "localhost is insecure" rule, so a plain-HTTP registry has to be declared.
+    registry_insecure: bool = True
+    registry_timeout_seconds: float = Field(default=30.0, gt=0)
     sandbox_network: str = "harborbox-net"
     sandbox_egress_network: str | None = None
     sandbox_runtime: str | None = None
@@ -99,9 +109,12 @@ class Settings(BaseSettings):
     reaper_failed_retention_hours: int = Field(default=24, ge=1)
 
     warm_pool_enabled: bool = True
-    warm_pool_relaydeck: int = Field(default=2, ge=0, le=32)
-    warm_pool_onvo_pro: int = Field(default=1, ge=0, le=32)
-    warm_pool_onvo_lite: int = Field(default=0, ge=0, le=32)
+    # Keyed by template name, so a `custom-<hash>` image a product built can be
+    # pooled exactly like the base. This used to be one field per product
+    # template, which stopped working the moment products started bringing
+    # their own images -- and warm starts are worth ~3s, so losing them for
+    # everything but the base would have been a real regression.
+    warm_pool: dict[str, int] = Field(default_factory=lambda: {"base": 1})
     warm_pool_warmup_concurrency: int = Field(default=2, ge=1, le=16)
     warm_pool_reconcile_seconds: float = Field(default=2.0, gt=0)
     warm_pool_idle_ttl_seconds: int = Field(default=900, ge=60)
@@ -109,22 +122,23 @@ class Settings(BaseSettings):
     warm_pool_acquired_timeout_seconds: int = Field(default=86_400, ge=60)
     warm_pool_release_on_shutdown: bool = True
 
-    relaydeck_template_memory_mb: int = Field(default=256, ge=128)
-    relaydeck_template_cpu: float = Field(default=0.5, gt=0)
-    onvo_pro_template_memory_mb: int = Field(default=1024, ge=128)
-    onvo_pro_template_cpu: float = Field(default=1.0, gt=0)
-    onvo_lite_template_memory_mb: int = Field(default=1024, ge=128)
-    onvo_lite_template_cpu: float = Field(default=1.0, gt=0)
-
-    # Derived templates are built from caller-supplied package lists, so the
-    # request body is hostile input: every name is regex-checked and must also
-    # appear in these allowlists before it reaches a generated Dockerfile.
-    template_apt_allowlist: frozenset[str] = DEFAULT_APT_ALLOWLIST
-    template_npm_allowlist: frozenset[str] = DEFAULT_NPM_ALLOWLIST
-    template_max_apt_packages: int = Field(default=40, ge=0, le=200)
-    template_max_npm_packages: int = Field(default=20, ge=0, le=200)
-    template_max_env_vars: int = Field(default=32, ge=0, le=200)
-    template_max_env_value_length: int = Field(default=1024, ge=1, le=8192)
+    base_template_memory_mb: int = Field(default=512, ge=128)
+    base_template_cpu: float = Field(default=1.0, gt=0)
+    # Repository prefixes a caller's `FROM` may name, matched after Docker's
+    # implicit `docker.io/library/` expansion. This is the supply-chain control:
+    # `RUN` can install anything, so what a build *starts from* is the only part
+    # still worth constraining. The static bases are appended automatically --
+    # callers should always be able to build on our own templates.
+    template_from_allowlist: frozenset[str] = frozenset({"docker.io/library"})
+    template_max_dockerfile_bytes: int = Field(default=65_536, ge=256)
+    template_max_dockerfile_instructions: int = Field(default=200, ge=1)
+    # Build contexts. The byte cap applies twice: to the uploaded archive, and
+    # to the sum of its members' declared sizes, so a tarball that compresses to
+    # nothing and expands to gigabytes is refused without being expanded.
+    template_max_context_bytes: int = Field(default=33_554_432, ge=1024)
+    template_max_context_files: int = Field(default=2000, ge=1)
+    template_context_root: str = "/var/lib/harborbox/build-contexts"
+    template_max_concurrent_builds: int = Field(default=2, ge=1, le=32)
     template_build_timeout_seconds: float = Field(default=1800.0, gt=0)
     template_gc_enabled: bool = True
     template_gc_max_idle_days: int = Field(default=14, ge=1)
@@ -185,26 +199,30 @@ class Settings(BaseSettings):
 
     @property
     def template_images(self) -> dict[str, str]:
-        return {
-            "onvo-pro": self.onvo_pro_image,
-            "onvo-lite": self.onvo_lite_image,
-            "relaydeck": self.relaydeck_image,
-        }
-
-    def base_of_derived_template(self, template: str) -> str | None:
-        """Return the static base a derived template name refers to, if it is one.
-
-        Purely lexical, and deliberately so: derived image names are
-        content-addressed by construction, which is what lets the synchronous
-        callers below stay synchronous.
-        """
-        base, _, digest = template.rpartition("-")
-        if base in self.template_images and DERIVED_TEMPLATE_SUFFIX.fullmatch(digest):
-            return base
-        return None
+        return {BASE_TEMPLATE: self.base_image}
 
     def derived_template_image(self, template: str) -> str:
         return f"{self.template_image_prefix}-{template}:{self.template_version}"
+
+    def _qualify(self, endpoint: str | None, reference: str) -> str:
+        """Address `reference` through `endpoint`, leaving the repository path alone.
+
+        The endpoint is only how a client dials the registry, so push and pull
+        may use different ones for the same store. Everything after the host
+        must therefore stay byte-identical between the two -- see
+        `push_image_for_template`.
+        """
+        return f"{endpoint}/{reference}" if endpoint else reference
+
+    def push_image_for_template(self, template: str) -> str:
+        """Return the reference BuildKit pushes to, dialled from its own network.
+
+        Differs from `image_for_template` only in the host part. The Docker
+        daemon that later pulls the image reaches the same registry by a
+        different address, and a mismatch below the host would only surface at
+        sandbox create, long after the build reported success.
+        """
+        return self._qualify(self.registry_push_endpoint, self._unqualified_image(template))
 
     def entrypoint_for_template(self, template: str | None) -> list[str]:  # noqa: ARG002 - see docstring
         """Return what opensandbox runs as the sandbox's bootstrap command.
@@ -226,56 +244,99 @@ class Settings(BaseSettings):
         """
         return ["tail", "-f", "/dev/null"]
 
+    def is_custom_template(self, template: str) -> bool:
+        """Whether this names a raw-Dockerfile template.
+
+        Everything that is not the statically registered base is one of
+        these: a Dockerfile some product sent.
+        """
+        return CUSTOM_TEMPLATE_NAME.fullmatch(template) is not None
+
     def is_known_template_name(self, template: str) -> bool:
         """Whether the name is well-formed. Existence and readiness need the DB."""
         return (
-            template in self.template_images
-            or self.base_of_derived_template(template) is not None
+            template in self.template_images or self.is_custom_template(template)
         )
 
-    def image_for_template(self, template: str | None) -> str:
+    def _unqualified_image(self, template: str | None) -> str:
         if template is None:
             message = "a registered sandbox template is required"
             raise KeyError(message)
         image = self.template_images.get(template)
         if image is not None:
             return image
-        if self.base_of_derived_template(template) is not None:
+        if self.is_custom_template(template):
             return self.derived_template_image(template)
         raise KeyError(template)
 
+    def image_for_template(self, template: str | None) -> str:
+        """Return the reference stored on the template row and sent to opensandbox.
+
+        This is the pull side: opensandbox passes it straight through to the
+        Docker daemon, which resolves it from the host rather than from any
+        container network.
+        """
+        return self._qualify(self.registry_pull_endpoint, self._unqualified_image(template))
+
+    @property
+    def effective_from_allowlist(self) -> frozenset[str]:
+        """The configured prefixes, plus every image this deployment ships.
+
+        A caller building on `harborbox-sandbox-relaydeck` is using a base we
+        built and pushed ourselves, so requiring an operator to allowlist it by
+        hand would only ever produce a confusing refusal.
+        """
+        ours = {
+            self._qualify(self.registry_push_endpoint, image).rsplit(":", 1)[0]
+            for image in self.template_images.values()
+        }
+        ours |= {
+            self._qualify(
+                self.registry_push_endpoint, f"{self.template_image_prefix}-"
+            ).rstrip("-")
+        }
+        return self.template_from_allowlist | ours
+
+    def image_spec_for_template(self, template: str | None) -> SandboxImageSpec | str:
+        """Return what to hand opensandbox as the image for a create call.
+
+        opensandbox accepts registry credentials only per request -- it has no
+        server-side credential store -- so a private registry means every
+        create, warm-pool refill included, carries the auth. A deployment with
+        no registry keeps passing the bare name, which is what the local daemon
+        wants.
+        """
+        image = self.image_for_template(template)
+        if not (self.registry_username and self.registry_password):
+            return image
+        return SandboxImageSpec(
+            image,
+            auth=SandboxImageAuth(
+                username=self.registry_username, password=self.registry_password
+            ),
+        )
+
     @property
     def template_resources(self) -> dict[str, tuple[int, float]]:
-        return {
-            "relaydeck": (
-                self.relaydeck_template_memory_mb,
-                self.relaydeck_template_cpu,
-            ),
-            "onvo-pro": (
-                self.onvo_pro_template_memory_mb,
-                self.onvo_pro_template_cpu,
-            ),
-            "onvo-lite": (
-                self.onvo_lite_template_memory_mb,
-                self.onvo_lite_template_cpu,
-            ),
-        }
+        return {BASE_TEMPLATE: (self.base_template_memory_mb, self.base_template_cpu)}
 
     @property
     def warm_pool_sizes(self) -> dict[str, int]:
+        """Pool sizes by template name, base and custom images alike.
+
+        A product's own `custom-<hash>` template can be pooled by naming it
+        here. Nothing validates that the name exists: a pool for a template
+        that was never built simply never fills, which is the same outcome as
+        setting it to zero and far better than refusing to start.
+        """
         if not self.warm_pool_enabled:
-            return dict.fromkeys(self.template_images, 0)
-        return {
-            "relaydeck": self.warm_pool_relaydeck,
-            "onvo-pro": self.warm_pool_onvo_pro,
-            "onvo-lite": self.warm_pool_onvo_lite,
-        }
+            return dict.fromkeys(self.warm_pool, 0)
+        return dict(self.warm_pool)
 
     def resources_for_template(self, template: str | None) -> tuple[int, float]:
         """Return static sizing for a template name.
 
-        A derived template inherits its base's sizing here. Any per-template
-        override lives in the database and is applied by
+        Any per-template override lives in the database and is applied by
         `harborbox.templates.resolve_template`, which is async and therefore the
         only place allowed to read it.
         """
@@ -285,9 +346,11 @@ class Settings(BaseSettings):
         resources = self.template_resources.get(template)
         if resources is not None:
             return resources
-        base = self.base_of_derived_template(template)
-        if base is not None:
-            return self.template_resources[base]
+        if self.is_custom_template(template):
+            # A product's own image has no static sizing: the row it was
+            # created with carries it, and `resolve_template` applies that.
+            # These defaults only matter before the row is read.
+            return (self.default_sandbox_memory_mb, self.default_sandbox_cpu)
         raise KeyError(template)
 
     @model_validator(mode="after")
@@ -300,13 +363,18 @@ class Settings(BaseSettings):
                 message = f"{template} template CPU exceeds max sandbox CPU"
                 raise ValueError(message)
 
+        # Over the pools actually configured, not over the registered
+        # templates: a pool may now name a product's own `custom-<hash>`
+        # image, which has no static entry. `resources_for_template` falls back
+        # to the deployment default for those, which is the same sizing the
+        # pool will really reserve until its row is read.
         warm_memory = sum(
-            self.warm_pool_sizes[template] * resources[0]
-            for template, resources in self.template_resources.items()
+            count * self.resources_for_template(template)[0]
+            for template, count in self.warm_pool_sizes.items()
         )
         warm_cpu = sum(
-            self.warm_pool_sizes[template] * resources[1]
-            for template, resources in self.template_resources.items()
+            count * self.resources_for_template(template)[1]
+            for template, count in self.warm_pool_sizes.items()
         )
         if (
             self.sandbox_memory_budget_mb is not None
@@ -329,9 +397,15 @@ class Settings(BaseSettings):
 
         Onvo Lite hit exactly this: pool 3.0, ceiling 4.0, onvo-lite needs 2.0.
         The check above passed it.
+
+        "Largest" now has to account for templates this config has never seen:
+        a product builds its own image and sizes it per request, so the biggest
+        thing that can ask for admission is bounded by `max_sandbox_cpu`, not
+        by anything registered here.
         """
         largest_template_cpu = max(
-            (cpu for _, cpu in self.template_resources.values()), default=0.0
+            *(cpu for _, cpu in self.template_resources.values()),
+            self.max_sandbox_cpu,
         )
         if (
             self.max_parallel_cpu is not None

@@ -25,3 +25,7 @@ htmlcov/
 /ruff-strict.json
 /e2e-results.json
 /ci-report.md
+
+# The bundled registry's htpasswd file. Generated per deployment from
+# HARBORBOX_REGISTRY_USERNAME/_PASSWORD; it is a credential, not config.
+auth/

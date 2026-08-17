@@ -69,12 +69,28 @@ class SandboxUpdate(BaseModel):
 
 
 class TemplateCreate(BaseModel):
-    base: str = Field(min_length=1, max_length=64)
-    apt: list[str] = Field(default_factory=list, max_length=200)
-    npm: list[str] = Field(default_factory=list, max_length=200)
-    env: dict[str, str] = Field(default_factory=dict)
+    """A Dockerfile, and optionally the context it copies from.
+
+    The only shape this endpoint takes. Harborbox used to accept an allowlisted
+    `{base, apt, npm, env}` spec and generate the Dockerfile itself; products
+    own their images now and send the real thing.
+    """
+
+    # The length bound here is a cheap first gate so an absurd body is refused
+    # before it is parsed at all; the configured limit is what governs.
+    dockerfile: str = Field(min_length=1, max_length=1_048_576)
+    # Digest returned by POST /v1/build-contexts. Without one the build gets an
+    # empty context and any COPY fails, which is the safe default.
+    context: str | None = Field(default=None, max_length=80)
     memory_mb: int | None = Field(default=None, ge=128)
     cpu: float | None = Field(default=None, gt=0)
+
+
+class BuildContextResponse(BaseModel):
+    """What POST /v1/build-contexts hands back, for use as `context`."""
+
+    digest: str
+    bytes: int
 
 
 class TemplateResponse(BaseModel):

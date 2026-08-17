@@ -61,7 +61,7 @@ class OpenSandboxWarmPools:
                     state_store=store,
                     connection_config=self.connection,
                     creation_spec=PoolCreationSpec(
-                        image=self.settings.image_for_template(template),
+                        image=self.settings.image_spec_for_template(template),
                         entrypoint=self.settings.entrypoint_for_template(template),
                         resource={"cpu": str(cpu), "memory": f"{memory_mb}Mi"},
                         metadata={
@@ -135,12 +135,11 @@ class OpenSandboxWarmPools:
         if template is None:
             return None
         if template not in self._pools:
-            if self.settings.base_of_derived_template(template) is not None:
-                # An accepted tradeoff: pooling per derived template would trade
-                # this design's bounded image count for an unbounded pool count.
-                logger.debug(
-                    "Derived template %s has no warm pool; cold starting", template
-                )
+            # Not an error: a template is pooled only when it is named in
+            # HARBORBOX_WARM_POOL. Everything else cold starts, which is the
+            # right default -- pooling every image a product ever built would
+            # trade a bounded image count for an unbounded pool count.
+            logger.debug("Template %s has no warm pool; cold starting", template)
             return None
         expected_memory, expected_cpu = self.settings.resources_for_template(template)
         if (

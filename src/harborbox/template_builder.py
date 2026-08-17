@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
 import os
 import shutil
 import subprocess
+import tempfile
 from datetime import timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING
 
+import httpx
 from sqlalchemy import select
 
+from harborbox.build_contexts import BuildContextError, BuildContextStore
 from harborbox.db import session_factory
 from harborbox.models import Sandbox, SandboxTemplate, utc_now
 from harborbox.templates import TemplateSpec, render_dockerfile
@@ -18,6 +24,17 @@ if TYPE_CHECKING:
     from harborbox.config import Settings
 
 logger = logging.getLogger(__name__)
+
+# A registry serves whichever manifest media type the client says it accepts.
+# Ask for all four: omitting them makes a v2 registry answer with a schema-1
+# manifest whose digest does not match the one the image was pushed under, and
+# the delete that follows would 404.
+_MANIFEST_MEDIA_TYPES = (
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+)
 
 MAX_ERROR_LENGTH = 4000
 BUILD_LOG_TAIL_LINES = 20
@@ -29,10 +46,28 @@ TERMINAL_SANDBOX_STATES = ("killed", "failed")
 # found. `arguments` passed to `_run_docker` below come only from other
 # methods on this class, never from request bodies.
 _DOCKER_BIN = shutil.which("docker") or "docker"
+# Same reasoning for buildctl, which the API image installs alongside it when a
+# builder is configured. Neither path is caller-supplied.
+_BUILDCTL_BIN = shutil.which("buildctl") or "buildctl"
 
 
 class TemplateBuildError(RuntimeError):
     pass
+
+
+def _split_reference(image: str) -> tuple[str, str]:
+    """Split an image reference into its repository path and tag.
+
+    Any registry host is dropped. A leading segment counts as a host only if it
+    looks like one -- it carries a dot or a port, or is `localhost` -- which is
+    the same rule Docker itself uses to tell `registry:5000/app` from a
+    two-segment repository like `library/app`.
+    """
+    head, slash, rest = image.partition("/")
+    looks_like_host = "." in head or ":" in head or head == "localhost"
+    repository_and_tag = rest if slash and looks_like_host else image
+    repository, _, tag = repository_and_tag.rpartition(":")
+    return repository, tag
 
 
 def build_log_tail(output: str) -> str:
@@ -57,16 +92,36 @@ class TemplateBuilder:
     on the next startup, alongside interrupted executions.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self, settings: Settings, context_store: BuildContextStore | None = None
+    ) -> None:
         self.settings = settings
+        # Optional so the package-spec path, which never has a context, can
+        # still construct a builder without one.
+        self.context_store = context_store
         self._tasks: set[asyncio.Task[None]] = set()
+        # Builds queue rather than all starting at once. This matters more
+        # since caller-supplied Dockerfiles: an allowlisted apt install is
+        # bounded work, an arbitrary RUN is not.
+        self._slots = asyncio.Semaphore(settings.template_max_concurrent_builds)
 
     def schedule_build(self, name: str) -> None:
         task = asyncio.create_task(
-            self._build(name), name=f"harborbox-template-build-{name}"
+            self._build_when_a_slot_frees(name),
+            name=f"harborbox-template-build-{name}",
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+    async def _build_when_a_slot_frees(self, name: str) -> None:
+        """Hold the template at `building` until a build slot is free.
+
+        The row already says `building`, and the caller is already polling, so
+        queueing costs nothing legible -- whereas starting every requested
+        build at once is how one caller starves the host.
+        """
+        async with self._slots:
+            await self._build(name)
 
     async def close(self) -> None:
         for task in list(self._tasks):
@@ -80,17 +135,23 @@ class TemplateBuilder:
             if template is None:
                 return
             spec = TemplateSpec.from_json(template.spec)
-            image = template.image
+        # Not `template.image`: the row stores the reference opensandbox pulls,
+        # which the builder cannot reach from its own network.
+        image = self.settings.push_image_for_template(name)
 
+        # The caller wrote the Dockerfile; we only append the runtime contract.
+        # Their `FROM` was allowlisted at validation time.
+        dockerfile = render_dockerfile(spec.dockerfile)
         try:
-            base_image = self.settings.image_for_template(spec.base)
-        except KeyError:
-            await self._record_failure(name, f"unknown base template: {spec.base}")
+            await asyncio.to_thread(
+                self._build_sync, dockerfile, image, spec.context_digest
+            )
+        except BuildContextError as exc:
+            # The context was swept, or never uploaded. Say so: as a bare COPY
+            # failure this is very hard to diagnose from the build log.
+            logger.warning("Template build failed for %s: %s", name, exc)
+            await self._record_failure(name, str(exc))
             return
-
-        dockerfile = render_dockerfile(base_image=base_image, spec=spec)
-        try:
-            await asyncio.to_thread(self._build_sync, dockerfile, image)
         except TemplateBuildError as exc:
             logger.warning("Template build failed for %s: %s", name, exc)
             await self._record_failure(name, str(exc))
@@ -129,22 +190,32 @@ class TemplateBuilder:
         return environment
 
     def _run_docker(self, arguments: list[str], stdin: str | None = None) -> str:
+        return self._run_tool(_DOCKER_BIN, arguments, stdin=stdin)
+
+    def _run_tool(
+        self,
+        binary: str,
+        arguments: list[str],
+        stdin: str | None = None,
+        env_overrides: dict[str, str] | None = None,
+    ) -> str:
         try:
-            # `arguments` is always a literal list built by _build_sync /
-            # _remove_image_sync below, never a caller-supplied string passed
+            # `arguments` is always a literal list built by the build/remove
+            # methods on this class, never a caller-supplied string passed
             # through as-is (and shell=True is not used), so there is no
             # shell-injection surface here.
             completed = subprocess.run(  # noqa: S603
-                [_DOCKER_BIN, *arguments],
+                [binary, *arguments],
                 input=stdin,
                 capture_output=True,
                 text=True,
                 timeout=self.settings.template_build_timeout_seconds,
-                env=self._docker_env(),
+                env=self._docker_env() | (env_overrides or {}),
                 check=False,
             )
         except FileNotFoundError as exc:
-            message = "the docker CLI is not installed in the Harborbox API image"
+            tool = Path(binary).name
+            message = f"the {tool} CLI is not installed in the Harborbox API image"
             raise TemplateBuildError(message) from exc
         except subprocess.TimeoutExpired as exc:
             timeout = self.settings.template_build_timeout_seconds
@@ -157,8 +228,29 @@ class TemplateBuilder:
             raise TemplateBuildError(build_log_tail(output))
         return output
 
-    def _build_sync(self, dockerfile: str, image: str) -> None:
-        """Build through BuildKit, with the Dockerfile on stdin and no context.
+    def _build_sync(
+        self, dockerfile: str, image: str, context_digest: str | None = None
+    ) -> None:
+        """Build the derived image, through the builder if one is configured.
+
+        With `builder_address` set the build runs on a rootless BuildKit daemon
+        that holds no Docker socket, and the result is pushed to the registry
+        rather than landing in a local image store. Without it, the original
+        local-daemon path applies.
+        """
+        if self.settings.builder_address:
+            self._build_with_buildkit(dockerfile, image, context_digest)
+            return
+        if context_digest is not None:
+            message = (
+                "a build context requires the rootless builder; "
+                "set HARBORBOX_BUILDER_ADDRESS"
+            )
+            raise TemplateBuildError(message)
+        self._build_with_local_daemon(dockerfile, image)
+
+    def _build_with_local_daemon(self, dockerfile: str, image: str) -> None:
+        """Build through the local daemon's BuildKit, Dockerfile on stdin, no context.
 
         Not docker-py: its `images.build` posts to the daemon's classic builder,
         which was removed in Docker Engine 29, where the call hangs rather than
@@ -177,6 +269,79 @@ class TemplateBuilder:
             ],
             stdin=dockerfile,
         )
+
+    def _build_with_buildkit(
+        self, dockerfile: str, image: str, context_digest: str | None = None
+    ) -> None:
+        """Build on the rootless builder and push straight to the registry.
+
+        `buildctl` has no stdin equivalent of `docker build -`, so the
+        Dockerfile is written to its own directory and the context is a
+        separate directory that is left empty. Empty is the point: it preserves
+        what `docker build -` gave for free, namely that a Dockerfile generated
+        from API input has nothing on the build host it could `COPY`.
+        """
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            dockerfile_dir = root / "dockerfile"
+            context_dir = root / "context"
+            dockerfile_dir.mkdir()
+            context_dir.mkdir()
+            (dockerfile_dir / "Dockerfile").write_text(dockerfile)
+            if context_digest is not None:
+                if self.context_store is None:
+                    message = "this deployment stores no build contexts"
+                    raise TemplateBuildError(message)
+                # The only case where the context is not empty. It holds
+                # exactly what the caller uploaded, so the guarantee that a
+                # build cannot COPY off the *build host* still holds.
+                self.context_store.extract(context_digest, context_dir)
+            output = f"type=image,name={image},push=true"
+            if self.settings.registry_insecure:
+                output = f"{output},registry.insecure=true"
+            self._run_tool(
+                _BUILDCTL_BIN,
+                [
+                    "--addr",
+                    self.settings.builder_address or "",
+                    "build",
+                    "--progress=plain",
+                    "--frontend",
+                    "dockerfile.v0",
+                    "--local",
+                    f"context={context_dir}",
+                    "--local",
+                    f"dockerfile={dockerfile_dir}",
+                    "--output",
+                    output,
+                ],
+                env_overrides=self._registry_credentials(root),
+            )
+
+    def _registry_credentials(self, workspace: Path) -> dict[str, str]:
+        """Write a throwaway docker config for buildctl, and point it there.
+
+        buildkitd keeps no credentials of its own: the client forwards them
+        over the build session, reading them from `DOCKER_CONFIG`. Without
+        this the build itself succeeds and the *push* fails, which reads as a
+        broken registry rather than a missing password.
+
+        The file holds the password in plaintext, so it lives in the build's
+        own temporary directory and goes when that does -- writing it to the
+        API image's `~/.docker` would leave it there for the process lifetime.
+        """
+        if not (self.settings.registry_username and self.settings.registry_password):
+            return {}
+        secret = f"{self.settings.registry_username}:{self.settings.registry_password}"
+        config = {
+            "auths": {
+                self.settings.registry_push_endpoint or "": {
+                    "auth": base64.b64encode(secret.encode()).decode()
+                }
+            }
+        }
+        (workspace / "config.json").write_text(json.dumps(config))
+        return {"DOCKER_CONFIG": str(workspace)}
 
     async def collect_unused_templates(self) -> int:
         """Delete derived templates and images no sandbox has used recently."""
@@ -221,7 +386,63 @@ class TemplateBuilder:
         return removed
 
     async def remove_image(self, image: str) -> None:
+        if self.settings.registry_push_endpoint:
+            await self._remove_from_registry(image)
+            return
         await asyncio.to_thread(self._remove_image_sync, image)
+
+    async def _remove_from_registry(self, image: str) -> None:
+        """Delete a derived image's manifest from the registry.
+
+        The registry API only deletes by digest, so the tag is resolved first
+        with a HEAD. Note this reclaims the manifest, not the blobs underneath
+        it: the registry frees those on its own `garbage-collect` pass, which
+        is a registry-side concern rather than something Harborbox drives.
+
+        A failure here is logged and swallowed. A retained manifest is wasted
+        storage, and stalling the sweep behind it would leave rows for images
+        the collector has already decided are dead -- the same call the
+        local-daemon path makes for `docker image rm`.
+
+        Only the repository path and tag are taken from `image`; the endpoint
+        comes from configuration. `SandboxTemplate.image` is written unqualified
+        by `derived_template_image`, while a caller may hand over a pull
+        reference, whose host is loopback *on the Docker host* and addresses
+        nothing from inside this container. Either way the host is the part to
+        discard, and it is discarded rather than assumed present -- reading the
+        repository as "everything after the first slash" turns the unqualified
+        form into an empty path and a `/v2//manifests/` request.
+        """
+        repository, tag = _split_reference(image)
+        endpoint = self.settings.registry_push_endpoint
+        scheme = "http" if self.settings.registry_insecure else "https"
+        base = f"{scheme}://{endpoint}/v2/{repository}/manifests"
+        auth = (
+            (self.settings.registry_username, self.settings.registry_password)
+            if self.settings.registry_username and self.settings.registry_password
+            else None
+        )
+        try:
+            async with httpx.AsyncClient(
+                auth=auth, timeout=self.settings.registry_timeout_seconds
+            ) as client:
+                head = await client.request(
+                    "HEAD",
+                    f"{base}/{tag}",
+                    headers={"Accept": ", ".join(_MANIFEST_MEDIA_TYPES)},
+                )
+                head.raise_for_status()
+                digest = head.headers.get("Docker-Content-Digest")
+                if not digest:
+                    logger.warning(
+                        "Registry did not report a digest for %s; manifest retained",
+                        image,
+                    )
+                    return
+                deleted = await client.request("DELETE", f"{base}/{digest}")
+                deleted.raise_for_status()
+        except httpx.HTTPError as exc:
+            logger.warning("Could not remove template image %s: %s", image, exc)
 
     def _remove_image_sync(self, image: str) -> None:
         try:
