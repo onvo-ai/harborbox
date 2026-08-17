@@ -207,7 +207,10 @@ services:
         target: /home/user/.config/buildkit/buildkitd.toml
     security_opt:
       - seccomp=unconfined
-      - apparmor=unconfined
+      # See compose.yaml: Ubuntu 23.10+ refuses user namespaces to unconfined
+      # processes, so those hosts set HARBORBOX_BUILDER_APPARMOR after
+      # installing deploy/apparmor/harborbox-buildkit.
+      - apparmor=${HARBORBOX_BUILDER_APPARMOR:-unconfined}
       - systempaths=unconfined
     devices:
       - /dev/fuse

@@ -474,27 +474,36 @@ Ubuntu 23.10 and later ship `kernel.apparmor_restrict_unprivileged_userns=1`,
 which stops an unconfined process creating a user namespace. Rootless BuildKit
 is exactly that process, so it cannot start.
 
-**No compose setting fixes this.** `apparmor=unconfined` is already set on the
-service and does not help — under this restriction "unconfined" is precisely
-the category that is denied; the permission has to come from a profile that
-grants `userns`. The change is on the host and needs root:
+`apparmor=unconfined` is already set on the service and does not help — under
+this restriction "unconfined" is precisely the category being denied.
 
-```bash
-cat <<'EOT' | sudo tee /etc/apparmor.d/usr.bin.rootlesskit
-abi <abi/4.0>,
-include <tunables/global>
+**The profile BuildKit's own error message suggests does not work here.** It
+tells you to write `/etc/apparmor.d/usr.bin.rootlesskit`, which attaches to
+that path as a *host* binary. The rootlesskit that matters runs inside a
+container, under whatever profile Docker gives that container, and never
+transitions into it. Installed and loaded on this host, the builder kept
+failing identically. Measured there:
 
-/usr/bin/rootlesskit flags=(unconfined) {
-  userns,
-  include if exists <local/usr.bin.rootlesskit>
-}
-EOT
-sudo systemctl restart apparmor.service
+```
+unconfined container userns:      unshare(0x10000000): Operation not permitted
+default-profile container userns: unshare(0x10000000): Operation not permitted
 ```
 
+Both denied, which is the whole point: the permission has to arrive as *the
+container's own* profile. Install the one in this repository and name it:
+
+```bash
+sudo cp deploy/apparmor/harborbox-buildkit /etc/apparmor.d/harborbox-buildkit
+sudo apparmor_parser -r -W /etc/apparmor.d/harborbox-buildkit
+```
+
+then set `HARBORBOX_BUILDER_APPARMOR=harborbox-buildkit` in the deployment's
+environment and recreate the builder. The variable defaults to `unconfined`,
+so hosts without AppArmor need no change.
+
 The blunter alternative is `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`
-(persist it in `/etc/sysctl.d/`), which lifts the restriction for every
-unconfined process on the box rather than for `rootlesskit` alone. Prefer the
+(persisted in `/etc/sysctl.d/`), which lifts the restriction for every
+unconfined process on the box rather than for this one container. Prefer the
 profile.
 
 After either, confirm what actually came up:
