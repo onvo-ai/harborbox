@@ -314,9 +314,12 @@ def derived_template_response(
         version=settings.template_version,
         memory_mb=template.memory_mb,
         cpu=template.cpu,
-        # Derived templates cold-start by design: a per-team pool would trade the
-        # bounded image count this design buys for an unbounded pool count.
-        warm_pool=0,
+        # Zero unless this template is named in HARBORBOX_WARM_POOL. Pooling
+        # every image a product built would trade a bounded image count for an
+        # unbounded pool count, so it stays opt-in -- but a product's own image
+        # is exactly the thing worth keeping warm, and this is the field an
+        # operator checks to confirm the pool they configured took effect.
+        warm_pool=settings.warm_pool_sizes.get(template.name, 0),
         error=template.error,
         created_at=template.created_at,
         updated_at=template.updated_at,

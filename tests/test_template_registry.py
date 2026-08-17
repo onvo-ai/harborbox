@@ -995,3 +995,37 @@ async def test_concurrent_builds_are_bounded(monkeypatch: pytest.MonkeyPatch) ->
     await asyncio.gather(*list(builder._tasks), return_exceptions=True)
 
     assert peak <= limit
+
+
+async def test_a_pooled_custom_template_reports_its_pool_size(
+    session: AsyncSession, builder: FakeTemplateBuilder
+) -> None:
+    """A product's own image can be pooled, so the response has to say so.
+
+    Hardcoding 0 was right when only the static templates could be pooled. Now
+    that a `custom-<hash>` can be named in HARBORBOX_WARM_POOL, reporting 0 for
+    a template with two warm sandboxes standing by is simply wrong -- and it is
+    the field an operator checks to confirm the pool they configured took.
+    """
+    template = derived_row()
+    session.add(template)
+    await session.commit()
+    pool_size = 2
+    app.state.settings = Settings(warm_pool={"base": 1, template.name: pool_size})
+    app.state.template_builder = builder
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        yield session
+
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[require_api_key] = lambda: None
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://harborbox"
+        ) as client:
+            response = await client.get(f"/v1/templates/{template.name}")
+    finally:
+        app.dependency_overrides.clear()
+        app.state.settings = Settings()
+
+    assert response.json()["warm_pool"] == pool_size
