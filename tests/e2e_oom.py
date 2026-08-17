@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 if TYPE_CHECKING:
-    from harborbox_sdk import SandboxClient
+    from live_client import SandboxClient
 
 
 @pytest.mark.e2e

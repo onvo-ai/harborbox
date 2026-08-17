@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Self
 
 if TYPE_CHECKING:
-    from harborbox_sdk.client import SandboxClient
+    from live_client.client import SandboxClient
 
 TERMINAL_STATES = {"succeeded", "failed", "cancelled"}
 

@@ -4,8 +4,7 @@ import os
 from typing import TYPE_CHECKING
 
 import pytest
-
-from harborbox_sdk import SandboxClient
+from live_client import SandboxClient
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -13,7 +12,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture
 def client() -> Iterator[SandboxClient]:
-    """Build a live-stack SDK client. Only meaningful for tests marked `e2e`."""
+    """Build a live-stack HTTP client. Only meaningful for tests marked `e2e`."""
     api_key = os.environ.get("HARBORBOX_API_KEY")
     if not api_key:
         pytest.fail("HARBORBOX_API_KEY is required for e2e tests")

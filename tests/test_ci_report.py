@@ -20,7 +20,7 @@ def test_renders_a_row_per_package_with_coverage_and_counts(tmp_path: Path) -> N
         {
             "files": {
                 "src/harborbox/api.py": {"summary": {"covered_lines": 8, "num_statements": 10}},
-                "src/harborbox_sdk/client.py": {
+                "src/harborbox_agent/main.py": {
                     "summary": {"covered_lines": 3, "num_statements": 3}
                 },
             }
@@ -31,7 +31,7 @@ def test_renders_a_row_per_package_with_coverage_and_counts(tmp_path: Path) -> N
     report = render_report(tmp_path)
 
     assert "| `harborbox` | 12 | 80.0% |" in report
-    assert "`harborbox_sdk`" in report
+    assert "`harborbox_agent`" in report
     assert "100.0%" in report
     assert "Total unit test coverage: 84.6%" in report
 

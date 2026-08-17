@@ -5,7 +5,7 @@ from typing import Any, Self
 
 import httpx
 
-from harborbox_sdk.models import Sandbox
+from live_client.models import Sandbox
 
 
 class Sandboxes:

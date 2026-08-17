@@ -30,7 +30,6 @@ client -> Harborbox API -> PostgreSQL queue -> scheduler -> OpenSandbox -> runti
 - File read, write, list, and remove operations
 - Hard OpenSandbox memory and CPU limits plus bounded Harborbox output and uploads
 - Warm pause, cold pause, resume, kill, and idle cold suspension
-- Sync Python SDK
 - E2B-shaped TypeScript SDK
 - Streaming binary uploads with exact `/workspace` and `/tmp` paths
 - OpenSandbox egress, credential vault, and secure runtime compatibility
@@ -202,54 +201,6 @@ The API joins the explicitly named `harborbox-control` network with the alias
 `harborbox-api`. A separately composed Onvo container can join that network as
 an external network and use `HARBORBOX_BASE_URL=http://harborbox-api:8000`;
 the host port remains bound to loopback.
-
-## Python SDK
-
-Install the project locally:
-
-```bash
-uv sync
-```
-
-Then:
-
-```python
-from harborbox_sdk import SandboxClient
-
-client = SandboxClient(
-    "http://localhost:8000",
-    api_key="your-api-key",
-)
-
-with client.sandboxes.create(
-    template="onvo-pro",
-    memory_mb=1024,
-    cpu=2,
-) as sandbox:
-    result = sandbox.run_code(
-        """
-x = 40
-print("calculating")
-x + 2
-"""
-    )
-    print(result.text)
-    print(result.logs.stdout)
-
-    command = sandbox.commands.run("python --version")
-    print(command.logs.stdout)
-
-    sandbox.files.write("hello.txt", "persistent workspace")
-    sandbox.files.write_bytes("/tmp/input.bin", b"\x00\x01")
-```
-
-Submit without blocking:
-
-```python
-job = sandbox.run_code("sum(range(10_000_000))", wait=False)
-print(job.status, job.queue_position)
-result = job.wait(timeout=300)
-```
 
 ## TypeScript SDK
 

@@ -32,7 +32,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/harborbox", "src/harborbox_sdk"]
+packages = ["src/harborbox"]
 
 [tool.pytest.ini_options]
 # -m "not e2e" keeps the live-stack suites out of the default and CI unit runs.
@@ -42,7 +42,9 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 # ci_report.py lives in scripts/, not src/; add it to sys.path so tests can
 # import it directly, matching how it is invoked in CI (python scripts/ci_report.py).
-pythonpath = ["scripts"]
+# tests/ is on the path for live_client, the e2e suite's HTTP driver -- a test
+# fixture, deliberately not a shipped package.
+pythonpath = ["scripts", "tests"]
 # The e2e_*.py modules hold live-stack tests; pytest's default test_*.py
 # pattern would never discover them, leaving `pytest -m e2e` empty.
 python_files = ["test_*.py", "e2e_*.py"]
@@ -86,17 +88,11 @@ ignore = [
 # sandbox/ ships standalone scripts run inside the sandbox container via
 # `python forkrun.py`, not imported as a package.
 "sandbox/**" = ["INP001"]
-# harborbox_sdk is a shipped public package (see __init__.py's __all__ and the
-# README), so its underscore-prefixed names are not implementation details to
-# be widened into public API -- they mark package-internal cooperation between
-# Sandbox/Execution/Commands/Files and SandboxClient, deliberately kept off
-# the public surface. Same reasoning as the tests/** SLF001 entry above.
-"src/harborbox_sdk/**" = ["SLF001"]
 
 [tool.mypy]
 python_version = "3.12"
 strict = true
-packages = ["harborbox", "harborbox_sdk"]
+packages = ["harborbox"]
 # ci_report.py is a standalone module in scripts/, not part of either src
 # package, so it needs its own entry: mypy_path lets mypy find it by name,
 # and modules brings it under the same strict checking as the packages above.
