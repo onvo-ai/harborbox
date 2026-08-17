@@ -189,6 +189,13 @@ class PausePlan:
 
     target: str
     call_runtime: bool
+    # Snapshotting reads a *running* container. OpenSandbox rejects it outright
+    # otherwise: `[SNAPSHOT::INVALID_SOURCE_STATE] Snapshot can only be created
+    # from a Running sandbox`. So the ladder's second rung has to thaw before it
+    # can go cold, which the first version of it did not, leaving a frozen
+    # sandbox stuck frozen -- holding the whole reservation the cold tier exists
+    # to release -- every time its idle timeout came due.
+    thaw_first: bool = False
 
 
 def plan_pause(status: str, *, memory: bool) -> PausePlan | None:
@@ -205,7 +212,9 @@ def plan_pause(status: str, *, memory: bool) -> PausePlan | None:
     target = "paused_memory" if memory else "paused_cold"
     if status == "created":
         return PausePlan(target="paused_cold", call_runtime=False)
-    if status == "running" or (status == "paused_memory" and not memory):
+    if status == "paused_memory" and not memory:
+        return PausePlan(target=target, call_runtime=True, thaw_first=True)
+    if status == "running":
         return PausePlan(target=target, call_runtime=True)
     if status in {"paused_memory", "paused_cold"}:
         return PausePlan(target=status, call_runtime=False)
@@ -957,6 +966,13 @@ class Scheduler:
         """
         target = "paused_memory" if memory else "paused_cold"
         expected = "paused_memory" if target == "paused_cold" else "running"
+        if sandbox.status == "paused_memory" and not memory:
+            # See PausePlan.thaw_first: OpenSandbox will not snapshot a frozen
+            # container, so the ladder's own second rung has to unfreeze before
+            # it can go cold. Cheap next to the snapshot that follows it.
+            started = await self.runtime.resume(sandbox)
+            sandbox.container_id = started.id
+            sandbox.container_name = started.name
         await self.runtime.pause(sandbox, memory=memory)
         async with session_factory() as session:
             current = await session.get(Sandbox, sandbox.id)

@@ -150,6 +150,33 @@ def pause_plan(status: str, *, memory: bool) -> tuple[str, bool] | None:
     return None if plan is None else (plan.target, plan.call_runtime)
 
 
+def test_going_cold_from_frozen_thaws_first() -> None:
+    """OpenSandbox will not snapshot a frozen container.
+
+    A live run answered `[SNAPSHOT::INVALID_SOURCE_STATE] Snapshot can only be
+    created from a Running sandbox`, so the second rung of the ladder has to
+    unfreeze before it can go cold. Without this the transition raised, the
+    sandbox stayed `paused_memory`, and it kept the whole memory reservation the
+    cold tier exists to release -- for as long as it lived.
+    """
+    frozen_to_cold = plan_pause("paused_memory", memory=False)
+    assert frozen_to_cold is not None
+    assert frozen_to_cold.thaw_first
+
+    # Nothing else thaws: the others are either already running or have no
+    # container at all.
+    for status, memory in (
+        ("running", True),
+        ("running", False),
+        ("created", False),
+        ("paused_memory", True),
+        ("paused_cold", False),
+    ):
+        plan = plan_pause(status, memory=memory)
+        assert plan is not None
+        assert not plan.thaw_first, (status, memory)
+
+
 def test_a_running_sandbox_pauses_into_either_tier() -> None:
     assert pause_plan("running", memory=True) == ("paused_memory", True)
     assert pause_plan("running", memory=False) == ("paused_cold", True)

@@ -630,6 +630,10 @@ async def pause_sandbox(
     plan = plan_pause(sandbox.status, memory=body.memory)
     if plan is None:
         raise HTTPException(status_code=409, detail=f"cannot pause {sandbox.status}")
+    if plan.thaw_first:
+        started = await runtime_from(request).resume(sandbox)
+        sandbox.container_id = started.id
+        sandbox.container_name = started.name
     if plan.call_runtime:
         await runtime_from(request).pause(sandbox, memory=body.memory)
     sandbox.status = plan.target

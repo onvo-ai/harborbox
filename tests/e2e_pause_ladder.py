@@ -56,6 +56,14 @@ def _timed(label: str, action: Callable[[], object]) -> float:
 
 @pytest.fixture
 def sandbox(client: SandboxClient) -> Iterator[Sandbox]:
+    """Build a sandbox that is actually `running`, which the ladder's top rung needs.
+
+    `create` returns a `created` row, not a container -- starting is lazy. Pause
+    a `created` sandbox and `plan_pause` correctly sends it straight to
+    `paused_cold` whatever `memory` said, because there is nothing to freeze.
+    Writing a file is the cheapest way to force the start, and every test here
+    needs the probe file anyway.
+    """
     live = client.sandboxes.create(
         template=TEMPLATE,
         memory_mb=MEMORY_MB,
@@ -63,6 +71,8 @@ def sandbox(client: SandboxClient) -> Iterator[Sandbox]:
         idle_timeout_seconds=0,
     )
     try:
+        live.files.write(PROBE_PATH, PROBE_BODY)
+        assert live.refresh().status == "running"
         yield live
     finally:
         live.kill()
@@ -113,8 +123,6 @@ def test_a_cold_pause_preserves_the_filesystem(sandbox: Sandbox) -> None:
     creates a fresh one pays for re-uploading everything -- and cannot get it
     back, because `kill()` deletes the snapshot along with the container.
     """
-    sandbox.files.write(PROBE_PATH, PROBE_BODY)
-
     sandbox.pause(memory=False)
     assert sandbox.refresh().status == "paused_cold"
 
@@ -132,10 +140,11 @@ def test_a_frozen_sandbox_can_still_go_cold(sandbox: Sandbox) -> None:
     timeout, which means `create_snapshot()` runs against a container whose
     processes are frozen -- there is no thaw first. Whether that snapshots
     cleanly is a property of the runtime, not of anything this repo can decide,
-    so it is worth an explicit test rather than an assumption.
+    so it is worth an explicit test rather than an assumption. It is not: the
+    first live run answered with `[SNAPSHOT::INVALID_SOURCE_STATE] Snapshot can
+    only be created from a Running sandbox`, so the transition now thaws first
+    (see `PausePlan.thaw_first`).
     """
-    sandbox.files.write(PROBE_PATH, PROBE_BODY)
-
     sandbox.pause(memory=True)
     assert sandbox.refresh().status == "paused_memory"
 
