@@ -138,6 +138,23 @@ jobs:
       - name: Build the stack
         run: docker compose --profile build build
 
+      # The builder is a second Compose project, and these two are what the two
+      # projects share: a bridge neither of them owns, and the mutual-TLS pair
+      # the API needs to drive buildkitd over TCP. Both are external volumes /
+      # networks on purpose -- a missing one fails `up` by name instead of
+      # being silently created empty.
+      - name: Create the shared build network and buildkit certificates
+        run: |
+          docker network create harborbox-build || true
+          ./scripts/gen-buildkit-certs.sh
+
+      # Separately, and first: every network the builder container joins is a
+      # network a caller's build step can reach, so it is deliberately alone in
+      # its own project. tests/e2e_build_isolation.py measures that from inside
+      # a real build step, which is the only place it can be measured.
+      - name: Start the builder
+        run: docker compose -f compose.builder.yaml up -d --wait
+
       - name: Start the stack
         run: docker compose up -d --wait
 
@@ -154,7 +171,9 @@ jobs:
 
       - name: Stack logs on failure
         if: failure()
-        run: docker compose logs --no-color --tail 300
+        run: |
+          docker compose logs --no-color --tail 300
+          docker compose -f compose.builder.yaml logs --no-color --tail 100
 
       # `docker compose logs` above only covers this compose project's own
       # services (postgres, opensandbox, api). The actual sandbox containers
@@ -210,7 +229,9 @@ jobs:
 
       - name: Tear down
         if: always()
-        run: docker compose down -v
+        run: |
+          docker compose down -v
+          docker compose -f compose.builder.yaml down -v
 
       - name: Upload e2e results
         if: always()

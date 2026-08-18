@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, NoReturn, Self
 
 import httpx
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -360,6 +361,14 @@ REGISTRY_UNREACHABLE = "registry unreachable"
 
 BUILDER_SETTINGS = {
     "builder_address": "tcp://builder:1234",
+    # Not decoration: Settings refuses a tcp:// builder without them, because a
+    # buildkitd reachable without a certificate is a build daemon handed to
+    # every caller-supplied `RUN`. Nothing here reads the files -- buildctl is
+    # never really executed in this module -- so the paths only have to be the
+    # ones the deployment mounts.
+    "builder_tls_ca_cert": "/certs/buildkit/ca.pem",
+    "builder_tls_cert": "/certs/buildkit/cert.pem",
+    "builder_tls_key": "/certs/buildkit/key.pem",
     "registry_push_endpoint": "registry:5000",
     "registry_pull_endpoint": "127.0.0.1:5050",
 }
@@ -387,6 +396,72 @@ def test_a_configured_builder_pushes_to_the_registry_instead_of_a_local_daemon(
         "name=registry:5000/harborbox-sandbox-custom-a1b2c3d4e5f6:local,"
         "push=true,registry.insecure=true" in joined
     )
+
+
+def test_the_build_authenticates_itself_to_the_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every buildctl invocation carries the client certificate.
+
+    The builder is a separate Compose project now, so this is TCP rather than
+    the unix socket it used to be, and the daemon at the other end requires a
+    client certificate (`[grpc.tls] ca` in compose.builder.yaml). A build that
+    forgot these flags would fail closed rather than silently unauthenticated
+    -- but the same flags are also what verifies the *daemon*, and that half
+    fails open if it is missing: the address is a service name resolved on a
+    network a caller's build step is also on.
+    """
+    calls: list[list[str]] = []
+    record_invocations(monkeypatch, calls)
+    builder = builder_module.TemplateBuilder(Settings(**BUILDER_SETTINGS))
+
+    builder._build_sync("FROM scratch\n", "registry:5000/img:local")
+
+    argv = calls[0]
+    for flag, expected in (
+        ("--tlscacert", "/certs/buildkit/ca.pem"),
+        ("--tlscert", "/certs/buildkit/cert.pem"),
+        ("--tlskey", "/certs/buildkit/key.pem"),
+    ):
+        assert flag in argv, f"{flag} missing from {argv}"
+        assert argv[argv.index(flag) + 1] == expected
+        # buildctl's TLS flags are global, so they have to precede the
+        # subcommand; after it they are parsed as `build` flags and rejected.
+        assert argv.index(flag) < argv.index("build")
+
+
+def test_a_socket_builder_sends_no_certificates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A unix socket needs none, and Settings does not demand any.
+
+    Reaching a socket already required a shared mount namespace, which is a
+    stronger statement than a certificate. Deployments that can keep the API
+    and the builder in one project should still be able to.
+    """
+    calls: list[list[str]] = []
+    record_invocations(monkeypatch, calls)
+    settings = Settings(
+        builder_address="unix:///run/user/1000/buildkit/buildkitd.sock",
+        registry_push_endpoint="registry:5000",
+    )
+
+    builder_module.TemplateBuilder(settings)._build_sync("FROM scratch\n", "img:local")
+
+    assert not [argument for argument in calls[0] if argument.startswith("--tls")]
+
+
+def test_a_tcp_builder_without_a_client_certificate_refuses_to_start() -> None:
+    """The setting that makes the TCP move safe, pinned as a startup failure.
+
+    A `tcp://` builder with no certificate is not a degraded configuration, it
+    is an open one: the gateway that fronts buildkitd sits on the build network
+    by construction, so a caller's build step can reach the port. Builds would
+    keep working, which is exactly why this has to fail at construction rather
+    than be noticed later.
+    """
+    with pytest.raises(ValidationError, match="requires mutual TLS"):
+        Settings(builder_address="tcp://buildkit-gateway:1234")
 
 
 def test_the_build_context_handed_to_buildkit_is_empty(

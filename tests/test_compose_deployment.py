@@ -29,6 +29,12 @@ from harborbox.config import Settings
 from harborbox.schemas import SandboxCreate
 
 COMPOSE = Path(__file__).resolve().parent.parent / "compose.internal-tools.yaml"
+# The builder is a *second* Compose project, deployed as a second Coolify
+# application. That separation is load-bearing rather than tidiness, and the
+# tests below are written against both files together because the property
+# worth pinning -- what a caller's build step can reach -- is a property of the
+# pair.
+BUILDER_COMPOSE = Path(__file__).resolve().parent.parent / "compose.builder.yaml"
 
 # `${VAR:-default}` and `${VAR}`. Nothing in these files nests, so one pass is
 # enough; the point is to read the *defaults* a deploy gets with no .env set.
@@ -42,6 +48,43 @@ def resolve(value: object) -> str:
 @pytest.fixture(scope="module")
 def compose() -> dict:
     return yaml.safe_load(COMPOSE.read_text())
+
+
+@pytest.fixture(scope="module")
+def builder_compose() -> dict:
+    return yaml.safe_load(BUILDER_COMPOSE.read_text())
+
+
+def networks_of(service: dict) -> set[str]:
+    """Return the network keys a service joins.
+
+    `networks:` is a bare list on some services and a mapping (with aliases) on
+    others; both spellings mean the same thing here.
+    """
+    nets = service.get("networks") or {}
+    return set(nets)
+
+
+def services_on(compose: dict, network: str) -> set[str]:
+    return {
+        name
+        for name, service in compose["services"].items()
+        if network in networks_of(service)
+    }
+
+
+def network_name(compose: dict, key: str) -> str:
+    """Return the real Docker network name behind a compose network key.
+
+    The `build` network is external and shared between the two projects, so the
+    two files agreeing on this string is what makes "the builder and the
+    registry are on one network" true rather than a coincidence of naming.
+    """
+    # A Compose-managed network may be declared as a bare key with no body at
+    # all (`control:`), which yaml reads as None; its real name is then scoped
+    # to the project, so the key is the right identity for it here.
+    declared = compose["networks"].get(key) or {}
+    return resolve(declared.get("name") or key)
 
 
 @pytest.fixture(scope="module")
@@ -286,37 +329,128 @@ def test_the_api_does_not_hold_the_docker_socket(compose: dict) -> None:
     assert not [volume for volume in volumes if "docker.sock" in resolve(volume)]
 
 
-def test_the_builder_holds_no_docker_socket_either(compose: dict) -> None:
+def test_the_builder_holds_no_docker_socket_either(builder_compose: dict) -> None:
     """A builder with the socket would be the same hole wearing a different hat."""
-    builder = compose["services"]["builder"]
+    builder = builder_compose["services"]["builder"]
     volumes = builder.get("volumes") or []
 
     assert not [volume for volume in volumes if "docker.sock" in resolve(volume)]
     assert builder.get("privileged") is not True
 
 
-def test_the_builder_is_not_on_the_host_network(compose: dict) -> None:
+def test_the_builder_is_not_on_the_host_network(builder_compose: dict) -> None:
     """Host networking would put every build step on the host's loopback.
 
     Verified during the Q2 spike: with `network_mode: host` a `RUN` step reached
     a service published on host loopback. On this host that reaches PostgreSQL
     and the API itself, so the builder gets its own bridge network instead.
     """
-    builder = compose["services"]["builder"]
+    builder = builder_compose["services"]["builder"]
 
     assert builder.get("network_mode") != "host"
-    assert "build" in builder["networks"]
+    assert "build" in networks_of(builder)
 
 
-def test_the_builder_reaches_the_registry_and_nothing_else(compose: dict) -> None:
-    """The build network exists to hold exactly two members."""
-    on_build_network = {
-        name
-        for name, service in compose["services"].items()
-        if "build" in (service.get("networks") or [])
-    }
+def test_the_builder_and_the_control_plane_are_separate_compose_projects(
+    compose: dict, builder_compose: dict
+) -> None:
+    """The whole fix, in one assertion, and the one nothing was checking.
 
-    assert on_build_network == {"builder", "registry"}
+    Coolify appends its own project network to every service of a compose
+    application. That is invisible to this repository -- it happens after the
+    file is read -- so no amount of `networks:` discipline within one file can
+    stop it, and `connect_to_docker_network` was already false on the
+    application it happened to.
+
+    What *can* be arranged is that the project is not worth attaching to. A
+    distinct `name:` is what makes Coolify treat the builder as its own
+    application with its own project network, which is why this is asserted on
+    the literal field rather than inferred.
+    """
+    assert compose["name"] != builder_compose["name"]
+    assert builder_compose["name"] == "harborbox-builder"
+
+
+def test_coolify_can_only_attach_the_builder_to_itself(builder_compose: dict) -> None:
+    """One service in the builder project, so its project network has one member.
+
+    This is the other half of the separation and the easier half to lose: add a
+    second service to compose.builder.yaml -- a cache warmer, a log shipper, a
+    metrics sidecar -- and the orchestrator's project network silently becomes
+    a bridge from a caller's build step to that service. Anything the builder
+    genuinely needs alongside it belongs on the shared `build` network, where
+    `test_the_builder_reaches_the_registry_and_nothing_else` will see it.
+    """
+    assert set(builder_compose["services"]) == {"builder"}
+
+
+def test_the_builder_reaches_the_registry_and_nothing_else(
+    compose: dict, builder_compose: dict
+) -> None:
+    """What a caller-supplied `RUN` can reach, computed the way deployment builds it.
+
+    The previous version of this test asserted that exactly two services in
+    this one file named the `build` network. That was true, it stayed true, and
+    the deployment was open anyway -- measured on the infrastructure host, from
+    inside the builder container:
+
+        api:8000/health   -> {"status":"ok"}
+        opensandbox:8080  -> HTTP/1.1 401 Unauthorized
+        postgres:5432     -> OPEN
+
+    The test could not see it because a compose file is not the whole
+    deployment: Coolify appends its project network to every service of an
+    application, so the builder was on a second network that appears in no file
+    here. A test that reads one file and asserts about one network is testing
+    the file, not the property.
+
+    So this one models the appended network instead of ignoring it. A build
+    step runs inside buildkitd's network namespace, so it reaches:
+
+      - everything on the shared `build` network, from either project;
+      - everything in the builder's own compose project, because that is what
+        an orchestrator's project network would join it to.
+
+    Static analysis still cannot prove what a *host* does -- only
+    tests/e2e_build_isolation.py, which dials these services from inside a real
+    build step, does that. What this pins is that the arrangement is one where
+    the appended network has nothing in it.
+    """
+    assert network_name(compose, "build") == network_name(builder_compose, "build")
+
+    reachable = (
+        services_on(compose, "build")
+        | services_on(builder_compose, "build")
+        | set(builder_compose["services"])
+    ) - {"builder"}
+
+    assert reachable == {"registry", "buildkit-gateway"}
+    # Named individually as well, because the set comparison above would also
+    # pass if someone renamed the API to `registry`. These three are what was
+    # actually reachable in production.
+    assert not reachable & {"api", "postgres", "opensandbox"}
+
+
+def test_the_builder_requires_a_client_certificate(builder_compose: dict) -> None:
+    """Reaching buildkitd's port must not be the same as being able to build.
+
+    The gateway that fronts the port is on the build network by construction,
+    so a caller's build step can open a connection to it. `[grpc.tls] ca` is
+    the line that makes buildkitd demand and verify a client certificate; drop
+    it and buildkitd logs "TLS is not enabled ... enabling mutual TLS
+    authentication is highly recommended", accepts anyone, and every build
+    keeps working -- so nothing else would notice.
+    """
+    config = builder_compose["configs"]["buildkitd-config"]["content"]
+
+    assert "tcp://0.0.0.0:1234" in config
+    assert "[grpc.tls]" in config
+    for key in ("ca =", "cert =", "key ="):
+        assert key in config, f"{key} missing from the buildkitd config"
+    # The resolver fix that made build steps able to install anything at all;
+    # BuildKit's default of 8.8.8.8 is firewalled on the deployed host and
+    # every `pip install` fails looking like a bad version pin.
+    assert '[dns]\n  nameservers = ["127.0.0.11"]' in config
 
 
 def test_the_push_and_pull_endpoints_address_one_registry(settings: Settings) -> None:
@@ -332,37 +466,81 @@ def test_the_push_and_pull_endpoints_address_one_registry(settings: Settings) ->
     assert push.split("/", 1)[1] == pull.split("/", 1)[1]
 
 
-def test_the_api_drives_the_builder_over_a_socket_it_actually_mounts(
+def test_the_api_drives_the_builder_through_something_that_answers(
     compose: dict, settings: Settings
 ) -> None:
-    """The path in HARBORBOX_BUILDER_ADDRESS has to exist in the API container.
+    """The address in HARBORBOX_BUILDER_ADDRESS has to resolve on this stack.
 
     Same class of failure as the outage this module was written for: a
-    configured address nothing answers to. A socket makes it checkable
-    statically, which a hostname never was.
+    configured address nothing answers to. This used to be a unix socket, which
+    was checkable by looking for the mount; now it is a hostname again, so the
+    check is the one that caught that outage -- a service or an alias must
+    answer to the name.
     """
     assert settings.builder_address is not None
-    path = settings.builder_address.removeprefix("unix://")
+    host = settings.builder_address.removeprefix("tcp://").split(":")[0]
+    aliases = set()
+    for service in compose["services"].values():
+        nets = service.get("networks")
+        if isinstance(nets, dict):
+            for net in nets.values():
+                if isinstance(net, dict):
+                    aliases.update(net.get("aliases") or [])
+
+    assert host in set(compose["services"]) | aliases
+
+
+def test_the_api_holds_a_client_certificate_it_actually_mounts(
+    compose: dict, settings: Settings
+) -> None:
+    """Every path the API is told to authenticate with must exist in its container.
+
+    Settings already refuses a `tcp://` builder with no certificate configured,
+    which is the security half. This is the deployment half: three paths that
+    point at nothing would pass that validator and fail at the first build,
+    with a buildctl error about a file rather than about configuration.
+    """
     mounts = {
-        resolve(volume).split(":")[1]
-        for volume in compose["services"]["api"]["volumes"]
+        resolve(volume).split(":")[1] for volume in compose["services"]["api"]["volumes"]
     }
+    configured = [
+        settings.builder_tls_ca_cert,
+        settings.builder_tls_cert,
+        settings.builder_tls_key,
+    ]
 
-    assert any(path.startswith(mount) for mount in mounts)
+    assert all(configured)
+    for path in configured:
+        assert path is not None
+        assert any(path.startswith(f"{mount}/") for mount in mounts), (
+            f"{path} is not inside anything the api service mounts: {sorted(mounts)}"
+        )
 
 
-def test_the_api_shares_no_network_with_the_builder(compose: dict) -> None:
-    """A socket instead of TCP is what buys this, and it is the point.
+def test_the_api_shares_no_network_with_the_builder(
+    compose: dict, builder_compose: dict
+) -> None:
+    """The property the socket used to buy, kept across the TCP move.
 
     Build steps run inside buildkitd's own network namespace, so every network
-    the builder joins is one that caller-supplied build steps can reach. Over
-    TCP the API would have to share one.
-    """
-    shared = set(compose["services"]["api"]["networks"]) & set(
-        compose["services"]["builder"]["networks"]
-    )
+    the builder joins is one that caller-supplied build steps can reach. The
+    API therefore stays off all of them and reaches buildkitd through the
+    dual-homed gateway instead -- the same shape as the registry, and safe for
+    the same reason: Docker does not route between bridge networks.
 
-    assert not shared
+    Both project networks are included, because that is where the deployed
+    topology differed from the file: distinct `name:` fields mean the
+    orchestrator's appended networks are distinct too.
+    """
+    api = {
+        network_name(compose, key) for key in networks_of(compose["services"]["api"])
+    } | {compose["name"]}
+    builder = {
+        network_name(builder_compose, key)
+        for key in networks_of(builder_compose["services"]["builder"])
+    } | {builder_compose["name"]}
+
+    assert not api & builder
 
 
 BAKE = Path(__file__).resolve().parent.parent / "docker-bake.hcl"

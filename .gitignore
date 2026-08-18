@@ -29,3 +29,13 @@ htmlcov/
 # The bundled registry's htpasswd file. Generated per deployment from
 # HARBORBOX_REGISTRY_USERNAME/_PASSWORD; it is a credential, not config.
 auth/
+
+# The buildkit mutual-TLS material. scripts/gen-buildkit-certs.sh writes it into
+# Docker volumes and never into the working tree, so nothing here should ever
+# match -- which is the point: a hand-run openssl in the repository root cannot
+# become a committed private key. Nothing in this file is negated with `!`, so
+# there is no path back in.
+*.pem
+*.key
+*.crt
+*.srl

@@ -26,10 +26,29 @@
 # the old DockerRuntime path has nothing to talk to.
 #
 # The API no longer holds the docker socket. Template images are built on the
-# rootless `builder` service, which the API drives over a unix socket in a
-# shared volume, and the results land in the local `registry` rather than in
-# this host's image store. opensandbox still holds the socket -- something has
-# to create sandbox containers -- but the control plane does not.
+# rootless `builder`, and the results land in the local `registry` rather than
+# in this host's image store. opensandbox still holds the socket -- something
+# has to create sandbox containers -- but the control plane does not.
+#
+# **The builder is no longer part of this application.** It is a second Coolify
+# application, deployed from compose.builder.yaml onto this same host, and the
+# reason is measured rather than theoretical: Coolify appends its project
+# network to every service of a compose application, and a build step runs
+# inside buildkitd's network namespace. While `builder` was a service here, a
+# caller's `RUN` could reach `api:8000`, `opensandbox:8080` and `postgres:5432`
+# -- verified from inside the builder container on this host. Nothing in a
+# compose file prevents that attachment (`connect_to_docker_network` was
+# already false), so the builder was moved into a project where the attachment
+# reaches nothing. See compose.builder.yaml and
+# docs/arbitrary-dockerfile-templates.md section 10.3.
+#
+# What crosses the two applications:
+#   - the external `harborbox-build` network, joined here by `registry` and
+#     `buildkit-gateway` and there by `builder`;
+#   - `harborbox-buildkit-tls-client`, the client half of the mutual-TLS pair
+#     the API needs to drive buildkitd over TCP, written by
+#     scripts/gen-buildkit-certs.sh.
+# Both must exist before this application starts.
 #
 # This host ships one image, not three. Products own a Dockerfile and POST it
 # to /v1/templates, which is the only way to build.
@@ -37,24 +56,57 @@
 name: harborbox
 
 configs:
-  # BuildKit resolves `FROM` itself, and that resolution does NOT inherit the
-  # `registry.insecure=true` Harborbox puts on the build output -- that flag
-  # only covers the push. Without this the first product Dockerfile to build
-  # FROM the base dies on
-  #   http: server gave HTTP response to HTTPS client
-  # which reads like a broken registry rather than a missing daemon setting.
-  buildkitd-config:
+  # A TCP passthrough to the buildkitd that now runs in the other application.
+  # Identical to compose.yaml's; see the long note there for why the API cannot
+  # simply join the build network to reach it. In short: every network the
+  # builder joins is one a caller's `RUN` can reach, so the API stays off that
+  # network and this dual-homed proxy carries the connection across. It
+  # terminates nothing -- buildkitd's mutual TLS is what makes reaching the
+  # port different from being able to build.
+  buildkit-gateway-config:
     content: |
-      # See compose.yaml: BuildKit's default resolver for build steps is
-      # 8.8.8.8, which this host blocks, so every build that fetches anything
-      # fails to resolve. 127.0.0.11 is Docker's embedded DNS, reachable
-      # because a build step shares buildkitd's network namespace.
-      [dns]
-        nameservers = ["127.0.0.11"]
+      global
+        log stdout format raw local0 info
+        # Without an explicit cap haproxy sizes its connection tables from the
+        # container's file-descriptor ulimit, which Docker sets to something
+        # enormous, and the worker is OOM-killed at boot inside this memory
+        # limit -- `exited with code 137` in a restart loop, with no mention of
+        # memory anywhere in its own log. The API runs at most
+        # HARBORBOX_TEMPLATE_MAX_CONCURRENT_BUILDS connections through here.
+        maxconn 256
 
-      [registry."registry:5000"]
-        http = true
-        insecure = true
+      defaults
+        mode tcp
+        log global
+        option tcplog
+        timeout connect 10s
+        # Longer than HARBORBOX_TEMPLATE_BUILD_TIMEOUT_SECONDS: one build is
+        # one connection, and cutting it here surfaces as an unexplained gRPC
+        # error rather than as a build timeout.
+        timeout client 2h
+        timeout server 2h
+
+      # Without this haproxy resolves `builder` once at startup and keeps the
+      # address forever, so the first redeploy of the builder application --
+      # which is now a separate application, redeployed on its own schedule --
+      # would silently break every build until this container restarted too.
+      resolvers docker
+        nameserver embedded 127.0.0.11:53
+        resolve_retries 3
+        timeout resolve 1s
+        timeout retry 1s
+        hold valid 10s
+        hold nx 1s
+        hold other 1s
+
+      frontend buildkit
+        bind :1234
+        default_backend builder
+
+      backend builder
+        # init-addr libc,none: start even when the builder application is not
+        # up. The two are deployed independently and in either order.
+        server builder builder:1234 resolvers docker init-addr libc,none
 
   # Mirrors compose.yaml's config, with two deliberate differences for this
   # host: no egress section, because sandboxes here must reach nothing, and a
@@ -192,56 +244,40 @@ services:
       - build
       - control
 
-  # Rootless BuildKit: where a product's Dockerfile becomes an image. It holds
-  # no Docker socket, so a build step is an unprivileged process in a user
-  # namespace rather than root on this host.
+  # The API's route to buildkitd, which runs in the other Coolify application.
   #
-  # Three things here are load-bearing and were verified on a live stack; see
-  # docs/arbitrary-dockerfile-templates.md section 10:
+  # `builder` was a service here and the API drove it over a unix socket in a
+  # shared volume. That is the strongest form of the isolation -- no shared
+  # network at all -- and on this host it was not what was actually running:
+  # Coolify's project network put the builder next to `api`, `opensandbox` and
+  # `postgres`, all three of which answered from inside a build step. A socket
+  # cannot cross Compose projects, so moving the builder into its own
+  # application costs the socket and buys back the isolation.
   #
-  #   1. `systempaths=unconfined` rather than the `--oci-worker-no-process-sandbox`
-  #      flag most rootless BuildKit guides use. Both start buildkitd
-  #      unprivileged; only this one keeps the per-step process sandbox.
-  #   2. It joins `build` and nothing else. Under `network_mode: host` a build
-  #      step reached a service published on host loopback -- here, PostgreSQL
-  #      and the API.
-  #   3. Native overlayfs needs /dev/fuse and user namespaces. Check
-  #      `docker logs` for `using overlayfs`; `fuse-overlayfs` works, slower.
-  builder:
-    image: moby/buildkit:rootless
+  # Dual-homed exactly as the registry above is, and safe for the same reason:
+  # Docker does not route between bridge networks, so a build step that reaches
+  # this container reaches this listener and nothing behind it. The listener
+  # leads only to buildkitd, which requires a client certificate that lives in
+  # a volume no build step can mount.
+  buildkit-gateway:
+    image: haproxy:3.2-alpine
     configs:
-      - source: buildkitd-config
-        target: /home/user/.config/buildkit/buildkitd.toml
-    security_opt:
-      - seccomp=unconfined
-      # See compose.yaml: Ubuntu 23.10+ refuses user namespaces to unconfined
-      # processes, so those hosts set HARBORBOX_BUILDER_APPARMOR after
-      # installing deploy/apparmor/harborbox-buildkit.
-      - apparmor=${HARBORBOX_BUILDER_APPARMOR:-unconfined}
-      - systempaths=unconfined
-    devices:
-      - /dev/fuse
-    volumes:
-      # The API drives buildkitd over this socket instead of TCP, so the two
-      # share no network -- and a build step, which runs in buildkitd's network
-      # namespace, therefore cannot reach the control plane.
-      #
-      # /run/user/1000 specifically: the image already owns that path as uid
-      # 1000, which a fresh named volume inherits. Anywhere else buildkitd gets
-      # a root-owned directory and dies with `bind: permission denied`.
-      - harborbox-buildkit-run:/run/user/1000
-      - harborbox-buildkit:/home/user/.local/share/buildkit
-    healthcheck:
-      test: ["CMD", "buildctl", "debug", "workers"]
-      interval: 5s
-      timeout: 5s
-      retries: 20
-    mem_limit: 2g
-    memswap_limit: 2g
-    pids_limit: 4096
+      - source: buildkit-gateway-config
+        target: /usr/local/etc/haproxy/haproxy.cfg
+    mem_limit: 64m
+    memswap_limit: 64m
+    pids_limit: 64
     restart: unless-stopped
     networks:
-      - build
+      # Aliases for the reason the api service documents below: Coolify's
+      # compose rewriter drops service network entries whose value is null,
+      # which would leave this on neither network and every build unroutable.
+      build:
+        aliases:
+          - harborbox-buildkit-gateway
+      control:
+        aliases:
+          - buildkit-gateway
 
   opensandbox:
     image: opensandbox/server:v0.2.2
@@ -327,9 +363,20 @@ services:
       # stopped having a template each.
       HARBORBOX_WARM_POOL: ${HARBORBOX_WARM_POOL:-{"base":1}}
       #
-      # Builds run on the rootless builder, over a socket, not on this
-      # container's daemon -- it no longer has one.
-      HARBORBOX_BUILDER_ADDRESS: unix:///run/user/1000/buildkit/buildkitd.sock
+      # Builds run on the rootless builder, which is the other Coolify
+      # application, reached through the gateway above -- not on this
+      # container's daemon, which it no longer has.
+      #
+      # TCP where this was a unix socket, and the certificates below are not
+      # optional: Settings refuses to start with a tcp:// builder address and
+      # no client certificate, because an unauthenticated buildkitd on TCP is
+      # strictly worse than the socket it replaces. Everything that can reach
+      # the gateway -- including a caller's build step -- could otherwise
+      # build. Generate the pair with scripts/gen-buildkit-certs.sh.
+      HARBORBOX_BUILDER_ADDRESS: tcp://buildkit-gateway:1234
+      HARBORBOX_BUILDER_TLS_CA_CERT: /certs/buildkit/ca.pem
+      HARBORBOX_BUILDER_TLS_CERT: /certs/buildkit/cert.pem
+      HARBORBOX_BUILDER_TLS_KEY: /certs/buildkit/key.pem
       # Two addresses for one registry, and the difference is not cosmetic.
       # BuildKit dials it from the `build` network, so it uses the service
       # name. The reference the API stores is resolved by the *Docker daemon*
@@ -425,10 +472,14 @@ services:
       # HARBORBOX_OPENSANDBOX_USE_SERVER_PROXY above.
       - "host.docker.internal:host-gateway"
     volumes:
-      # The builder's socket, and only that. This replaces the docker socket
+      # A client certificate, and only that. This replaces the docker socket
       # the API used to hold: it can ask for an image build, and it cannot
-      # start a container on this host.
-      - harborbox-buildkit-run:/run/user/1000
+      # start a container on this host. Read-only, and it is the client half of
+      # the pair only -- buildkitd's own key is in a volume this application
+      # does not mount.
+      - harborbox-buildkit-tls-client:/certs/buildkit:ro
+      # buildctl streams `--local` directories from the client, so uploaded
+      # build contexts belong to this container, not to the builder.
       - harborbox-contexts:/var/lib/harborbox/build-contexts
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -516,16 +567,35 @@ volumes:
   opensandbox-state:
   harborbox-registry:
   harborbox-registry-auth:
-  harborbox-buildkit:
-  harborbox-buildkit-run:
   harborbox-contexts:
+  # The client half of the buildkit mutual-TLS pair, written by
+  # scripts/gen-buildkit-certs.sh. External because the builder application
+  # mounts the server half of the same PKI from its own project, and because a
+  # missing external volume fails the deploy by name -- where a bind mount of
+  # an absent path would silently become an empty directory, which is exactly
+  # how the registry crash-looped on its htpasswd.
+  harborbox-buildkit-tls-client:
+    external: true
 
 networks:
   control:
-  # The builder and the registry, and nothing else. A build step runs inside
-  # buildkitd's network namespace, so what the builder can reach is what
-  # product-supplied build steps can reach.
+  # The registry, the buildkit gateway, and -- from the other Coolify
+  # application -- the builder. Nothing else, ever: a build step runs inside
+  # buildkitd's network namespace, so every member of this network is something
+  # a product-supplied `RUN` can reach.
+  #
+  # External for the same reason `sandboxes` is: Coolify rewrites managed
+  # network definitions, and this one has to be the same bridge in two
+  # applications. Created once, out of band, with:
+  #   docker network create harborbox-build
+  #
+  # Spelled literally rather than through a variable, in all three compose
+  # files: two applications have to name the same bridge, and a variable set in
+  # one and not the other produces two networks and a build that cannot find
+  # the builder.
   build:
+    name: harborbox-build
+    external: true
   # Declared external because Coolify rewrites managed network definitions and
   # silently dropped this one — the API then created sandboxes against a network
   # that did not exist, and every sandbox went straight to `failed` with nothing
