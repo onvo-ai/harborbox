@@ -165,7 +165,14 @@ services:
       # `open /certs/cert.pem: no such file or directory`. Bind mounts are
       # passed through untouched, which is how the docker socket has always
       # reached opensandbox.
-      - ${HARBORBOX_BUILDKIT_TLS_DIR:-/data/harborbox/buildkit-tls}/server:/certs:ro
+      # No `${VAR:-default}` here. Coolify splits a volume string on `:`
+      # before interpolating it, so the `:-` inside a default lands in the
+      # middle of source:target:mode and the deploy dies on
+      #   invalid spec: /data/harborbox/buildkit-tls:: empty section between colons
+      # Ports tolerate the same syntax; volumes do not. The variable is
+      # therefore required -- set it on both applications, and see
+      # .env.example.
+      - ${HARBORBOX_BUILDKIT_TLS_DIR}/server:/certs:ro
       - harborbox-buildkit:/home/user/.local/share/buildkit
     # Over the unix socket, which needs no certificate. Reaching the TCP
     # listener from here would need the client half of the PKI, which this

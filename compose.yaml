@@ -355,7 +355,14 @@ services:
       # own key lives in a different volume this container never sees.
       # Bind mount for the reason given in compose.builder.yaml: a named
       # volume gets namespaced by Coolify and silently arrives empty.
-      - ${HARBORBOX_BUILDKIT_TLS_DIR:-/data/harborbox/buildkit-tls}/client:/certs/buildkit:ro
+      # No `${VAR:-default}` here. Coolify splits a volume string on `:`
+      # before interpolating it, so the `:-` inside a default lands in the
+      # middle of source:target:mode and the deploy dies on
+      #   invalid spec: /data/harborbox/buildkit-tls:: empty section between colons
+      # Ports tolerate the same syntax; volumes do not. The variable is
+      # therefore required -- set it on both applications, and see
+      # .env.example.
+      - ${HARBORBOX_BUILDKIT_TLS_DIR}/client:/certs/buildkit:ro
       # Uploaded build contexts. buildctl streams `--local` directories from
       # the *client*, so this belongs to the API and not to the builder; it was
       # mounted on the builder here, where it did nothing, while the API kept
