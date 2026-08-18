@@ -157,7 +157,15 @@ services:
       # API mounts a different volume with the client half, so a build step
       # that somehow escaped into this container still could not mint itself a
       # client certificate from what is here.
-      - harborbox-buildkit-tls-server:/certs:ro
+      # A bind mount, not a named volume, and that is load-bearing: Coolify
+      # rewrites a service's *named* volume reference to
+      # `<app-uuid>_<name>` and creates that volume empty -- `external: true`
+      # and an explicit `name:` on the declaration both survive and are both
+      # ignored for the mount. buildkitd then died on
+      # `open /certs/cert.pem: no such file or directory`. Bind mounts are
+      # passed through untouched, which is how the docker socket has always
+      # reached opensandbox.
+      - ${HARBORBOX_BUILDKIT_TLS_DIR:-/data/harborbox/buildkit-tls}/server:/certs:ro
       - harborbox-buildkit:/home/user/.local/share/buildkit
     # Over the unix socket, which needs no certificate. Reaching the TCP
     # listener from here would need the client half of the PKI, which this
@@ -176,22 +184,6 @@ services:
 
 volumes:
   harborbox-buildkit:
-  # Written by scripts/gen-buildkit-certs.sh, external so the two compose
-  # projects can be brought up in either order and neither owns the PKI. A
-  # missing one fails the `up` with a named error rather than the empty
-  # directory a bind mount of an absent path would silently create -- the
-  # failure mode that crash-looped the registry when its htpasswd was a bind
-  # mount.
-  harborbox-buildkit-tls-server:
-    external: true
-    # Explicit `name:` for the same reason the `build` network below carries
-    # one: Coolify namespaces a compose volume with the application UUID and
-    # `external: true` alone does not stop it. The builder then mounted an
-    # empty `<uuid>_harborbox-buildkit-tls-server` and crash-looped on
-    # `open /certs/cert.pem: no such file or directory`, while the network --
-    # which had a `name:` -- attached correctly. Measured on the first deploy
-    # of this application.
-    name: harborbox-buildkit-tls-server
 
 networks:
   # Shared with the Harborbox project, which is why it is external and named
