@@ -530,35 +530,25 @@ services:
       - traefik.http.routers.harborbox-health.service=harborbox-health
       - traefik.http.services.harborbox-health.loadbalancer.server.port=8000
       #
-      # A second router publishes the API itself — /v1 only — for Onvo Lite,
-      # which runs on onvo-production (188.245.108.57) and so cannot use the
-      # internal http://harborbox:8000 the way Trigger can from this host.
+      # There is deliberately no second router here. A `harborbox-api` router
+      # once published /v1 at harborbox-api.onvo.ai for Onvo Lite, back when
+      # Lite ran its Python from onvo-production and could not reach the
+      # internal http://harborbox:8000. Lite's sandbox calls now run as
+      # Trigger.dev tasks on this host, where apps/lite/trigger.config.ts sets
+      # HARBORBOX_URL=http://harborbox-next:8000 -- a Docker alias on the
+      # Trigger stack's private network. Nothing has needed the public route
+      # since, and its DNS record no longer exists (harborbox-api.onvo.ai is
+      # NXDOMAIN), so the router was matching a hostname that cannot arrive.
       #
-      # Read the warning above before touching this. The docker socket makes an
-      # open /v1 an arbitrary-code-execution surface, so the route is NOT open:
-      #
-      #  1. It hangs off harborbox-api.onvo.ai, which is DNS-only in Cloudflare
-      #     (grey cloud), NOT proxied. That is load-bearing: harborbox.onvo.ai
-      #     IS proxied, and behind Cloudflare every request reaches Traefik
-      #     wearing a Cloudflare source address, which would make the allowlist
-      #     below match everyone or no one.
-      #  2. `ipAllowList` restricts it to the two hosts that run Lite. The API
-      #     key stops being the only thing between the internet and the docker
-      #     socket; an attacker now needs the key *and* one of these hosts.
-      #  3. PathPrefix(`/v1`), so /openapi.json and /docs stay unroutable.
-      #
-      # Adding a Lite host means adding its egress IP here. If Lite is ever
-      # co-located with Harborbox, delete this router rather than leaving a
-      # public route nothing needs.
-      - traefik.http.routers.harborbox-api.rule=Host(`harborbox-api.onvo.ai`) && PathPrefix(`/v1`)
-      - traefik.http.routers.harborbox-api.entryPoints=https
-      - traefik.http.routers.harborbox-api.tls=true
-      - traefik.http.routers.harborbox-api.tls.certresolver=letsencrypt
-      - traefik.http.routers.harborbox-api.service=harborbox-api
-      - traefik.http.routers.harborbox-api.middlewares=harborbox-api-allowlist
-      - traefik.http.services.harborbox-api.loadbalancer.server.port=8000
-      # onvo-production (Lite prod) and staging-server (Lite staging).
-      - traefik.http.middlewares.harborbox-api-allowlist.ipAllowList.sourceRange=188.245.108.57/32,116.203.66.157/32
+      # Do not re-add it to give something off-host access to /v1 without
+      # reading the warning above first. This API holds the docker socket, so
+      # a reachable /v1 is an arbitrary-code-execution surface. The removed
+      # router only survived review because it carried three separate
+      # controls: a DNS-only (grey-cloud) hostname, so Traefik saw real
+      # source addresses rather than Cloudflare's; an ipAllowList pinned to
+      # the Lite hosts; and PathPrefix(`/v1`), keeping /openapi.json and
+      # /docs unroutable. Joining the caller to a Docker network is cheaper
+      # and safer than reproducing all three.
     networks:
       # Each entry carries an alias deliberately. Coolify's compose rewriter
       # drops service network entries whose value is null, which silently left
