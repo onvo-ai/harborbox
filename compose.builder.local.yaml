@@ -1,0 +1,14 @@
+# Local override for compose.builder.yaml.
+#
+# The deployed builder bind-mounts its certificates from an absolute path,
+# because Coolify neither interpolates variables in a volume source nor
+# tolerates a `${VAR:-default}` in one. That path needs root to create on a
+# developer machine, so local runs point at the checkout instead.
+#
+#   docker compose -f compose.builder.yaml -f compose.builder.local.yaml up -d
+#
+# scripts/try-locally.sh does this for you.
+services:
+  builder:
+    volumes:
+      - ./.buildkit-tls/server:/certs:ro

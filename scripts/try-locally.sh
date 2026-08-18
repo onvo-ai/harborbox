@@ -17,7 +17,7 @@ cd "$(dirname "$0")/.."
 # Local runs keep the PKI in the checkout rather than /data, which needs root.
 # Both compose files read this variable, so exporting it here is what makes the
 # two projects agree on where the certificates are.
-export HARBORBOX_BUILDKIT_TLS_DIR="${HARBORBOX_BUILDKIT_TLS_DIR:-$PWD/.buildkit-tls}"
+export HARBORBOX_BUILDKIT_TLS_DIR="${HARBORBOX_BUILDKIT_TLS_DIR:-$PWD/.buildkit-tls}"   # read by gen-buildkit-certs.sh only
 
 REGISTRY_USER="${HARBORBOX_REGISTRY_USERNAME:-harborbox}"
 REGISTRY_PASS="${HARBORBOX_REGISTRY_PASSWORD:-change-me-registry}"
@@ -51,7 +51,7 @@ say "3. Start the builder, in its own project"
 # namespace: every network the builder container joins is one a caller's `RUN`
 # can reach, including the one an orchestrator appends to every service of an
 # application. Keeping it alone means that appended network reaches nothing.
-docker compose -f compose.builder.yaml up -d --wait
+docker compose -f compose.builder.yaml -f compose.builder.local.yaml up -d --wait
 ok "rootless builder, on harborbox-build only"
 
 say "4. Start the rest of the stack"
@@ -109,7 +109,7 @@ cat <<EOF
 
     $BASE/docs        the OpenAPI page
     docker compose logs -f api
-    docker compose down -v && docker compose -f compose.builder.yaml down -v
+    docker compose down -v && docker compose -f compose.builder.yaml -f compose.builder.local.yaml down -v
                       tear both projects down, volumes included
 
   The certificate volumes and the harborbox-build network survive that on
