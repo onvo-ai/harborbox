@@ -535,7 +535,7 @@ TCP:
   build step that reaches the gateway reaches that listener and nothing behind
   it. What stops a build step *using* the listener is the client certificate it
   does not have.
-- `scripts/gen-buildkit-certs.sh` issues the pair into three Docker volumes —
+- `scripts/gen-buildkit-certs.sh` issues the pair into a directory on the host —
   CA (mounted by nothing), server (builder only), client (API only). No
   certificate, key, or CA is in this repository, and the CA key never enters a
   running container.
@@ -868,8 +868,17 @@ cd /path/to/a/harborbox/checkout   # any checkout of this commit
 ./scripts/gen-buildkit-certs.sh
 ```
 
-It writes three Docker volumes (`harborbox-buildkit-ca`, `-tls-server`,
-`-tls-client`) and nothing to disk. It needs Docker and nothing else --
+It writes `ca/`, `server/` and `client/` under
+`$HARBORBOX_BUILDKIT_TLS_DIR` (default `/data/harborbox/buildkit-tls`), which
+both applications bind-mount. **Not Docker volumes**: Coolify rewrites a
+service's named-volume reference to `<app-uuid>_<name>` and creates that volume
+empty, so the builder mounted an empty `/certs` and died on `open
+/certs/cert.pem: no such file or directory`. Neither `external: true` nor an
+explicit `name:` on the declaration prevents it — both survive into the
+generated compose and are both ignored for the mount. Bind mounts pass through
+untouched, which is how the docker socket has always reached opensandbox. Set
+the variable identically on both applications if you move it. It needs Docker
+and nothing else --
 `openssl` runs inside `python:3.12-slim-bookworm`. Re-running is a no-op;
 `--force` reissues and invalidates the running pair, so it needs both
 applications restarted afterwards.

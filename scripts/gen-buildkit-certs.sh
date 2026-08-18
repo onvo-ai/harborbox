@@ -62,15 +62,35 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-for volume in harborbox-buildkit-ca harborbox-buildkit-tls-server harborbox-buildkit-tls-client; do
-  docker volume create "$volume" >/dev/null
-done
+# Directories on the host, not Docker volumes. Coolify rewrites a service's
+# named-volume reference to `<app-uuid>_<name>` and creates that volume empty,
+# so the builder mounted an empty `/certs` and died on
+# `open /certs/cert.pem: no such file or directory`. Neither `external: true`
+# nor an explicit `name:` on the declaration prevents it. Bind mounts are
+# passed through untouched -- the same reason the docker socket reaches
+# opensandbox -- so the PKI lives at a path both applications mount.
+#
+# Must be absolute: Coolify deploys from an ephemeral checkout under
+# /artifacts/<uuid>, so a relative path would resolve inside a directory that
+# is deleted after the build. Local runs override it -- see
+# scripts/try-locally.sh.
+TLS_DIR="${HARBORBOX_BUILDKIT_TLS_DIR:-/data/harborbox/buildkit-tls}"
+
+case "$TLS_DIR" in
+  /*) ;;
+  *) TLS_DIR="$(cd "$(dirname "$TLS_DIR")" && pwd)/$(basename "$TLS_DIR")" ;;
+esac
+
+mkdir -p "$TLS_DIR/ca" "$TLS_DIR/server" "$TLS_DIR/client"
+# The CA private key is the one thing here that must not be world-readable;
+# the server and client directories are mounted read-only by their services.
+chmod 700 "$TLS_DIR/ca"
 
 docker run --rm \
   -e FORCE="$FORCE" -e DAYS="$DAYS" -e SANS="$SANS" \
-  -v harborbox-buildkit-ca:/ca \
-  -v harborbox-buildkit-tls-server:/server \
-  -v harborbox-buildkit-tls-client:/client \
+  -v "$TLS_DIR/ca:/ca" \
+  -v "$TLS_DIR/server:/server" \
+  -v "$TLS_DIR/client:/client" \
   "$IMAGE" sh -eu -c '
     if [ -s /server/cert.pem ] && [ -s /client/cert.pem ] && [ "$FORCE" != 1 ]; then
       echo "certificates already present; pass --force to reissue"
@@ -127,11 +147,15 @@ docker run --rm \
 
 cat <<'EOF'
 
-  Written to three Docker volumes. Nothing landed in the working tree.
+  Written under $TLS_DIR:
 
-    harborbox-buildkit-ca          the CA, mounted by no service
-    harborbox-buildkit-tls-server  mounted read-only by `builder`
-    harborbox-buildkit-tls-client  mounted read-only by `api`
+    ca/       the CA and its key, mounted by no service, mode 700
+    server/   mounted read-only at /certs by `builder`
+    client/   mounted read-only at /certs/buildkit by `api`
+
+  Both applications bind-mount those paths, so the same directory must exist
+  on whichever host runs them. Set HARBORBOX_BUILDKIT_TLS_DIR to move it, and
+  set it identically for both applications.
 
   Reissuing (--force) invalidates the running pair: restart both projects.
 EOF

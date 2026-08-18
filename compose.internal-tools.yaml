@@ -477,7 +477,9 @@ services:
       # start a container on this host. Read-only, and it is the client half of
       # the pair only -- buildkitd's own key is in a volume this application
       # does not mount.
-      - harborbox-buildkit-tls-client:/certs/buildkit:ro
+      # Bind mount for the reason given in compose.builder.yaml: a named
+      # volume gets namespaced by Coolify and silently arrives empty.
+      - ${HARBORBOX_BUILDKIT_TLS_DIR:-/data/harborbox/buildkit-tls}/client:/certs/buildkit:ro
       # buildctl streams `--local` directories from the client, so uploaded
       # build contexts belong to this container, not to the builder.
       - harborbox-contexts:/var/lib/harborbox/build-contexts
@@ -568,19 +570,6 @@ volumes:
   harborbox-registry:
   harborbox-registry-auth:
   harborbox-contexts:
-  # The client half of the buildkit mutual-TLS pair, written by
-  # scripts/gen-buildkit-certs.sh. External because the builder application
-  # mounts the server half of the same PKI from its own project, and because a
-  # missing external volume fails the deploy by name -- where a bind mount of
-  # an absent path would silently become an empty directory, which is exactly
-  # how the registry crash-looped on its htpasswd.
-  harborbox-buildkit-tls-client:
-    external: true
-    # See compose.builder.yaml: `external: true` is not enough under Coolify,
-    # which namespaces the volume with the application UUID unless a `name:`
-    # pins it. Without this the API mounts an empty volume and every build
-    # fails its TLS handshake instead of failing to start.
-    name: harborbox-buildkit-tls-client
 
 networks:
   control:

@@ -14,6 +14,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Local runs keep the PKI in the checkout rather than /data, which needs root.
+# Both compose files read this variable, so exporting it here is what makes the
+# two projects agree on where the certificates are.
+export HARBORBOX_BUILDKIT_TLS_DIR="${HARBORBOX_BUILDKIT_TLS_DIR:-$PWD/.buildkit-tls}"
+
 REGISTRY_USER="${HARBORBOX_REGISTRY_USERNAME:-harborbox}"
 REGISTRY_PASS="${HARBORBOX_REGISTRY_PASSWORD:-change-me-registry}"
 API_KEY="${HARBORBOX_API_KEY:-change-me}"
@@ -111,7 +116,7 @@ cat <<EOF
   purpose -- they are shared between the projects and are not either one's to
   delete. Remove them by hand if you want a genuinely clean slate:
 
-    docker volume rm harborbox-buildkit-{ca,tls-server,tls-client}
+    rm -rf .buildkit-tls   # the certificates; ./scripts/gen-buildkit-certs.sh reissues them
     docker network rm harborbox-build
 
   To see what a caller's build step can actually reach -- the property the

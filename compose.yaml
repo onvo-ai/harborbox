@@ -353,7 +353,9 @@ services:
       #
       # Read-only, and it is the client half of the PKI only -- the builder's
       # own key lives in a different volume this container never sees.
-      - harborbox-buildkit-tls-client:/certs/buildkit:ro
+      # Bind mount for the reason given in compose.builder.yaml: a named
+      # volume gets namespaced by Coolify and silently arrives empty.
+      - ${HARBORBOX_BUILDKIT_TLS_DIR:-/data/harborbox/buildkit-tls}/client:/certs/buildkit:ro
       # Uploaded build contexts. buildctl streams `--local` directories from
       # the *client*, so this belongs to the API and not to the builder; it was
       # mounted on the builder here, where it did nothing, while the API kept
@@ -383,12 +385,6 @@ volumes:
   harborbox-registry:
   harborbox-registry-auth:
   harborbox-contexts:
-  # Written by scripts/gen-buildkit-certs.sh, which also writes the server half
-  # into a volume only the builder project mounts. External because the two
-  # projects are brought up independently and neither owns the PKI; a missing
-  # one fails `up` by name instead of being created empty.
-  harborbox-buildkit-tls-client:
-    external: true
 
 networks:
   control:

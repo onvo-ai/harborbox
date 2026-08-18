@@ -39,3 +39,4 @@ auth/
 *.key
 *.crt
 *.srl
+.buildkit-tls/
