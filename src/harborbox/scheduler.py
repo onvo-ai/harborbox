@@ -973,9 +973,46 @@ class Scheduler:
         )
 
         for sandbox_id in plan.freeze:
-            await self._suspend(by_id[sandbox_id], memory=True)
+            await self._suspend_or_forget(by_id[sandbox_id], memory=True)
         for sandbox_id in plan.cool:
-            await self._suspend(by_id[sandbox_id], memory=False)
+            await self._suspend_or_forget(by_id[sandbox_id], memory=False)
+
+    async def _suspend_or_forget(self, sandbox: Sandbox, *, memory: bool) -> None:
+        """Suspend one sandbox, treating one that has vanished as already done.
+
+        OpenSandbox owns whether a container exists; these rows are a cache of
+        that. A sandbox disappearing between the plan and the pause is ordinary
+        -- a redeploy, an operator `docker rm`, the nightly image cleanup -- and
+        `terminate` has always treated it as success (the NOT_FOUND branches in
+        `opensandbox_runtime`). Pausing did not, and that cost twice over:
+
+        - the exception left `_cold_pause_idle_sandboxes` entirely, so every
+          sandbox after it in the plan stayed running past its idle timeout and
+          `_sweep_unused_templates`, which runs next in the same iteration,
+          never ran at all;
+        - the row stayed `running`, so the next poll a second later selected it
+          again and logged the same traceback, indefinitely.
+
+        Marking it `failed` is what stops the retry: it leaves the status set
+        the planner selects on. `failed` rather than a new state because the
+        reaper already prunes failed rows on its own retention, so this cleans
+        up after itself.
+        """
+        try:
+            await self._suspend(sandbox, memory=memory)
+        except SandboxUnavailableError as exc:
+            logger.info(
+                "idle sandbox vanished before it could be paused",
+                extra={"sandbox_id": sandbox.id, "reason": str(exc)},
+            )
+            async with session_factory() as session:
+                current = await session.get(Sandbox, sandbox.id)
+                if current is not None and current.status in {
+                    "running",
+                    "paused_memory",
+                }:
+                    current.status = "failed"
+                    await session.commit()
 
     async def _suspend(self, sandbox: Sandbox, *, memory: bool) -> None:
         """Pause one sandbox and record the tier it landed in.
