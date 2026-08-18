@@ -486,7 +486,14 @@ services:
       # Ports tolerate the same syntax; volumes do not. The variable is
       # therefore required -- set it on both applications, and see
       # .env.example.
-      - ${HARBORBOX_BUILDKIT_TLS_DIR}/client:/certs/buildkit:ro
+      # A literal absolute path, deliberately. Coolify does not interpolate
+      # environment variables in a volume source -- it substituted the
+      # *name* and produced a named volume called
+      # `harborbox-buildkit-tls-dirserver` -- and it splits the string on
+      # `:` before interpolation, so a `${VAR:-default}` breaks the parse
+      # outright. Ports accept both; volumes accept neither. Local runs use
+      # compose.builder.local.yaml, which overrides this to a checkout path.
+      - /data/harborbox/buildkit-tls/client:/certs/buildkit:ro
       # buildctl streams `--local` directories from the client, so uploaded
       # build contexts belong to this container, not to the builder.
       - harborbox-contexts:/var/lib/harborbox/build-contexts
