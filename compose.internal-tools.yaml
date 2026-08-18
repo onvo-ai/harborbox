@@ -576,6 +576,11 @@ volumes:
   # how the registry crash-looped on its htpasswd.
   harborbox-buildkit-tls-client:
     external: true
+    # See compose.builder.yaml: `external: true` is not enough under Coolify,
+    # which namespaces the volume with the application UUID unless a `name:`
+    # pins it. Without this the API mounts an empty volume and every build
+    # fails its TLS handshake instead of failing to start.
+    name: harborbox-buildkit-tls-client
 
 networks:
   control:
