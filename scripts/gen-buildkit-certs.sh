@@ -76,6 +76,21 @@ done
 # scripts/try-locally.sh.
 TLS_DIR="${HARBORBOX_BUILDKIT_TLS_DIR:-/data/harborbox/buildkit-tls}"
 
+# Who has to read each half. These are the uids the two containers actually run
+# as, checked on the deployed host: `builder` is rootless buildkitd at 1000,
+# `api` is root. Both keys are mode 0600, so the ownership is the whole of the
+# access control and a wrong value is not a warning -- it is a failure.
+#
+# They differ in how loudly they fail, which is why the API side is worth
+# stating rather than leaving to coincidence. A server key the builder cannot
+# read stops buildkitd at startup, immediately and visibly. A client key the
+# API cannot read leaves the API healthy and fails every build in the TLS
+# handshake instead. So if the API image ever adopts a non-root user -- an
+# ordinary hardening change -- set HARBORBOX_API_UID to match it, or builds
+# break with no obvious connection to the change that broke them.
+BUILDER_UID="${HARBORBOX_BUILDER_UID:-1000}"
+API_UID="${HARBORBOX_API_UID:-0}"
+
 case "$TLS_DIR" in
   /*) ;;
   *) TLS_DIR="$(cd "$(dirname "$TLS_DIR")" && pwd)/$(basename "$TLS_DIR")" ;;
@@ -88,6 +103,7 @@ chmod 700 "$TLS_DIR/ca"
 
 docker run --rm \
   -e FORCE="$FORCE" -e DAYS="$DAYS" -e SANS="$SANS" \
+  -e BUILDER_UID="$BUILDER_UID" -e API_UID="$API_UID" \
   -v "$TLS_DIR/ca:/ca" \
   -v "$TLS_DIR/server:/server" \
   -v "$TLS_DIR/client:/client" \
@@ -131,14 +147,18 @@ docker run --rm \
     install -m 0644 /ca/ca.pem   /server/ca.pem
     install -m 0644 server.pem   /server/cert.pem
     install -m 0600 server-key.pem /server/key.pem
-    # Rootless buildkitd runs as uid 1000 and reads these before it drops into
-    # its user namespace; root-owned 0600 key would leave it unable to start
-    # its TCP listener at all.
-    chown -R 1000:1000 /server
+    # Rootless buildkitd reads these before it drops into its user namespace;
+    # a key it does not own leaves it unable to start its TCP listener at all.
+    chown -R "$BUILDER_UID:$BUILDER_UID" /server
 
     install -m 0644 /ca/ca.pem   /client/ca.pem
     install -m 0644 client.pem   /client/cert.pem
     install -m 0600 client-key.pem /client/key.pem
+    # The API half. Root today, which is why this was previously left to the
+    # default and happened to work. No apostrophes in here: this whole block is
+    # a single-quoted argument to sh -c, and one ends it, spilling the rest onto
+    # the host -- where it fails on paths that only exist in the container.
+    chown -R "$API_UID:$API_UID" /client
 
     rm -rf "$work"
     echo "issued server and client certificates"
