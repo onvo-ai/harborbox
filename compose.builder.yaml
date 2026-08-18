@@ -184,6 +184,14 @@ volumes:
   # mount.
   harborbox-buildkit-tls-server:
     external: true
+    # Explicit `name:` for the same reason the `build` network below carries
+    # one: Coolify namespaces a compose volume with the application UUID and
+    # `external: true` alone does not stop it. The builder then mounted an
+    # empty `<uuid>_harborbox-buildkit-tls-server` and crash-looped on
+    # `open /certs/cert.pem: no such file or directory`, while the network --
+    # which had a `name:` -- attached correctly. Measured on the first deploy
+    # of this application.
+    name: harborbox-buildkit-tls-server
 
 networks:
   # Shared with the Harborbox project, which is why it is external and named
