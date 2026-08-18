@@ -458,11 +458,12 @@ The repository path after the host part must be identical on both sides. Worth
 a test that asserts exactly that, because a mismatch fails only at sandbox
 create, long after the build reported success.
 
-#### This isolation does not hold as deployed
+#### What broke this, and what fixes it
 
-Everything above is true of `compose.yaml`, and
-`test_the_builder_reaches_the_registry_and_nothing_else` asserts it. **It is
-false in the Coolify deployment**, measured on the infrastructure host:
+Everything above is true of `compose.yaml` on a laptop, and
+`test_the_builder_reaches_the_registry_and_nothing_else` asserted it for
+months. **It was false in the Coolify deployment the whole time**, measured on
+the infrastructure host:
 
 ```
 builder networks:  <uuid>=172.22.0.3   <uuid>_build=172.19.0.3
@@ -475,34 +476,123 @@ from inside the builder:
 ```
 
 A build step shares buildkitd's network namespace, so a caller-supplied `RUN`
-can reach the control plane and its database. That is precisely what this
-section says must not be possible.
+could reach the control plane and its database. The cause was Coolify, not the
+compose file: it appends its project network to every service of a compose
+application. `connect_to_docker_network` was already **false** for that
+application and does not prevent it.
 
-The cause is Coolify, not the compose file: it appends its project network to
-every service of a compose application. The per-application
-`connect_to_docker_network` setting is already **false** for this app and does
-not prevent it, so nothing in this repository can currently switch it off.
+The reason the test could not see it is worth stating plainly, because it is
+the more transferable lesson: **a compose file is not the deployment.** A test
+that reads one file and asserts about one network asserts something about the
+file. Everything the orchestrator adds afterwards is invisible to it.
 
-What still stands between a hostile build step and damage is credentials, not
-topology — the API requires its key and PostgreSQL its password. That is one
-layer where the design intended two.
+Two exits were considered and one was tried:
 
-Two ways out, neither yet done:
+1. **Isolate the build steps rather than the container**, with `[worker.oci]
+   networkMode = "cni"`. Attempted, and it does not work here, for three
+   independent reasons. `moby/buildkit:rootless` ships no CNI plugins and no
+   `/etc/buildkit`. Adding them still fails — `could not add "hbbuild0":
+   operation not permitted` — because rootlesskit has no `NET_ADMIN` without
+   `slirp4netns`, which this image also lacks. And even with `slirp4netns` the
+   build traffic NATs out *through the container*, which is itself on the
+   control-plane network, so a separate namespace does not remove the
+   reachability it was supposed to remove. (An aside for anyone who tries
+   anyway: `cniConfigPath` wants a single plugin config, not a conflist; a
+   conflist fails with `error parsing configuration: missing 'type'`.)
+2. **Stop Coolify attaching the network.** Nothing in this repository can, and
+   a setting that a future Coolify honours is one a future Coolify can also
+   ignore.
 
-1. **Isolate the build steps rather than the container.** BuildKit can put each
-   build in its own network namespace with `[worker.oci] networkMode = "cni"`
-   and a CNI config that NATs to the internet and routes nowhere else. This is
-   the real fix, because it stops depending on what the orchestrator does to
-   the container. Caveat before trying it: this image has no `slirp4netns`
-   (checked), so rootless CNI may leave build steps with no egress at all —
-   which is what section 10.6 was about. Verify egress still works before
-   shipping it.
-2. **Stop Coolify attaching the network**, if a newer Coolify honours the
-   setting or accepts an override. Cheaper, but it re-breaks the moment
-   somebody redeploys under a version that ignores it.
+**The fix that shipped is neither: make the attachment harmless.** The builder
+moved into its own Compose project, `compose.builder.yaml`, deployed as a
+second Coolify application. The project network Coolify appends to it therefore
+joins the builder to the only other service in that project, which is nothing —
+it holds one service, and `test_coolify_can_only_attach_the_builder_to_itself`
+keeps it that way. The only other network the builder joins is the shared
+external `harborbox-build`, whose members are the registry and the gateway
+below.
 
-Until one of them lands, treat the build step as something that can reach the
-control plane, and do not serve untrusted callers on this deployment.
+The cost is the unix socket. The API drove buildkitd over
+`harborbox-buildkit-run:/run/user/1000`, which needs one host *and one compose
+project*; that was the strongest form of this isolation, because it meant the
+two shared no network at all, and it cannot survive the split. So the API dials
+TCP:
+
+- `builder` listens on `tcp://0.0.0.0:1234` **and** the unix socket. buildkitd
+  applies TLS only to `tcp://` listeners, so the socket stays as the
+  container-local healthcheck path and the TCP listener is the authenticated
+  one.
+- `[grpc.tls] ca` in `buildkitd.toml` is the load-bearing line: with a CA set,
+  buildkitd uses `RequireAndVerifyClientCert`. Without it, it logs `TLS is not
+  enabled ... enabling mutual TLS authentication is highly recommended` and
+  accepts anyone who can open a socket. That is not hypothetical here — see the
+  gateway below — so `Settings` refuses to start with a `tcp://` builder
+  address and no client certificate.
+- `buildkit-gateway` (haproxy, TCP passthrough) sits in the Harborbox project
+  on both `build` and `control`, and the API dials *it*. The API never joins
+  `build`. This is the same dual-homing the registry has always had, and it is
+  safe for the same reason: Docker does not route between bridge networks, so a
+  build step that reaches the gateway reaches that listener and nothing behind
+  it. What stops a build step *using* the listener is the client certificate it
+  does not have.
+- `scripts/gen-buildkit-certs.sh` issues the pair into three Docker volumes —
+  CA (mounted by nothing), server (builder only), client (API only). No
+  certificate, key, or CA is in this repository, and the CA key never enters a
+  running container.
+
+Nothing about DNS changed and nothing about it could be allowed to: the builder
+is still a container on user-defined bridges, so `[dns] nameservers =
+["127.0.0.11"]` still resolves for build steps, which is what keeps `pip
+install` working on a host that firewalls 8.8.8.8. This is also the second
+reason the CNI route was wrong — a per-build namespace is exactly where that
+resolver stops being valid.
+
+#### What is true now, and what is not
+
+Measured from inside a real build step by
+`tests/e2e_build_isolation.py`, on the split stack:
+
+```
+reachable from inside a build step:
+  registry:5000            REACHED
+  api:8000                 unreachable
+  harborbox-api:8000       unreachable
+  harborbox:8000           unreachable
+  postgres:5432            unreachable
+  opensandbox:8080         unreachable
+```
+
+That test is the answer to "the old test passed while production was open". It
+builds a template whose Dockerfile opens sockets and reads the results out of a
+sandbox created from the resulting image, so it measures the deployment rather
+than the file. It **requires `registry:5000` to answer**: a probe that reaches
+nothing proves nothing, and without that control the test would pass just as
+happily if `timeout` were missing from the base image. Its negative control was
+run by hand — `docker network connect harborbox-control <builder>`, which is
+what Coolify did — and it reproduces the production measurement exactly:
+`api:8000 REACHED`, `postgres:5432 REACHED`, `opensandbox:8080 REACHED`.
+
+What remains, stated so nobody reads more into this than it says:
+
+- **A build step still shares a network with the registry and the gateway**, by
+  construction. The registry is what a build is *for*; the gateway is bounded
+  by the client certificate. Both are on `harborbox-build`, and anything else
+  put on that network is put within reach of every caller's `RUN`.
+- **Host-published ports are still reachable**, as they are from any container
+  on any bridge: a build step can dial the host gateway address. On the
+  infrastructure host that means Traefik's 80/443. The registry publishes on
+  `127.0.0.1` only, which a bridge cannot route to, so it is not among them.
+  The wider internet is reachable by design — builds install packages.
+- **The separation is only as good as the deployment.** If the builder
+  application is ever given a domain in Coolify, Coolify attaches the proxy
+  network to it and the boundary is gone; the same is true if a second service
+  is added to `compose.builder.yaml`, or if someone folds the builder back into
+  the main application. The unit tests pin the file; only the e2e probe pins
+  the host.
+- **This is not a sandbox for hostile code at build time.** It bounds what a
+  build step can *reach*. What it can do inside its own namespace is the
+  rootless-BuildKit story in 10.1, and sandboxes themselves are still ordinary
+  containers sharing the host kernel.
 
 ### 10.4 The Coolify host needs one root change before the builder runs
 
@@ -660,6 +750,16 @@ reclaim it, leaving `tags: null` in the registry.
   to be mounted at `/run/user/1000`, which the image already owns as uid 1000;
   a fresh named volume inherits that, and anywhere else buildkitd dies with
   `bind: permission denied`.
+
+  **Reversed later, and the reasoning above is still right.** A socket needs
+  one compose project as well as one host, and the deployed builder had to
+  leave the project to stop Coolify's project network putting the control plane
+  within reach of every build (10.3). It is TCP now, with mutual TLS and a
+  dual-homed gateway the API dials instead of joining the build network. The
+  socket survives as buildkitd's second listener, for the healthcheck. Note
+  what the trade actually was: not "socket vs TCP" on the merits, where the
+  socket wins, but "a stronger mechanism inside a topology that did not hold"
+  against "a weaker one inside a topology that does".
 - **Two settings, not one.** `HARBORBOX_REGISTRY_ENDPOINT` became
   `_PUSH_ENDPOINT` and `_PULL_ENDPOINT`, for the reason in section 10.3.
   `tests/test_compose_deployment.py` asserts they differ only in the host part.
@@ -741,6 +841,103 @@ containing `../../etc/passwd` is refused at upload.
   the whole deployment, not per caller.
 - Q2 on the Coolify host (section 10.4) is still unverified, and it gates
   turning this on there.
+
+## 13. Migrating a deployment to the two-application split
+
+This changes how Harborbox is deployed: **two Coolify applications instead of
+one**, on the same host. What follows is the order that works. Deploying the
+main application first is not fatal -- template builds fail while the builder
+is missing, and recover on their own once it is up -- but nothing else here is
+optional.
+
+The reason for each step is in 10.3; this is the runbook.
+
+**1. Create the shared bridge, on the host.**
+
+```bash
+docker network create harborbox-build
+```
+
+Both applications declare it `external:` and neither creates it. Compose fails
+by name if it is missing, which is the intended failure.
+
+**2. Issue the buildkit certificates, on the host.**
+
+```bash
+cd /path/to/a/harborbox/checkout   # any checkout of this commit
+./scripts/gen-buildkit-certs.sh
+```
+
+It writes three Docker volumes (`harborbox-buildkit-ca`, `-tls-server`,
+`-tls-client`) and nothing to disk. It needs Docker and nothing else --
+`openssl` runs inside `python:3.12-slim-bookworm`. Re-running is a no-op;
+`--force` reissues and invalidates the running pair, so it needs both
+applications restarted afterwards.
+
+**3. Create the builder application in Coolify.**
+
+- Same git repository, same branch.
+- Docker Compose location: `/compose.builder.yaml`.
+- Environment: nothing is required. Set `HARBORBOX_BUILDER_APPARMOR` only if
+  this host needs the profile route from 10.4 rather than the sysctl.
+- **Give it no domain.** A domain makes Coolify attach the proxy network to
+  it, and every network the builder joins is one a caller's build step joins.
+  That would undo the entire point of the split.
+
+Deploy it, then confirm what came up:
+
+```bash
+docker logs <builder-container> 2>&1 | grep -E 'snapshotter|process-mode|TLS|server on'
+```
+
+Wanted: `using overlayfs`, `process-mode:sandbox`, `running server on
+[::]:1234`, and `TLS is disabled for unix://...` — that last line is about the
+healthcheck socket and is expected. **`TLS is not enabled for tcp://...` is
+not expected**: it means buildkitd found no certificates and is accepting
+anyone who can open a socket. Stop and fix step 2 if you see it.
+
+**4. Redeploy the main application from this commit.**
+
+Its compose file no longer defines `builder`, so Coolify removes that
+container, and gains `buildkit-gateway`. Nothing else about the application
+changes: same volumes, same database, same registry, same published loopback
+port.
+
+**5. Confirm the chain, then confirm the boundary.**
+
+```bash
+# builds still work
+curl -sS -X POST https://<api>/v1/templates -H "X-API-Key: $KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"dockerfile":"FROM debian:bookworm-slim\nRUN apt-get update"}'
+# ... poll GET /v1/templates/<name> until ready
+
+# and the isolation the split is for, measured from inside a build step
+HARBORBOX_API_KEY=$KEY uv run pytest -m e2e tests/e2e_build_isolation.py
+```
+
+The second is the one that matters. It fails loudly if the builder ends up on
+a network with the control plane again, which is the failure this whole
+exercise is about and the one that a green unit-test suite did not catch.
+
+**6. Clean up, once builds are proven.**
+
+The old socket volume is now unreferenced:
+
+```bash
+docker volume rm harborbox_harborbox-buildkit-run
+```
+
+The old Coolify-managed `<uuid>_build` network is likewise orphaned and will be
+pruned. Leave `harborbox-buildkit` (the build cache) alone -- it moved to the
+builder project, so the old one is stale, but removing it only costs a cold
+first build.
+
+**Rolling back** means redeploying both applications from a commit before this
+one and putting `builder` back in the main application. The registry, the
+database and every built image are untouched by either direction; the only
+state this migration introduces is the certificate volumes, and a rollback
+simply stops using them.
 
 ## Sources
 

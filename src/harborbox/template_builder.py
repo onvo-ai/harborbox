@@ -304,6 +304,7 @@ class TemplateBuilder:
                 [
                     "--addr",
                     self.settings.builder_address or "",
+                    *self._builder_tls_arguments(),
                     "build",
                     "--progress=plain",
                     "--frontend",
@@ -317,6 +318,35 @@ class TemplateBuilder:
                 ],
                 env_overrides=self._registry_credentials(root),
             )
+
+    def _builder_tls_arguments(self) -> list[str]:
+        """Return the buildctl flags that authenticate this client to buildkitd.
+
+        Empty for a `unix://` builder, which needs no credentials because
+        reaching the socket already required a shared mount namespace.
+
+        For a `tcp://` one they are mandatory, and `Settings` refuses to
+        construct without them, so the `if` below is about the socket case
+        rather than about tolerating an unauthenticated TCP builder. The
+        certificate does two jobs at once: it proves this process may build
+        (buildkitd verifies it against its CA), and it proves the daemon
+        answering is the one we meant to reach -- which matters more than usual
+        here, because the address is a service name resolved by Docker's
+        embedded DNS on a network that a caller's build step is also on.
+        """
+        if not self.settings.builder_is_tcp:
+            return []
+        arguments = [
+            "--tlscacert",
+            self.settings.builder_tls_ca_cert or "",
+            "--tlscert",
+            self.settings.builder_tls_cert or "",
+            "--tlskey",
+            self.settings.builder_tls_key or "",
+        ]
+        if self.settings.builder_tls_server_name:
+            arguments += ["--tlsservername", self.settings.builder_tls_server_name]
+        return arguments
 
     def _registry_credentials(self, workspace: Path) -> dict[str, str]:
         """Write a throwaway docker config for buildctl, and point it there.

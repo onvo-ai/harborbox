@@ -49,11 +49,28 @@ class Settings(BaseSettings):
     template_image_prefix: str = "harborbox-sandbox"
     template_version: str = "local"
 
-    # Address of the rootless BuildKit daemon, e.g. "tcp://builder:1234". Set
-    # it and template builds stop touching the Docker socket entirely; leave it
-    # unset and they keep going through `docker build -` against the local
-    # daemon, which is the pre-registry behaviour.
+    # Address of the rootless BuildKit daemon, e.g.
+    # "tcp://buildkit-gateway:1234". Set it and template builds stop touching
+    # the Docker socket entirely; leave it unset and they keep going through
+    # `docker build -` against the local daemon, which is the pre-registry
+    # behaviour.
+    #
+    # A `unix://` address is still accepted -- it is the strongest form, since
+    # a socket needs no shared network at all -- but the bundled deployments no
+    # longer use one: the builder is a separate Compose project so that the
+    # network an orchestrator attaches to it reaches nothing, and a socket
+    # cannot cross projects. See compose.builder.yaml.
     builder_address: str | None = None
+    # Mutual TLS for a `tcp://` builder. Required, not optional: see
+    # `refuse_an_unauthenticated_tcp_builder` below for why unauthenticated
+    # TCP would be worse than the socket it replaced.
+    builder_tls_ca_cert: str | None = None
+    builder_tls_cert: str | None = None
+    builder_tls_key: str | None = None
+    # Only needed when the name dialled is not one of the server certificate's
+    # subject alternative names -- an IP address, say, or a host alias that was
+    # not known when the certificate was issued.
+    builder_tls_server_name: str | None = None
     # Both endpoints address the same registry and must agree on everything
     # after the host part; see Settings.push_image_for_template and
     # docs/arbitrary-dockerfile-templates.md section 10.3. Unset on both means
@@ -352,6 +369,54 @@ class Settings(BaseSettings):
             # These defaults only matter before the row is read.
             return (self.default_sandbox_memory_mb, self.default_sandbox_cpu)
         raise KeyError(template)
+
+    @property
+    def builder_is_tcp(self) -> bool:
+        return (self.builder_address or "").startswith("tcp://")
+
+    @model_validator(mode="after")
+    def refuse_an_unauthenticated_tcp_builder(self) -> "Settings":
+        """Refuse to start against a buildkitd on TCP with no client certificate.
+
+        The builder used to be reached over a unix socket in a volume shared
+        with this container, which meant no network could reach it at all. It
+        moved to TCP for a deployment reason -- the builder is now its own
+        Compose project, because every network its container joins is a network
+        a caller's build step can reach, and an orchestrator that appends its
+        own project network to every service made "joins only the build
+        network" false in production.
+
+        That trade is only worth making if reaching the port is not the same as
+        being able to build. A build step *can* reach the port: the gateway
+        that fronts it sits on the build network by construction. So an
+        unauthenticated TCP buildkitd would hand every caller-supplied `RUN` a
+        build daemon -- strictly worse than the socket it replaced, and the
+        failure would be silent, because builds would work perfectly.
+
+        buildkitd's own side of this is `[grpc.tls] ca`, which makes it require
+        and verify a client certificate. This is the client side of the same
+        decision, refusing at startup rather than at the first build.
+        """
+        if not self.builder_is_tcp:
+            return self
+        missing = [
+            name
+            for name, value in (
+                ("HARBORBOX_BUILDER_TLS_CA_CERT", self.builder_tls_ca_cert),
+                ("HARBORBOX_BUILDER_TLS_CERT", self.builder_tls_cert),
+                ("HARBORBOX_BUILDER_TLS_KEY", self.builder_tls_key),
+            )
+            if not value
+        ]
+        if missing:
+            message = (
+                f"{self.builder_address} drives buildkitd over TCP, which requires "
+                f"mutual TLS; {', '.join(missing)} is unset. Anything that can reach "
+                f"that port could otherwise build, and a caller's build step can "
+                f"reach it. Generate the pair with scripts/gen-buildkit-certs.sh."
+            )
+            raise ValueError(message)
+        return self
 
     @model_validator(mode="after")
     def validate_warm_pool_budget(self) -> "Settings":

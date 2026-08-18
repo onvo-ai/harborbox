@@ -50,16 +50,28 @@ socket reported by:
 docker context inspect --format '{{.Endpoints.docker.Host}}'
 ```
 
-Remove the `unix://` prefix. The bundled registry uses basic auth, so create a
-credentials file for it before the first start:
+Remove the `unix://` prefix. The bundled registry hashes its own credentials
+from `HARBORBOX_REGISTRY_USERNAME`/`HARBORBOX_REGISTRY_PASSWORD` at boot, so
+there is nothing to create by hand for it.
+
+Harborbox is **two Compose projects**: this one, and the rootless builder in
+`compose.builder.yaml`. The split is a security boundary rather than a
+packaging preference -- see "How template builds are isolated" below -- and it
+means two things exist before either project starts, shared by both:
 
 ```bash
-mkdir -p auth && docker run --rm httpd:2-alpine htpasswd -Bbn harborbox "$HARBORBOX_REGISTRY_PASSWORD" > auth/htpasswd
+docker network create harborbox-build
+./scripts/gen-buildkit-certs.sh
 ```
 
-Use the same username and password you set for `HARBORBOX_REGISTRY_USERNAME`
-and `HARBORBOX_REGISTRY_PASSWORD` in `.env`. Then start the registry, build the
-immutable runtime templates and push them to it, build the API, and start:
+The first is the bridge the builder meets the registry on. The second issues
+the mutual-TLS pair the API uses to drive buildkitd, into Docker volumes; no
+key is ever written into the working tree. Then start the builder, build the
+immutable runtime templates and push them to the registry, and start the rest:
+
+```bash
+docker compose -f compose.builder.yaml up -d
+```
 
 ```bash
 docker compose up -d registry
@@ -73,6 +85,9 @@ docker compose up -d registry
 docker compose build api && docker compose up -d
 ```
 
+`./scripts/try-locally.sh` does all of the above and then proves the chain end
+to end with a Dockerfile of its own; it is the fastest way to see this work.
+
 The templates must be pushed, not merely built: the builder resolves each
 derived template's `FROM` over its own network and cannot see the host daemon's
 local image store.
@@ -84,34 +99,69 @@ The sandbox image services are behind an inactive `build` profile. They are
 image build targets, not runtime services. Normal startup runs PostgreSQL,
 Harborbox and the pinned OpenSandbox server.
 
+### How template builds are isolated
+
 OpenSandbox receives the host Docker socket in the bundled single-host setup,
 which grants that service host-level Docker control. **Harborbox's API does
 not.** It builds derived template images by driving a rootless BuildKit daemon
-(`builder`) over a unix socket in a shared volume, so the control plane can ask
-for an image and cannot start a container. A leaked `HARBORBOX_API_KEY` is
-therefore not by itself arbitrary code execution on the host.
+(`builder`) that holds no socket, so the control plane can ask for an image and
+cannot start a container. A leaked `HARBORBOX_API_KEY` is therefore not by
+itself arbitrary code execution on the host.
 
-Three properties of that arrangement are deliberate, and each was verified
-against a live stack rather than assumed — the evidence is in
-`docs/arbitrary-dockerfile-templates.md` section 10:
+The thing to understand about that builder is that **a build step runs inside
+buildkitd's network namespace**. There is no per-build network of its own: the
+OCI worker's netmode is `host`, meaning buildkitd's own namespace, and the
+rootless image ships no `slirp4netns` to give a step one. So every network the
+builder container joins is a network that a caller's `RUN` can reach, and the
+question "what can a hostile Dockerfile talk to" reduces to "what is on the
+builder's networks".
 
-- **The builder joins only the `build` network**, with the registry. Build
-  steps run inside buildkitd's own network namespace, so any network the
-  builder can reach is one a caller's build step can reach. Under
-  `network_mode: host` a build step reached a service on host loopback, which
-  on a single-host deployment means PostgreSQL and the API itself.
-- **The API drives it over a socket, not TCP**, which is what lets the two
-  share no network at all.
+Four properties follow, and each was verified against a live stack rather than
+assumed — the evidence is in `docs/arbitrary-dockerfile-templates.md` section
+10:
+
+- **The builder is its own Compose project**, deployed separately, holding one
+  service. This is not tidiness. Orchestrators append a per-application network
+  to every service they deploy — Coolify does, unconditionally, and its
+  `connect_to_docker_network` setting does not stop it — and while the builder
+  was a service alongside the API, that appended network put `api:8000`,
+  `opensandbox:8080` and `postgres:5432` within reach of every caller-supplied
+  build step. Nothing inside a compose file can prevent the attachment. What it
+  can do is leave nothing on the other end of it.
+- **The API reaches buildkitd over authenticated TCP**, through the dual-homed
+  `buildkit-gateway`, and never joins the build network itself. The unix socket
+  this replaces was stronger and cannot cross projects. Because a build step
+  can reach that gateway, buildkitd requires and verifies a client certificate
+  (`[grpc.tls] ca`); `Settings` refuses to start a `tcp://` builder with no
+  certificate configured, since an unauthenticated one would hand every caller
+  a build daemon while every build kept working.
 - **The registry has two addresses for one store.** BuildKit dials
   `registry:5000` over the build network; the reference Harborbox stores and
   hands to OpenSandbox is `127.0.0.1:5050`, because the *Docker daemon*
   resolves it from the host, where `registry` means nothing. Everything after
   the host part must stay identical, or the build succeeds and the sandbox
   create that follows fails on a missing image.
+- **`network_mode: host` is never used for the builder.** Under it a build step
+  reached a service published on host loopback, which on a single-host
+  deployment means PostgreSQL and the API itself.
 
-Leaving `HARBORBOX_BUILDER_ADDRESS` unset keeps the previous behaviour: builds
-go through a mounted Docker socket against the local daemon, and the API holds
-host-level Docker control again. If you use neither, set
+Whether that holds is measured, not asserted: `tests/e2e_build_isolation.py`
+builds a template whose Dockerfile opens sockets to the control plane and reads
+the results out of a sandbox made from the image. It requires `registry:5000`
+to answer, so a broken probe fails rather than passes quietly.
+
+```
+reachable from inside a build step:
+  registry:5000            REACHED
+  api:8000                 unreachable
+  harborbox-api:8000       unreachable
+  postgres:5432            unreachable
+  opensandbox:8080         unreachable
+```
+
+Leaving `HARBORBOX_BUILDER_ADDRESS` unset keeps the pre-registry behaviour:
+builds go through a mounted Docker socket against the local daemon, and the API
+holds host-level Docker control again. If you use neither, set
 `HARBORBOX_TEMPLATE_GC_ENABLED=false` and the template endpoints fail with a
 recorded build error instead of running.
 
