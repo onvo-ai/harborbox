@@ -682,20 +682,23 @@ def test_the_deployment_exports_under_the_name_the_checkup_queries(
     )
 
 
-def test_the_deployment_authenticates_to_the_ingester(compose: dict) -> None:
-    """A dropped batch and no batch look identical from SigNoz.
+def test_the_deployment_carries_the_ingestion_header_the_estate_uses(
+    compose: dict,
+) -> None:
+    """The same header and the same Infisical entry as every other service.
 
-    The ingester rejects an unauthenticated export, so a missing key
-    reproduces the whole bug with every other part of this correct. Required
-    rather than defaulted, so the deploy fails by name instead of coming up
-    healthy and reporting nothing.
+    Not asserted as *required*: the self-hosted ingester does not enforce the
+    token, which is what DEV-1858 was verified against -- an unauthenticated
+    `POST https://ingester.onvo.ai/v1/traces` returns 200. What is worth
+    pinning is that the wiring stays in place, so enabling enforcement later is
+    one Infisical entry rather than a change to this file.
     """
     headers = str(compose["services"]["api"]["environment"]["OTEL_EXPORTER_OTLP_HEADERS"])
 
-    assert "signoz-access-token=" in headers
-    assert ":?" in headers, (
-        "the ingestion key has a deploy-time default, so this stack can start "
-        "with an unauthenticated exporter and silently export nothing."
+    assert headers.startswith("signoz-access-token=")
+    assert "SIGNOZ_INGESTION_KEY" in headers, (
+        "the header is hardcoded or reads some other variable, so the estate's "
+        "existing Infisical entry no longer reaches this deploy."
     )
 
 

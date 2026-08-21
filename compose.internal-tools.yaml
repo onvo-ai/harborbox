@@ -351,11 +351,17 @@ services:
       # pair that can drift from them.
       HARBORBOX_ENVIRONMENT: ${HARBORBOX_ENVIRONMENT:-production}
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OPENTELEMETRY_ENDPOINT:-https://ingester.onvo.ai}
-      # Required, not defaulted. The ingester drops an unauthenticated batch,
-      # and a dropped batch is indistinguishable from the zero this ticket was
-      # filed about -- so this deploy refuses to start rather than come up
-      # looking healthy and reporting nothing.
-      OTEL_EXPORTER_OTLP_HEADERS: signoz-access-token=${SIGNOZ_INGESTION_KEY:?refusing to start with no SigNoz ingestion key - every span and log would be dropped at the ingester and the daily checkup would go back to reporting a structural zero. Set it in .env from Infisical Onvo/production SIGNOZ_INGESTION_KEY.}
+      # Sent to match every other exporting service, and deliberately *not*
+      # required. The self-hosted ingester does not enforce it today: DEV-1858
+      # closed on a bare unauthenticated `curl -X POST -d '{}'
+      # https://ingester.onvo.ai/v1/traces` returning 200 five times running,
+      # which is the exit criterion that whole incident was verified against.
+      # Wiring the estate's variable in anyway costs nothing and makes turning
+      # enforcement on later one Infisical entry rather than a code change.
+      #
+      # An unset key sends an empty token rather than no header, which the
+      # exporter is happy with -- verified against a local collector.
+      OTEL_EXPORTER_OTLP_HEADERS: signoz-access-token=${SIGNOZ_INGESTION_KEY:-}
       # The reason 0.2.0's first deploy failed here. Until 0.2.0 the API built
       # `DockerRuntime` directly in its lifespan and never read this setting, so
       # its `opensandbox` default was harmless. 0.2.0 routes through
