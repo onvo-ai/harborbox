@@ -398,6 +398,38 @@ For a stronger isolation boundary, configure OpenSandbox's `[secure_runtime]`
 block for gVisor or Kata on Linux, or deploy its Kubernetes backend with an
 appropriate RuntimeClass.
 
+## Telemetry
+
+Harborbox exports OTLP traces and logs. Both are off unless an endpoint is
+configured:
+
+```bash
+OTEL_EXPORTER_OTLP_ENDPOINT=https://ingester.onvo.ai
+OTEL_EXPORTER_OTLP_HEADERS=signoz-access-token=<ingestion key>
+HARBORBOX_ENVIRONMENT=production
+```
+
+With no endpoint set, nothing is instrumented at all — no middleware, no
+patched clients, and no exporter retrying an address nobody configured. That is
+the intended state for local development, and pointing a local stack at the
+real ingester is still safe: any `HARBORBOX_ENVIRONMENT` other than
+`production` or `staging` exports under `harborbox-dev`, so it cannot be
+mistaken for the deployment.
+
+Two things about this are load-bearing rather than cosmetic:
+
+- **The service name is `harborbox`, and it is a constant in
+  `src/harborbox/telemetry.py` rather than an environment variable.** The
+  estate's daily checkup asks SigNoz for error groups under that exact name.
+  Any other value — a typo, an unset variable, the SDK's `unknown_service`
+  default — makes the error count structurally zero and renders it as green.
+  That is what happened for the first months of Harborbox's life, and it is
+  why the wiring here is explicit instead of `opentelemetry-instrument`.
+- **Logs matter as much as traces.** The failures worth catching happen in the
+  scheduler's background loop and in template builds, long after any request
+  span has ended. `logging` records go to the collector *and* to stderr, so
+  `docker compose logs` is unaffected.
+
 ## REST API
 
 Core endpoints:

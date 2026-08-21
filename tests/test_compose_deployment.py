@@ -27,6 +27,7 @@ import yaml
 
 from harborbox.config import Settings
 from harborbox.schemas import SandboxCreate
+from harborbox.telemetry import SERVICE_NAME, export_is_configured, service_name_for
 
 COMPOSE = Path(__file__).resolve().parent.parent / "compose.internal-tools.yaml"
 # The builder is a *second* Compose project, deployed as a second Coolify
@@ -35,6 +36,10 @@ COMPOSE = Path(__file__).resolve().parent.parent / "compose.internal-tools.yaml"
 # worth pinning -- what a caller's build step can reach -- is a property of the
 # pair.
 BUILDER_COMPOSE = Path(__file__).resolve().parent.parent / "compose.builder.yaml"
+# The local development stack. Read here only to assert what it does *not* do:
+# telemetry has a safe default, and a safe default is worth nothing unless
+# something checks it is still the default.
+LOCAL_COMPOSE = Path(__file__).resolve().parent.parent / "compose.yaml"
 
 # `${VAR:-default}` and `${VAR}`. Nothing in these files nests, so one pass is
 # enough; the point is to read the *defaults* a deploy gets with no .env set.
@@ -53,6 +58,25 @@ def compose() -> dict:
 @pytest.fixture(scope="module")
 def builder_compose() -> dict:
     return yaml.safe_load(BUILDER_COMPOSE.read_text())
+
+
+@pytest.fixture(scope="module")
+def local_compose() -> dict:
+    return yaml.safe_load(LOCAL_COMPOSE.read_text())
+
+
+def deploy_time_environment(compose: dict) -> dict[str, str]:
+    """Return the api service's environment as a deploy with no .env sees it.
+
+    Required-with-message vars (`${X:?...}`) are dropped: they have no
+    deploy-time value at all, and the deploy fails by name rather than starting
+    with an empty one.
+    """
+    return {
+        key: resolve(value)
+        for key, value in compose["services"]["api"]["environment"].items()
+        if ":?" not in str(value)
+    }
 
 
 def networks_of(service: dict) -> set[str]:
@@ -633,3 +657,85 @@ def test_the_bundled_local_stack_can_actually_construct_its_settings() -> None:
     )
 
     assert settings.warm_pool_sizes
+
+
+def test_the_deployment_exports_under_the_name_the_checkup_queries(
+    compose: dict, settings: Settings
+) -> None:
+    """DEV-1948, pinned at the layer it actually broke.
+
+    Nothing in the code was wrong: the app simply had no endpoint and no
+    environment, so it exported nothing, so the daily checkup's
+    `service.name = harborbox` error query returned a structural zero and
+    rendered it green. Both halves have to be right here for that query to have
+    anything to find -- an endpoint, and an environment that resolves to the
+    bare service name rather than the `-dev` one.
+    """
+    assert export_is_configured(deploy_time_environment(compose)), (
+        f"{COMPOSE.name} configures no OTLP endpoint, so this deploy exports "
+        f"nothing and the daily checkup's error count is structurally zero."
+    )
+    assert service_name_for(settings.environment) == SERVICE_NAME, (
+        f"{COMPOSE.name} deploys as {settings.environment!r}, which exports "
+        f"under {service_name_for(settings.environment)!r}. admin queries "
+        f"{SERVICE_NAME!r}."
+    )
+
+
+def test_the_deployment_authenticates_to_the_ingester(compose: dict) -> None:
+    """A dropped batch and no batch look identical from SigNoz.
+
+    The ingester rejects an unauthenticated export, so a missing key
+    reproduces the whole bug with every other part of this correct. Required
+    rather than defaulted, so the deploy fails by name instead of coming up
+    healthy and reporting nothing.
+    """
+    headers = str(compose["services"]["api"]["environment"]["OTEL_EXPORTER_OTLP_HEADERS"])
+
+    assert "signoz-access-token=" in headers
+    assert ":?" in headers, (
+        "the ingestion key has a deploy-time default, so this stack can start "
+        "with an unauthenticated exporter and silently export nothing."
+    )
+
+
+def test_the_deployment_does_not_export_through_the_box_it_watches(
+    compose: dict,
+) -> None:
+    """DEV-1829's trade-off, applied here.
+
+    SigNoz runs on `internal` (91.99.125.153). Exporting to it over localhost
+    or by its own address means a SigNoz outage also loses the telemetry that
+    would explain it, so this goes through the public ingester like every other
+    exporting service. The address matters twice: configs written before
+    2026-08-07 point at 91.99.169.190:4317, where nothing has listened since,
+    and an OTLP exporter fails silently against a dead endpoint.
+    """
+    endpoint = deploy_time_environment(compose)["OTEL_EXPORTER_OTLP_ENDPOINT"]
+
+    assert endpoint.startswith("https://"), endpoint
+    for dead in ("localhost", "127.0.0.1", "91.99.169.190"):
+        assert dead not in endpoint, (
+            f"{endpoint} exports through {dead}, which is either the box being "
+            f"watched or an address that stopped listening on 2026-08-07."
+        )
+
+
+def test_local_development_does_not_export_to_the_estate(local_compose: dict) -> None:
+    """DEV-1824's rule, kept as a property of the file rather than a habit.
+
+    Laptops exporting under the production service name made 94% of
+    "production" errors somebody's `pnpm dev` and hid the two real ones. Both
+    defences are asserted, because either alone is one edit from being lost:
+    the local stack exports nowhere, and it would not collide even if it did.
+    """
+    env = deploy_time_environment(local_compose)
+
+    assert not export_is_configured(env), (
+        f"{LOCAL_COMPOSE.name} exports by default, so every local stack posts "
+        f"into the estate's SigNoz."
+    )
+    assert service_name_for(env["HARBORBOX_ENVIRONMENT"]) != SERVICE_NAME, (
+        f"{LOCAL_COMPOSE.name} would export under {SERVICE_NAME!r} if anyone "
+        f"set an endpoint, which is exactly the collision DEV-1824 cost a week."
+    )

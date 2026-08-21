@@ -328,6 +328,34 @@ services:
     environment:
       HARBORBOX_API_KEY: ${SERVICE_PASSWORD_64_HARBORBOXAPI:?refusing to start with no API key - every sandbox call would 401. Set it in .env from Infisical Onvo/staging HARBORBOX_API_KEY.}
       HARBORBOX_DATABASE_URL: postgresql+asyncpg://harborbox:${SERVICE_PASSWORD_HARBORBOXDB}@postgres/harborbox
+      # Telemetry, and the reason it is not optional here. Harborbox ran for
+      # months emitting no span under any name, so the daily checkup's
+      # "errors in the last 24h" query for `service.name = harborbox` returned
+      # a structural zero and rendered it green -- a section that could not
+      # fail. See DEV-1948.
+      #
+      # The public ingester rather than SigNoz over localhost. That is the
+      # trade-off DEV-1829 settled for the host agents and it holds here for
+      # the same reason: exporting to the box that runs SigNoz means a SigNoz
+      # outage also loses the telemetry that would explain it. The address is
+      # the current one -- anything written before 2026-08-07 points at
+      # 91.99.169.190:4317, where nothing has listened since, and an OTLP
+      # exporter fails silently against a dead endpoint.
+      #
+      # `production` is what puts the spans under the bare `harborbox` service
+      # name the checkup queries, and what fills `deployment.environment` so
+      # DEV-1824's production filter matches them.
+      # `OPENTELEMETRY_ENDPOINT` and `SIGNOZ_INGESTION_KEY` are the names the
+      # rest of the estate already uses (onvo-pro, onvo-lite, the website), so
+      # this reads the same Infisical entries rather than inventing a second
+      # pair that can drift from them.
+      HARBORBOX_ENVIRONMENT: ${HARBORBOX_ENVIRONMENT:-production}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OPENTELEMETRY_ENDPOINT:-https://ingester.onvo.ai}
+      # Required, not defaulted. The ingester drops an unauthenticated batch,
+      # and a dropped batch is indistinguishable from the zero this ticket was
+      # filed about -- so this deploy refuses to start rather than come up
+      # looking healthy and reporting nothing.
+      OTEL_EXPORTER_OTLP_HEADERS: signoz-access-token=${SIGNOZ_INGESTION_KEY:?refusing to start with no SigNoz ingestion key - every span and log would be dropped at the ingester and the daily checkup would go back to reporting a structural zero. Set it in .env from Infisical Onvo/production SIGNOZ_INGESTION_KEY.}
       # The reason 0.2.0's first deploy failed here. Until 0.2.0 the API built
       # `DockerRuntime` directly in its lifespan and never read this setting, so
       # its `opensandbox` default was harmless. 0.2.0 routes through
