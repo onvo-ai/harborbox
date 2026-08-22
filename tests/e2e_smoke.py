@@ -63,12 +63,14 @@ READ_STATE = "cat /workspace/state.txt"
     strict=False,
 )
 @pytest.mark.e2e
-def test_two_sandboxes_execute_in_parallel(client: SandboxClient) -> None:
+def test_two_sandboxes_execute_in_parallel(
+    client: SandboxClient, data_stack_template: str
+) -> None:
     first = client.sandboxes.create(
-        template="onvo-lite", memory_mb=128, cpu=1, idle_timeout_seconds=60
+        template=data_stack_template, memory_mb=128, cpu=1, idle_timeout_seconds=60
     )
     second = client.sandboxes.create(
-        template="onvo-lite", memory_mb=128, cpu=1, idle_timeout_seconds=60
+        template=data_stack_template, memory_mb=128, cpu=1, idle_timeout_seconds=60
     )
     try:
         started = time.monotonic()

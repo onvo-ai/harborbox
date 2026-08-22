@@ -22,9 +22,9 @@ def timestamp(value: str | None) -> datetime:
 
 
 @pytest.fixture
-def sandbox(client: SandboxClient) -> Iterator[Sandbox]:
+def sandbox(client: SandboxClient, data_stack_template: str) -> Iterator[Sandbox]:
     box = client.sandboxes.create(
-        template="onvo-lite",
+        template=data_stack_template,
         memory_mb=768,
         cpu=1,
         idle_timeout_seconds=120,

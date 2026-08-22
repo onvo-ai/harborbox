@@ -38,7 +38,6 @@ if TYPE_CHECKING:
 # `plan_suspensions` entirely, so the scheduler cannot freeze it underneath a
 # measurement -- `hot_pause_idle_seconds` defaults to 60s and these tests run
 # for longer than that.
-TEMPLATE = "onvo-lite"
 MEMORY_MB = 256
 CPU = 0.5
 
@@ -55,7 +54,7 @@ def _timed(label: str, action: Callable[[], object]) -> float:
 
 
 @pytest.fixture
-def sandbox(client: SandboxClient) -> Iterator[Sandbox]:
+def sandbox(client: SandboxClient, data_stack_template: str) -> Iterator[Sandbox]:
     """Build a sandbox that is actually `running`, which the ladder's top rung needs.
 
     `create` returns a `created` row, not a container -- starting is lazy. Pause
@@ -65,7 +64,7 @@ def sandbox(client: SandboxClient) -> Iterator[Sandbox]:
     needs the probe file anyway.
     """
     live = client.sandboxes.create(
-        template=TEMPLATE,
+        template=data_stack_template,
         memory_mb=MEMORY_MB,
         cpu=CPU,
         idle_timeout_seconds=0,
@@ -79,7 +78,9 @@ def sandbox(client: SandboxClient) -> Iterator[Sandbox]:
 
 
 @pytest.mark.e2e
-def test_freezing_and_unfreezing_beats_snapshot_and_restore(sandbox: Sandbox) -> None:
+def test_freezing_and_unfreezing_beats_snapshot_and_restore(
+    sandbox: Sandbox, data_stack_template: str
+) -> None:
     """The tier's whole justification, measured both ways on one machine.
 
     A frozen sandbox keeps its entire memory reservation, so it is only worth
@@ -87,7 +88,9 @@ def test_freezing_and_unfreezing_beats_snapshot_and_restore(sandbox: Sandbox) ->
     snapshot. If this ever fails, the hot tier is spending live capacity for
     nothing and `hot_pause_idle_seconds=0` is the better default.
     """
-    print(f"\npause ladder, {TEMPLATE} {MEMORY_MB}MB/{CPU}cpu:")  # noqa: T201
+    print(  # noqa: T201
+        f"\npause ladder, {data_stack_template} {MEMORY_MB}MB/{CPU}cpu:"
+    )
 
     freeze = _timed("hot -> warm  (freeze)", lambda: sandbox.pause(memory=True))
     assert sandbox.refresh().status == "paused_memory"

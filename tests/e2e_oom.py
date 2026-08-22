@@ -27,8 +27,12 @@ OOM_FAILURE_BOUND_SECONDS = 15
 
 
 @pytest.mark.e2e
-def test_oom_is_contained_and_reported(client: SandboxClient) -> None:
-    sandbox = client.sandboxes.create(template="onvo-lite", memory_mb=128, cpu=1)
+def test_oom_is_contained_and_reported(
+    client: SandboxClient, data_stack_template: str
+) -> None:
+    sandbox = client.sandboxes.create(
+        template=data_stack_template, memory_mb=128, cpu=1
+    )
     try:
         execution = sandbox.commands.run(
             OOM_COMMAND,
@@ -85,7 +89,9 @@ def test_oom_is_contained_and_reported(client: SandboxClient) -> None:
         # (test_api_stays_healthy_after_oom covers that separately) but that
         # the scheduler's capacity accounting and admission are unaffected,
         # i.e. the blast radius was the one sandbox that OOM'd, not the host.
-        control = client.sandboxes.create(template="onvo-lite", memory_mb=128, cpu=1)
+        control = client.sandboxes.create(
+            template=data_stack_template, memory_mb=128, cpu=1
+        )
         try:
             # Was `run_code("1 + 1")` until the Jupyter kernel and the endpoint
             # it served were removed; a command is what a caller has now, and
@@ -103,8 +109,12 @@ def test_oom_is_contained_and_reported(client: SandboxClient) -> None:
 
 
 @pytest.mark.e2e
-def test_api_stays_healthy_after_oom(client: SandboxClient) -> None:
-    sandbox = client.sandboxes.create(template="onvo-lite", memory_mb=128, cpu=1)
+def test_api_stays_healthy_after_oom(
+    client: SandboxClient, data_stack_template: str
+) -> None:
+    sandbox = client.sandboxes.create(
+        template=data_stack_template, memory_mb=128, cpu=1
+    )
     try:
         execution = sandbox.commands.run(
             OOM_COMMAND,
