@@ -106,10 +106,16 @@ jobs:
     # skipped or deleted test -- see the comment on that test for what is
     # known and what still needs a live stack to diagnose further.
 
-    # The runner is 2 cores / 3.7GB. The warm pool alone wants 2x256MB plus
-    # 1x1024MB of sandboxes at boot, which is tight enough to tip api into
-    # "unhealthy" on its own even once the images below exist. Disabling it
-    # keeps the stack lean; the e2e tests create the sandboxes they need.
+    # The warm pool alone wants 2x256MB plus 1x1024MB of sandboxes at boot,
+    # which is enough to tip api into "unhealthy" on its own even once the
+    # images below exist. Disabling it keeps the stack lean; the e2e tests
+    # create the sandboxes they need.
+    #
+    # This used to read "the runner is 2 cores / 3.7GB", describing `openclaw`
+    # -- a box deleted 2026-08-07. CI runs on build-server (46.225.223.190),
+    # x86_64, 8 cores / 15G, shared with three runner instances and onvo's CI.
+    # The pool stays disabled regardless: the contention is with the sibling
+    # runners, not with the box's own size.
     env:
       HARBORBOX_WARM_POOL_ENABLED: "false"
       # The stack is built, started, tested against, and torn down entirely
@@ -118,6 +124,18 @@ jobs:
       # pytest client) — a repository secret would buy no security here, just
       # an extra manual setup step and an ambient credential.
       HARBORBOX_API_KEY: local-e2e-only-not-a-real-credential
+      # Same reasoning, and required: compose declares
+      # `${HARBORBOX_REGISTRY_PASSWORD:?set a registry password}`, so `docker
+      # compose` aborts before it starts anything when this is unset. The job
+      # failed at "Build the stack" on exactly that for as long as CI has been
+      # able to run at all -- it was invisible only because the runners were
+      # accepting no jobs (DEV-1971).
+      #
+      # registry-auth htpasswds this into a file for `registry:3`, which is
+      # bound to 127.0.0.1 inside this job's own stack and torn down with it.
+      # The value only has to match on both sides, so a repository secret would
+      # buy no security here either.
+      HARBORBOX_REGISTRY_PASSWORD: local-e2e-only-not-a-real-credential
 
     steps:
       - uses: actions/checkout@v4
@@ -143,7 +161,21 @@ jobs:
       # the API needs to drive buildkitd over TCP. Both are external volumes /
       # networks on purpose -- a missing one fails `up` by name instead of
       # being silently created empty.
+      # `gen-buildkit-certs.sh` defaults HARBORBOX_BUILDKIT_TLS_DIR to
+      # /data/harborbox/buildkit-tls, which the unprivileged `ghrunner` user
+      # cannot create -- the step died on `mkdir: cannot create directory
+      # '/data/harborbox': Permission denied`. That absolute path exists for
+      # the Coolify deploy, which needs one because Coolify will not
+      # interpolate a variable in a volume source.
+      #
+      # CI is in the same position as a developer machine, so it takes the same
+      # route scripts/try-locally.sh does: certificates in the checkout. This
+      # is also what the API already expects -- compose.yaml mounts
+      # `./.buildkit-tls/client`, a repo-relative path -- so /data would have
+      # left the API without its half of the PKI even if the mkdir had worked.
       - name: Create the shared build network and buildkit certificates
+        env:
+          HARBORBOX_BUILDKIT_TLS_DIR: ${{ github.workspace }}/.buildkit-tls
         run: |
           docker network create harborbox-build || true
           ./scripts/gen-buildkit-certs.sh
@@ -152,8 +184,11 @@ jobs:
       # network a caller's build step can reach, so it is deliberately alone in
       # its own project. tests/e2e_build_isolation.py measures that from inside
       # a real build step, which is the only place it can be measured.
+      # -f compose.builder.local.yaml for the same reason: the deployed
+      # builder bind-mounts /data/harborbox/buildkit-tls/server, and the local
+      # override points it at the checkout instead.
       - name: Start the builder
-        run: docker compose -f compose.builder.yaml up -d --wait
+        run: docker compose -f compose.builder.yaml -f compose.builder.local.yaml up -d --wait
 
       - name: Start the stack
         run: docker compose up -d --wait
@@ -173,7 +208,7 @@ jobs:
         if: failure()
         run: |
           docker compose logs --no-color --tail 300
-          docker compose -f compose.builder.yaml logs --no-color --tail 100
+          docker compose -f compose.builder.yaml -f compose.builder.local.yaml logs --no-color --tail 100
 
       # `docker compose logs` above only covers this compose project's own
       # services (postgres, opensandbox, api). The actual sandbox containers
@@ -231,7 +266,7 @@ jobs:
         if: always()
         run: |
           docker compose down -v
-          docker compose -f compose.builder.yaml down -v
+          docker compose -f compose.builder.yaml -f compose.builder.local.yaml down -v
 
       - name: Upload e2e results
         if: always()
