@@ -11,6 +11,23 @@ dependencies = [
   "fastapi>=0.116.0",
   "httpx>=0.28.0",
   "opensandbox>=0.1.15,<0.2.0",
+  # Telemetry. Not optional extras: an observability stack that a deployment
+  # can forget to install is one that reports a clean zero forever, which is
+  # exactly the failure DEV-1948 was filed for. The exporter is HTTP/proto to
+  # match the rest of the estate (onvo-pro, onvo-lite and the website all POST
+  # to ${OPENTELEMETRY_ENDPOINT}/v1/traces), not gRPC.
+  #
+  # asyncpg rather than sqlalchemy: SQLAlchemy's async engine drives asyncpg,
+  # so instrumenting the driver covers both the ORM's statements and
+  # notify.py's raw LISTEN/NOTIFY connection, which SQLAlchemy never sees.
+  "opentelemetry-exporter-otlp-proto-http>=1.30.0",
+  "opentelemetry-instrumentation-asyncpg>=0.51b0",
+  "opentelemetry-instrumentation-fastapi>=0.51b0",
+  "opentelemetry-instrumentation-httpx>=0.51b0",
+  # For its LoggingHandler, not for LoggingInstrumentor. The equivalent
+  # handler in opentelemetry-sdk is deprecated in favour of this one.
+  "opentelemetry-instrumentation-logging>=0.51b0",
+  "opentelemetry-sdk>=1.30.0",
   "pydantic-settings>=2.10.0",
   "sqlalchemy[asyncio]>=2.0.40",
   "uvicorn[standard]>=0.35.0",

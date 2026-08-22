@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     )
 
     api_key: str = "change-me"
+    # Which deployment this is. Two things read it, both in telemetry.py: it
+    # becomes the `deployment.environment` resource attribute on every span and
+    # log, and anything outside {production, staging} exports under a `-dev`
+    # service name so a local stack pointed at the estate's ingester cannot be
+    # mistaken for the real one. Defaults to development because that is the
+    # answer that is safe to be wrong about.
+    environment: str = "development"
     execution_secret_key: SecretStr = SecretStr(
         "local-development-secret-change-me"
     )

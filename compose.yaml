@@ -266,6 +266,19 @@ services:
         condition: service_healthy
     environment:
       HARBORBOX_API_KEY: ${HARBORBOX_API_KEY:-change-me}
+      # Telemetry. Unset, and that is the safety property rather than an
+      # oversight: with no endpoint Harborbox instruments nothing at all, so a
+      # local stack costs nothing and cannot post into the estate's SigNoz.
+      # DEV-1824 is what that rule is worth -- laptops exporting under the
+      # production service name made 94% of "production" errors somebody's
+      # `pnpm dev`, and buried the two real ones.
+      #
+      # Point these at the estate's ingester to opt in. It is safe to: with
+      # HARBORBOX_ENVIRONMENT left at development the spans arrive under
+      # `harborbox-dev`, so opting in still cannot be mistaken for production.
+      HARBORBOX_ENVIRONMENT: ${HARBORBOX_ENVIRONMENT:-development}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+      OTEL_EXPORTER_OTLP_HEADERS: ${OTEL_EXPORTER_OTLP_HEADERS:-}
       HARBORBOX_EXECUTION_SECRET_KEY: ${HARBORBOX_EXECUTION_SECRET_KEY:-local-development-secret-change-me}
       HARBORBOX_DATABASE_URL: postgresql+asyncpg://harborbox:${POSTGRES_PASSWORD:-harborbox}@postgres/harborbox
       HARBORBOX_OPENSANDBOX_DOMAIN: opensandbox:8080
