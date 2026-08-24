@@ -11,7 +11,7 @@ Do not grow this into a product surface, and do not document it: anything a
 caller should be able to do belongs in the REST API and the TypeScript SDK.
 """
 
-from live_client.client import SandboxClient
+from live_client.client import SandboxClient, SandboxError
 from live_client.models import Execution, ExecutionError, ExecutionResult, Logs, Sandbox
 
 __all__ = [
@@ -21,4 +21,5 @@ __all__ = [
     "Logs",
     "Sandbox",
     "SandboxClient",
+    "SandboxError",
 ]

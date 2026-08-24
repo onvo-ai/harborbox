@@ -19,7 +19,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from harborbox import scheduler as scheduler_module
-from harborbox.api import app
+from harborbox.api import SANDBOX_START_FAILED_CODE, SANDBOX_STARTING_CODE, app
 from harborbox.config import Settings
 from harborbox.db import Base, get_session
 from harborbox.errors import SandboxUnavailableError
@@ -494,7 +494,64 @@ async def test_a_failed_lazy_start_reports_503_and_does_not_strand_starting(
         app.dependency_overrides.clear()
 
     assert response.status_code == httpx.codes.SERVICE_UNAVAILABLE
+    # Machine-readable, both ways. The status code alone says nothing here:
+    # a still-starting sandbox returns the same 503, and telling the two
+    # apart used to mean parsing the English in `message` (DEV-1996).
+    assert response.json()["detail"]["code"] == SANDBOX_START_FAILED_CODE
+    assert response.json()["detail"]["message"] == "upstream boom"
+    assert "Retry-After" not in response.headers
     async with sessions() as session:
         sandbox = await session.get(Sandbox, "sbx-broken")
     assert sandbox is not None
     assert sandbox.status == "failed"
+
+
+async def test_a_slow_lazy_start_reports_a_retryable_503(
+    sessions: Sessions, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other 503, and the one this suite could not previously observe.
+
+    The start has not failed -- it is still running in the background, and
+    `asyncio.shield` keeps it there -- so the response says so in a way a
+    client can act on without reading its message: a code that is not the
+    failed-start one, and a `Retry-After` telling it when to come back.
+
+    The sandbox stays `starting` rather than being marked `failed`, which is
+    the row-level half of the same distinction.
+    """
+    monkeypatch.setattr(scheduler_module, "session_factory", sessions)
+    # Longer than the 0.1s budget below, so the caller's wait elapses while
+    # the start is still perfectly healthy.
+    runtime = FakeRuntime(start_delay=5)
+    settings = Settings(lazy_start_wait_timeout_seconds=0.1)
+    app.state.settings = settings
+    app.state.runtime = runtime
+    app.state.scheduler = scheduler_module.Scheduler(settings, runtime)
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        async with sessions() as opened:
+            yield opened
+
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[require_api_key] = lambda: None
+    async with sessions() as session:
+        session.add(sandbox_row(id="sbx-slow", status="created"))
+        await session.commit()
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://harborbox"
+        ) as client:
+            response = await client.get(
+                "/v1/sandboxes/sbx-slow/files/list", params={"path": "."}
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == httpx.codes.SERVICE_UNAVAILABLE
+    assert response.json()["detail"]["code"] == SANDBOX_STARTING_CODE
+    assert response.headers["Retry-After"] == "1"
+    async with sessions() as session:
+        sandbox = await session.get(Sandbox, "sbx-slow")
+    assert sandbox is not None
+    assert sandbox.status == "starting"

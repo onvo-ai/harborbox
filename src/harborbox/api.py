@@ -208,6 +208,51 @@ def opensandbox_error(detail: str, status_code: int = 422) -> HTTPException:
     )
 
 
+# The lazy-start path fails in two ways that mean opposite things, and both
+# used to be a bare 503 whose only difference was English prose in `detail`.
+# A caller had to match on message text to tell "come back in a moment" from
+# "this sandbox is dead", so in practice nobody did -- the e2e suite's own
+# client raised both as the same `Server error '503 Service Unavailable'`
+# (DEV-1996), and Onvo Lite runs this same path in production.
+#
+# Two machine-readable signals now separate them, and they agree:
+#   * `detail.code`, matching `opensandbox_error`'s existing shape, and
+#   * `Retry-After`, which `resume_sandbox`'s 429 already sends. Present
+#     means retry; absent means the operation will not succeed on a retry.
+# The status code stays 503 for both: it is the correct code for each, and
+# changing it would break callers reading the status alone.
+SANDBOX_STARTING_CODE = "SANDBOX_STARTING"
+SANDBOX_START_FAILED_CODE = "SANDBOX_START_FAILED"
+
+
+def sandbox_starting_error(detail: str) -> HTTPException:
+    """503 for a start that is still running: retry and it may well succeed.
+
+    `Scheduler.ensure_sandbox_ready` bounds the *caller's* wait, not the start
+    itself, so the container is still coming up in the background when this is
+    raised. `Retry-After` is deliberately short: a retry reattaches to that
+    same in-flight start rather than beginning a second one.
+    """
+    return HTTPException(
+        status_code=503,
+        detail={"code": SANDBOX_STARTING_CODE, "message": detail},
+        headers={"Retry-After": "1"},
+    )
+
+
+def sandbox_start_failed_error(detail: str) -> HTTPException:
+    """503 for a start that failed: the sandbox is `failed` and will not recover.
+
+    No `Retry-After`, and that absence is the contract -- retrying only
+    re-reads a `failed` row. The caller's move is a new sandbox, not a
+    second attempt at this one.
+    """
+    return HTTPException(
+        status_code=503,
+        detail={"code": SANDBOX_START_FAILED_CODE, "message": detail},
+    )
+
+
 async def ensure_ready(
     sandbox: Sandbox, request: Request, session: AsyncSession
 ) -> Sandbox:
@@ -221,6 +266,12 @@ async def ensure_ready(
     checked the same way `resume_sandbox` already checks capacity before
     starting one, and bounded by `lazy_start_wait_timeout_seconds` so a slow
     or stuck runtime surfaces as a clear 503 rather than hanging the request.
+
+    Two different 503s: `sandbox_starting_error` means the start is still
+    running and a retry may succeed, `sandbox_start_failed_error` means it
+    failed and the sandbox is now `failed`. They are told apart by
+    `detail.code` and by the presence of `Retry-After`, never by their
+    message text.
     """
     action = lazy_start_action(sandbox.status)
     if action == "unavailable":
@@ -262,7 +313,7 @@ async def ensure_ready(
         # Not a failure: the start is still going in the background (see
         # `Scheduler.ensure_sandbox_ready`). A retry either finds `running`
         # or waits on the same in-flight start again.
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise sandbox_starting_error(str(exc)) from exc
     except SandboxUnavailableError as exc:
         # Mirrors `resume_sandbox`'s own handling of the same exception, with
         # one refinement: refresh first, so a sandbox the scheduler already
@@ -272,7 +323,7 @@ async def ensure_ready(
         if sandbox.status not in {"killed", "failed"}:
             sandbox.status = "failed"
             await session.commit()
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raise sandbox_start_failed_error(str(exc)) from exc
     await session.refresh(sandbox)
     return sandbox
 
@@ -733,7 +784,10 @@ async def resume_sandbox(
     except SandboxUnavailableError as exc:
         sandbox.status = "failed"
         await session.commit()
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+        # Same code as `ensure_ready`'s own failed-start 503: identical
+        # condition, and a caller that resumes explicitly reads the same
+        # contract as one that triggers a lazy start with a file write.
+        raise sandbox_start_failed_error(str(exc)) from exc
     else:
         return sandbox
 
