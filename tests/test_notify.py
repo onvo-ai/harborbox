@@ -13,8 +13,15 @@ the caller back on the polling behaviour this replaced.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from contextlib import AbstractAsyncContextManager
+from typing import TYPE_CHECKING
 
+import asyncpg
 import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Callable
 
 from harborbox.config import Settings
 from harborbox.notify import ExecutionNotifier
@@ -133,3 +140,139 @@ def test_the_listener_dsn_drops_what_asyncpg_cannot_read(
     every reconnect rather than failing visibly at startup.
     """
     assert notifier(configured)._dsn() == expected
+
+
+class FakePostgresConnection:
+    """A stand-in that enforces asyncpg's real concurrency invariant.
+
+    asyncpg connections are not safe for concurrent use: a second operation
+    started while one is still in flight raises `InterfaceError`. That is the
+    production failure this fake reproduces -- 12 of 12 error spans in the
+    72-hour window after DEV-1948's instrumentation went live were
+    `InterfaceError: cannot perform operation: another operation is in
+    progress` on `SELECT pg_notify($1, $2)`, and every one of them landed
+    while two or more requests were in flight.
+    """
+
+    # asyncpg's own wording, so a reader grepping the production error string
+    # lands here.
+    BUSY_MESSAGE = "cannot perform operation: another operation is in progress"
+
+    def __init__(self) -> None:
+        self.executed: list[tuple[object, ...]] = []
+        self.listeners: dict[str, object] = {}
+        self.closed = False
+        self._busy = False
+
+    async def execute(self, query: str, *args: object) -> None:
+        if self._busy:
+            raise asyncpg.InterfaceError(self.BUSY_MESSAGE)
+        self._busy = True
+        try:
+            # The await is the point: it hands control back to the event loop
+            # mid-operation, which is exactly the window a second caller slips
+            # into against a shared connection.
+            await asyncio.sleep(0)
+            self.executed.append((query, *args))
+        finally:
+            self._busy = False
+
+    async def add_listener(self, channel: str, callback: object) -> None:
+        self.listeners[channel] = callback
+
+    def add_termination_listener(self, _callback: object) -> None:
+        return None
+
+    def is_closed(self) -> bool:
+        return self.closed
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class FakePool:
+    """A pool that hands out one connection per concurrent caller, up to a bound.
+
+    The bound matters: it is what makes the assertion below prove that emits
+    past `max_size` queue for a connection rather than collide on one.
+    """
+
+    def __init__(
+        self, max_size: int, factory: Callable[[], FakePostgresConnection]
+    ) -> None:
+        self._free = [factory() for _ in range(max_size)]
+        self._slots = asyncio.Semaphore(max_size)
+        self.closed = False
+
+    def acquire(self) -> AbstractAsyncContextManager[FakePostgresConnection]:
+        return self._lease()
+
+    @contextlib.asynccontextmanager
+    async def _lease(self) -> AsyncIterator[FakePostgresConnection]:
+        await self._slots.acquire()
+        connection = self._free.pop()
+        try:
+            yield connection
+        finally:
+            self._free.append(connection)
+            self._slots.release()
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def test_concurrent_emits_all_reach_the_wire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent notifications must not knock each other off the connection.
+
+    The API task emits on enqueue (`notify_queued`) and the scheduler task
+    emits on completion (`notify_execution_finished`). They are separate
+    asyncio tasks, so sharing one asyncpg connection between them loses
+    notifications under exactly the concurrency the notifier exists to speed
+    up. A dropped `NOTIFY` costs correctness nothing -- every waiter has a
+    timeout -- but it costs the other replicas their wake-up, which is the
+    whole point of the module.
+
+    `_emit` suppresses the error by design, so the assertion is on delivery
+    rather than on a raise: count what actually reached the wire.
+    """
+    connections: list[FakePostgresConnection] = []
+
+    def fake_connection() -> FakePostgresConnection:
+        connection = FakePostgresConnection()
+        connections.append(connection)
+        return connection
+
+    async def fake_connect(*_args: object, **_kwargs: object) -> FakePostgresConnection:
+        return fake_connection()
+
+    async def fake_create_pool(
+        *_args: object, max_size: int = 1, **_kwargs: object
+    ) -> FakePool:
+        return FakePool(max_size, fake_connection)
+
+    monkeypatch.setattr(asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(asyncpg, "create_pool", fake_create_pool)
+
+    events = notifier("postgresql+asyncpg://user:pw@db:5432/harborbox")
+    await events.start()
+    # Let the listener task dial before anything is emitted.
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    emits = 20
+    try:
+        await asyncio.gather(
+            *(events.notify_execution_finished(f"exec_{index}") for index in range(emits))
+        )
+    finally:
+        await events.close()
+
+    delivered = [
+        statement for connection in connections for statement in connection.executed
+    ]
+    assert len(delivered) == emits, (
+        f"{emits - len(delivered)} of {emits} notifications were dropped by a "
+        "collision on a shared connection"
+    )
