@@ -210,6 +210,12 @@ class Settings(BaseSettings):
     # container create plus health check, which since the kernel's removal is
     # all there is to wait for. If it elapses the start is not aborted, only the
     # caller's wait: see `Scheduler.ensure_sandbox_ready`.
+    #
+    # A client's own request timeout must sit above this, or the retryable 503
+    # it produces can never reach that client -- the read times out first and
+    # the whole branch goes unobservable (DEV-1996). The e2e suite's client
+    # pins itself against this number for exactly that reason; see
+    # `SERVER_LAZY_START_WAIT_TIMEOUT_SECONDS` in tests/live_client/client.py.
     lazy_start_wait_timeout_seconds: float = Field(default=60.0, gt=0)
     reaper_poll_seconds: float = Field(default=5.0, gt=0)
     # How many started-but-unassigned sandboxes to keep ready. 0 disables the
