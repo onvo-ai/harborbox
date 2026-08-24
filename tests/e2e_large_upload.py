@@ -21,12 +21,14 @@ def upload_chunks(megabytes: int) -> Iterator[bytes]:
 
 
 @pytest.mark.e2e
-def test_large_streaming_upload_persists_full_size(client: SandboxClient) -> None:
+def test_large_streaming_upload_persists_full_size(
+    client: SandboxClient, data_stack_template: str
+) -> None:
     base_url = os.environ.get("HARBORBOX_BASE_URL", "http://127.0.0.1:8000")
     api_key = os.environ["HARBORBOX_API_KEY"]
     size_mb = int(os.environ.get("HARBORBOX_LARGE_UPLOAD_MB", "100"))
     sandbox = client.sandboxes.create(
-        template="onvo-lite",
+        template=data_stack_template,
         memory_mb=768,
         cpu=1,
         idle_timeout_seconds=120,
