@@ -892,6 +892,28 @@ applications restarted afterwards.
 - **Give it no domain.** A domain makes Coolify attach the proxy network to
   it, and every network the builder joins is one a caller's build step joins.
   That would undo the entire point of the split.
+- **Which project it goes in does not matter; being its own application does.**
+  The network Coolify appends is named for the *application* UUID, not the
+  project, so two applications in one project do not share one. Both harborbox
+  applications live in the `Harborbox` project
+  (uuid `b1274plth4b7k2v1hzi11jno`) and the split still holds. Measured on the
+  infrastructure host on 2026-08-24, after that move:
+
+  ```
+  builder networks:  harborbox-build 172.20.0.3
+                     l4fzsorn4q21t6qsqs3hpw3q 172.24.0.3   <- its own, not shared
+  api networks:      u95r9dynmb7i2kn945n61qiq{,_control}, harborbox-next-net, <trigger>
+
+  from inside the builder:
+    api:8000        -> bad address 'api'   (does not resolve)
+    172.22.0.8:8000 -> UNREACHABLE
+    172.23.0.2:5432 -> UNREACHABLE
+    registry:5000   -> OPEN
+  ```
+
+  Re-run that check after any Coolify reorganisation. It is the only thing that
+  proves the invariant in 10.3 — a compose file cannot, for the reason in the
+  section above.
 
 Deploy it, then confirm what came up:
 
