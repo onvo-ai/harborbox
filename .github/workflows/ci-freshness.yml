@@ -1,0 +1,117 @@
+name: CI freshness
+
+# The watchdog for DEV-1971. From 2026-08-17 to 2026-08-22 no job in this
+# repository was picked up by a runner: every run sat queued until GitHub's
+# 48-hour timeout cancelled it, and four PRs merged unvalidated. Nothing
+# alerted, because nothing had gone red - a check that never ran renders as
+# neutral on the PR page, not as a red X. There is no signal that says "this
+# was never tested", only the absence of one that says it passed.
+
+on:
+  schedule:
+    # Every two hours. Not on the hour: GitHub queues the top-of-hour crontab
+    # of every repository at once, and a watchdog is the wrong thing to have
+    # sitting in that queue.
+    - cron: "23 */2 * * *"
+  workflow_dispatch:
+
+# A run per schedule tick is enough; if one is still going, skip the next.
+concurrency:
+  group: ci-freshness
+  cancel-in-progress: false
+
+jobs:
+  freshness:
+    name: Is CI still reporting?
+    # GITHUB-HOSTED, AND THAT IS THE ENTIRE POINT. ci.yml runs on
+    # `[self-hosted, onvo-ci]`; those runners going unreachable is the exact
+    # fault this job exists to catch, so it must not depend on them. A
+    # watchdog sharing its subject's single point of failure reports nothing
+    # at the only moment it matters.
+    #
+    # This works because harborbox is public: public repositories get free
+    # standard runners and are not charged against the org's Actions spend.
+    # The comment in ci.yml saying every GitHub-hosted job fails in ~2s with
+    # "recent account payments have failed" is true of the private `onvo`
+    # repository and was carried over here; measured 2026-08-25, a
+    # `ubuntu-latest` job on this repo starts and succeeds in about 20s.
+    runs-on: ubuntu-latest
+    permissions:
+      # actions:read for the workflow-run history, issues:write for the alarm.
+      actions: read
+      contents: read
+      issues: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # No `uv sync`: ci_freshness.py is standard library only, so the
+      # watchdog shares no dependency resolution, no cache and no runner with
+      # the thing it watches. Fewer moving parts is the requirement here.
+      - name: Judge CI freshness
+        id: judge
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python3 scripts/ci_freshness.py
+
+      # A GitHub issue, deliberately. The two notification channels this org
+      # already has are both dead: Uptime Kuma's only channel is a Slack
+      # webhook returning `invalid_token`, and there is no other. An issue
+      # needs no credential beyond the job's own token, is visible in the same
+      # place the work is, and cannot itself fail silently.
+      - name: Raise or clear the alarm
+        uses: actions/github-script@v7
+        env:
+          VERDICT: ${{ steps.judge.outputs.verdict }}
+        with:
+          script: |
+            // This marker is how the job finds its own issue again, the same
+            // contract ci.yml's report comment uses. It must stay stable -
+            // there is no other copy of it anywhere.
+            const marker = '<!-- harborbox-ci-freshness -->';
+            const title = 'CI is not reporting a verdict';
+            const verdict = JSON.parse(process.env.VERDICT);
+            const { owner, repo } = context.repo;
+
+            const found = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', per_page: 100,
+            });
+            const mine = found.find((i) => i.body?.startsWith(marker));
+
+            if (!verdict.stale) {
+              if (mine) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: mine.number,
+                  body: `Recovered. ${verdict.headline}`,
+                });
+                await github.rest.issues.update({
+                  owner, repo, issue_number: mine.number, state: 'closed',
+                });
+              }
+              core.info(verdict.headline);
+              return;
+            }
+
+            const body = [
+              marker,
+              `**${verdict.headline}**`,
+              '',
+              ...verdict.details.map((d) => `- ${d}`),
+              '',
+              'A queued-forever check shows as neutral on a PR, not as a red X, so',
+              'nothing else will tell you about this. See DEV-1971 for the last',
+              'occurrence and its cause (the org runner group had stopped serving',
+              'public repositories).',
+              '',
+              `_Raised by [CI freshness](${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId})._`,
+            ].join('\n');
+
+            if (mine) {
+              await github.rest.issues.update({
+                owner, repo, issue_number: mine.number, body,
+              });
+            } else {
+              await github.rest.issues.create({ owner, repo, title, body });
+            }
+            core.setFailed(verdict.headline);
