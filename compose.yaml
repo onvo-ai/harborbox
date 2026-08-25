@@ -290,6 +290,12 @@ services:
       # execd port directly, which is what extra_hosts below is for.
       HARBORBOX_OPENSANDBOX_USE_SERVER_PROXY: ${HARBORBOX_OPENSANDBOX_USE_SERVER_PROXY:-false}
       HARBORBOX_OPENSANDBOX_READY_TIMEOUT_SECONDS: ${HARBORBOX_OPENSANDBOX_READY_TIMEOUT_SECONDS:-30}
+      # These two are a pair, and the API refuses to start if they cross: the
+      # start's own budget must outlast the caller's wait, or a slow cold start
+      # dies before the caller is told it is still starting (DEV-2032). Raise
+      # one and raise the other.
+      HARBORBOX_SANDBOX_START_TIMEOUT_SECONDS: ${HARBORBOX_SANDBOX_START_TIMEOUT_SECONDS:-120}
+      HARBORBOX_LAZY_START_WAIT_TIMEOUT_SECONDS: ${HARBORBOX_LAZY_START_WAIT_TIMEOUT_SECONDS:-60}
       HARBORBOX_OPENSANDBOX_SNAPSHOT_TIMEOUT_SECONDS: ${HARBORBOX_OPENSANDBOX_SNAPSHOT_TIMEOUT_SECONDS:-300}
       HARBORBOX_BASE_IMAGE: harborbox-sandbox-base:${HARBORBOX_IMAGE_TAG:-local}
       # Pools by template name. A product that wants its own image kept

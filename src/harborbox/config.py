@@ -37,7 +37,41 @@ class Settings(BaseSettings):
     opensandbox_protocol: Literal["http", "https"] = "http"
     opensandbox_api_key: SecretStr = SecretStr("change-me-opensandbox")
     opensandbox_use_server_proxy: bool = True
+    # `ConnectionConfig.request_timeout` for every ordinary control-plane call
+    # the runtime makes, and the connect/ready bound on an *already-started*
+    # sandbox. Deliberately short, and deliberately no longer the budget for a
+    # cold start -- see `sandbox_start_timeout_seconds` below.
     opensandbox_ready_timeout_seconds: float = Field(default=30.0, gt=0)
+    # The budget for one cold start: the create POST plus the readiness wait,
+    # and the same for a resume. Split out of
+    # `opensandbox_ready_timeout_seconds` for DEV-2032, which is worth stating
+    # plainly because the old shared 30s was actively harmful in two ways at
+    # once.
+    #
+    # It was too short for the thing it bounded. Cold starts were measured at
+    # 20-31s under production-like concurrency, i.e. inside their own margin,
+    # so a start that was merely slow tripped it -- and a tripped start used to
+    # be recorded as a dead sandbox. That half is fixed in the runtime: a
+    # timeout on this path now raises `SandboxStartTimeoutError`, which leaves
+    # the row retryable rather than `failed`.
+    #
+    # And it was too *long* for everything else sharing it, which is why the
+    # fix is a separate field rather than a raise of the old one. That value is
+    # the per-request bound on every control-plane call, including ones on the
+    # error path (see `oom_diagnostic_timeout_seconds`, which exists precisely
+    # because inheriting 30s there was already too much). Sizing a cold start
+    # honestly and sizing a single HTTP call honestly are different questions
+    # and they now have different answers.
+    #
+    # The number is not a margin added to the 20-31s measurement -- that
+    # measurement is a sample from one loaded shared box, and adding a guess to
+    # it would just be a bigger guess. It is derived from the bound it must not
+    # cross: `lazy_start_wait_timeout_seconds` is when the *caller* stops
+    # waiting, and this must outlast that so the caller always gets the
+    # retryable "still starting" answer rather than watching the start die
+    # first. `refuse_a_start_budget_the_caller_can_pre_empt` enforces exactly
+    # that, so raising either number without the other fails at startup.
+    sandbox_start_timeout_seconds: float = Field(default=120.0, gt=0)
     # Bounds the live get_sandbox_info() lookup _detect_memory_exceeded makes
     # on every runtime error (14 call sites) to work out whether a failure was
     # an OOM kill. It is a diagnostic, not a critical path: without its own
@@ -124,10 +158,12 @@ class Settings(BaseSettings):
     # `Scheduler._ensure_running` catching it -- holds real capacity, unlike
     # a stuck `created` row. Shorter than reaper_stuck_created_after_seconds
     # on purpose: five minutes is generous over every start budget that
-    # feeds into it (opensandbox_ready_timeout_seconds and
+    # feeds into it (sandbox_start_timeout_seconds and
     # lazy_start_wait_timeout_seconds combined top out well under this), so
     # anything still `starting` this long is abandoned, not slow. Defence in
-    # depth, not the primary fix.
+    # depth, not the primary fix -- and since DEV-2032 it is also the backstop
+    # for a start that timed out and left its row retryable: nobody coming
+    # back to retry it is exactly the case this sweeps.
     reaper_stuck_starting_after_seconds: int = Field(default=300, ge=30)
     # Long enough that a failure is still there when someone comes to look.
     reaper_failed_retention_hours: int = Field(default=24, ge=1)
@@ -427,6 +463,43 @@ class Settings(BaseSettings):
                 f"mutual TLS; {', '.join(missing)} is unset. Anything that can reach "
                 f"that port could otherwise build, and a caller's build step can "
                 f"reach it. Generate the pair with scripts/gen-buildkit-certs.sh."
+            )
+            raise ValueError(message)
+        return self
+
+    @model_validator(mode="after")
+    def refuse_a_start_budget_the_caller_can_pre_empt(self) -> "Settings":
+        """Refuse a start budget the caller's own wait can outlive.
+
+        Two nested deadlines guard one lazy start.
+        `lazy_start_wait_timeout_seconds` is the outer one: how long the HTTP
+        caller waits before being handed a retryable "still starting" 503,
+        while the start carries on in the background.
+        `sandbox_start_timeout_seconds` is the inner one: how long the start
+        itself is allowed to take.
+
+        If the inner is the shorter of the two it pre-empts the outer, and the
+        outer branch stops being reachable through this path at all -- which is
+        what shipped. At 30s inside 60s, a create slower than 30s ended the
+        start before the caller's patience ran out, so the answer was always
+        "this sandbox failed", never "it is still coming up". Cold starts were
+        measured at 20-31s, so that was not a rare corner.
+
+        Enforced at startup because the failure mode is silent otherwise: the
+        system keeps working, it just answers the wrong one of two 503s under
+        load. Deliberately the same shape as
+        `test_live_client_retry.py`'s client/server pair (DEV-1996) -- the same
+        crossing, one layer out, found the same way.
+        """
+        if self.sandbox_start_timeout_seconds <= self.lazy_start_wait_timeout_seconds:
+            message = (
+                f"sandbox_start_timeout_seconds "
+                f"({self.sandbox_start_timeout_seconds:g}s) must exceed "
+                f"lazy_start_wait_timeout_seconds "
+                f"({self.lazy_start_wait_timeout_seconds:g}s). The inner bound is the "
+                f"start's own budget and the outer one is only the caller's wait; "
+                f"crossed, a slow start dies before the caller is told it is still "
+                f"starting, and the retryable branch never fires."
             )
             raise ValueError(message)
         return self

@@ -16,11 +16,19 @@ import httpx
 from opensandbox import Sandbox as OpenSandbox
 from opensandbox import SandboxManager
 from opensandbox.config import ConnectionConfig
-from opensandbox.exceptions import SandboxApiException, SandboxException
+from opensandbox.exceptions import (
+    SandboxApiException,
+    SandboxException,
+    SandboxReadyTimeoutException,
+)
 from opensandbox.models.execd import Execution, ExecutionHandlers, RunCommandOpts
 from opensandbox.models.filesystem import DirectoryListEntry
 
-from harborbox.errors import SandboxMemoryExceededError, SandboxUnavailableError
+from harborbox.errors import (
+    SandboxMemoryExceededError,
+    SandboxStartTimeoutError,
+    SandboxUnavailableError,
+)
 from harborbox.runtime_protocol import StartedSandbox, WarmPoolReservation
 from harborbox.schemas import (
     ExecutionError,
@@ -179,6 +187,21 @@ class OpenSandboxRuntime:
             disable_metrics=True,
             transport=self._transport,
         )
+        # The same connection with one number changed. `request_timeout` bounds
+        # each HTTP call, and the create POST is a call that legitimately takes
+        # tens of seconds -- so on the start path it has to be the start's own
+        # budget, not the short bound every other call wants. Sharing
+        # `self._transport` means this is a second config over one connection
+        # pool, not a second pool.
+        self._start_connection = ConnectionConfig(
+            api_key=settings.opensandbox_api_key.get_secret_value(),
+            domain=settings.opensandbox_domain,
+            protocol=settings.opensandbox_protocol,
+            request_timeout=timedelta(seconds=settings.sandbox_start_timeout_seconds),
+            use_server_proxy=settings.opensandbox_use_server_proxy,
+            disable_metrics=True,
+            transport=self._transport,
+        )
         self._sandboxes: dict[str, OpenSandbox] = {}
         self._manager: SandboxManager | None = None
         self._manager_lock = asyncio.Lock()
@@ -232,14 +255,14 @@ class OpenSandboxRuntime:
             kwargs: dict[str, Any] = {
                 "timeout": None,
                 "ready_timeout": timedelta(
-                    seconds=self.settings.opensandbox_ready_timeout_seconds
+                    seconds=self.settings.sandbox_start_timeout_seconds
                 ),
                 "metadata": self._runtime_metadata(sandbox),
                 "resource": {
                     "cpu": str(sandbox.cpu),
                     "memory": f"{sandbox.memory_mb}Mi",
                 },
-                "connection_config": self._connection,
+                "connection_config": self._start_connection,
             }
             handle = None
             if not snapshot_id:
@@ -264,7 +287,7 @@ class OpenSandboxRuntime:
             self._sandboxes[sandbox.id] = handle
             return StartedSandbox(id=handle.id, name=handle.id)
         except SandboxException as exc:
-            await self._raise_runtime_error(exc, sandbox)
+            await self._raise_start_error(exc, sandbox)
 
     async def wait_until_ready(self, sandbox: Sandbox) -> None:
         """Ready means the container answers, which is now all there is to wait for.
@@ -463,15 +486,15 @@ class OpenSandboxRuntime:
         try:
             handle = await OpenSandbox.resume(
                 sandbox.container_id,
-                connection_config=self._connection,
+                connection_config=self._start_connection,
                 resume_timeout=timedelta(
-                    seconds=self.settings.opensandbox_ready_timeout_seconds
+                    seconds=self.settings.sandbox_start_timeout_seconds
                 ),
             )
             self._sandboxes[sandbox.id] = handle
             return StartedSandbox(id=handle.id, name=handle.id)
         except SandboxException as exc:
-            await self._raise_runtime_error(exc, sandbox)
+            await self._raise_start_error(exc, sandbox)
 
     async def kill(self, sandbox: Sandbox) -> None:
         handle = self._sandboxes.pop(sandbox.id, None)
@@ -683,3 +706,59 @@ class OpenSandboxRuntime:
         if await self._detect_memory_exceeded(sandbox):
             raise SandboxMemoryExceededError(sandbox.memory_mb) from exc
         raise SandboxUnavailableError(str(exc)) from exc
+
+    @staticmethod
+    def _is_start_timeout(exc: SandboxException) -> bool:
+        """Whether a failed start ran out of time rather than went wrong.
+
+        The SDK expresses one of these two ways and only names one of them.
+
+        `SandboxReadyTimeoutException` is the readiness poll giving up, which
+        is explicit. The other is the create POST itself exceeding
+        `ConnectionConfig.request_timeout`: httpx raises `ReadTimeout`, and the
+        SDK's own converter rewraps it as a generic `SandboxInternalException`
+        whose class says nothing. Only the cause chain still carries the fact,
+        so that is what this walks -- matching on the message text instead
+        would be the same dead substring match `_detect_memory_exceeded`'s
+        docstring already rejects.
+
+        A timeout is safe to call retryable because the SDK cleans up after
+        itself: `Sandbox.create` kills the half-built sandbox before raising,
+        so a retry starts a new container rather than orphaning the old one.
+
+        Narrow on purpose. Anything else -- a refused create, an unpullable
+        image, an unhealthy control plane -- is a dead sandbox, and telling a
+        caller to retry that would spin them against an error that never
+        clears.
+        """
+        if isinstance(exc, SandboxReadyTimeoutException):
+            return True
+        seen: set[int] = set()
+        cause: BaseException | None = exc
+        while cause is not None and id(cause) not in seen:
+            seen.add(id(cause))
+            if isinstance(cause, httpx.TimeoutException):
+                return True
+            cause = cause.__cause__
+        return False
+
+    async def _raise_start_error(
+        self, exc: SandboxException, sandbox: Sandbox
+    ) -> NoReturn:
+        """`_raise_runtime_error` for the start path, where slow is not dead.
+
+        Every runtime failure used to become `SandboxUnavailableError`, and
+        both `_ensure_running` and the API's `ensure_ready` read that as "this
+        sandbox is gone" and wrote `failed`. On the start path that turned a
+        cold start slower than its own budget into a permanently dead sandbox
+        -- the DEV-2032 bug, and one Onvo Lite hit in production on its
+        create-upload-transform path.
+
+        `SandboxStartTimeoutError` is the existing signal for "not known to be
+        broken, just not up yet" (DEV-1996 introduced it for the caller-side
+        deadline). Raising it here means a timed-out start leaves a row a retry
+        can still bring up.
+        """
+        if self._is_start_timeout(exc):
+            raise SandboxStartTimeoutError(str(exc)) from exc
+        await self._raise_runtime_error(exc, sandbox)
