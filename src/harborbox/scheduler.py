@@ -65,6 +65,13 @@ ERROR_NAME_SANDBOX_UNAVAILABLE = "SandboxUnavailable"
 # never drift independently of each other again.
 ERROR_NAME_MEMORY_LIMIT_EXCEEDED = "MemoryLimitExceeded"
 
+# Same wire-contract reasoning again. Distinct from ERROR_NAME_SANDBOX_UNAVAILABLE
+# because the two call for opposite things from the caller: `SandboxUnavailable`
+# means the sandbox is gone and the move is a new one, `SandboxStarting` means it
+# was only slow to come up and the same sandbox is still worth retrying. Pairs
+# with the `SANDBOX_STARTING` 503 code the HTTP path returns (DEV-1996).
+ERROR_NAME_SANDBOX_STARTING = "SandboxStarting"
+
 TERMINAL_EXECUTION_STATES = ("succeeded", "failed", "cancelled")
 
 
@@ -574,6 +581,19 @@ class Scheduler:
             await self._fail_execution(
                 execution_id, ERROR_NAME_MEMORY_LIMIT_EXCEEDED, str(exc)
             )
+        except SandboxStartTimeoutError as exc:
+            # The execution is over -- the caller asked for a result and is not
+            # getting one -- but the sandbox behind it was only slow. Failing
+            # both would put the next call back at square one against a
+            # `failed` row, which is the DEV-2032 bug arriving by the other
+            # door: `POST /executions` reaches the same `_ensure_running` the
+            # lazy-start path does.
+            await self._fail_execution(
+                execution_id,
+                ERROR_NAME_SANDBOX_STARTING,
+                str(exc),
+                fail_sandbox=False,
+            )
         except SandboxUnavailableError as exc:
             await self._fail_execution(
                 execution_id, ERROR_NAME_SANDBOX_UNAVAILABLE, str(exc)
@@ -761,6 +781,19 @@ class Scheduler:
         async with lock:
             try:
                 await self._ensure_running_locked(sandbox_id)
+            except SandboxStartTimeoutError:
+                # Slow, not dead (DEV-2032). The row stays as it is -- which
+                # `lazy_start_action` routes straight back into
+                # `_ensure_running_locked`, so a retry brings it up rather
+                # than bouncing off a `failed` row that nothing can revive.
+                # `reaper_stuck_starting_after_seconds` is the backstop for a
+                # start nobody comes back to retry, which is the capacity leak
+                # `_mark_start_failed` below is really guarding against.
+                logger.warning(
+                    "sandbox %s ran past its start budget; left retryable",
+                    sandbox_id,
+                )
+                raise
             except Exception:
                 # Must be recorded here, not left to the caller: a caller
                 # reached through `ensure_sandbox_ready` may already be gone
@@ -857,7 +890,22 @@ class Scheduler:
 
         await self.runtime.wait_until_ready(ready_sandbox)
 
-    async def _fail_execution(self, execution_id: str, name: str, value: str) -> None:
+    async def _fail_execution(
+        self,
+        execution_id: str,
+        name: str,
+        value: str,
+        *,
+        fail_sandbox: bool = True,
+    ) -> None:
+        """End one execution as `failed`, and usually its sandbox with it.
+
+        `fail_sandbox=False` is for the one case where the execution died but
+        the sandbox did not: a start that ran past its budget (DEV-2032). The
+        container-status check below cannot tell that case apart on its own --
+        a start that timed out never recorded a `container_id`, so the lookup
+        finds nothing and reads exactly like a dead container.
+        """
         async with session_factory() as session:
             execution = await session.get(Execution, execution_id)
             if execution is None or execution.status in TERMINAL_EXECUTION_STATES:
@@ -867,7 +915,7 @@ class Scheduler:
             execution.environment = scrub_environment(execution.environment)
             execution.error = {"name": name, "value": value, "traceback": []}
             sandbox = await session.get(Sandbox, execution.sandbox_id)
-            if sandbox is not None:
+            if fail_sandbox and sandbox is not None:
                 container_status = await self.runtime.container_status(sandbox)
                 if container_status in {None, "dead", "exited"}:
                     sandbox.status = "failed"

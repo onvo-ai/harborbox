@@ -781,6 +781,14 @@ async def resume_sandbox(
         await session.commit()
         await session.refresh(sandbox)
         await runtime_from(request).wait_until_ready(sandbox)
+    except SandboxStartTimeoutError as exc:
+        # Slow, not dead (DEV-2032). An explicit resume gets the same two-way
+        # answer a lazy start does, for the same reason: a resume that ran past
+        # its budget has not proved anything about the sandbox. The row keeps
+        # the `starting` set above, which `lazy_start_action` and
+        # `_ensure_running_locked` both accept, so the retry this 503 invites
+        # resumes the same sandbox rather than bouncing off a `failed` row.
+        raise sandbox_starting_error(str(exc)) from exc
     except SandboxUnavailableError as exc:
         sandbox.status = "failed"
         await session.commit()
