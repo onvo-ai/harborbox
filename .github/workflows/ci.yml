@@ -9,9 +9,14 @@ on:
 jobs:
   test:
     name: Unit tests
-    # Self-hosted for the reason onvo's ci.yml documents: the org's Actions
-    # spend is blocked, so every GitHub-hosted job fails in ~2s with "recent
-    # account payments have failed". Self-hosted runners are not billed.
+    # Self-hosted because these jobs need Docker, a shared build network and
+    # the buildkit host - not for billing. The reason this comment used to
+    # give, carried over from onvo's ci.yml ("the org's Actions spend is
+    # blocked, so every GitHub-hosted job fails in ~2s"), is true of the
+    # private `onvo` repository and not of this one: harborbox is public, so
+    # it gets free standard runners that no spending limit touches. Measured
+    # 2026-08-25, a `ubuntu-latest` job here starts and succeeds in ~20s.
+    # ci-freshness.yml depends on that, deliberately - see DEV-1971.
     runs-on: [self-hosted, onvo-ci]
     permissions:
       contents: read
