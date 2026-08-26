@@ -278,22 +278,33 @@ jobs:
       # OpenSandbox entirely" -- see the xfail on that test for what is
       # still unresolved. `docker ps -a` lists every container on the
       # runner, including already-exited ones, which is what made that
-      # absence itself the evidence; anything not matching this compose
-      # project's three named services would be a sandbox container
-      # opensandbox spawned, named with its own OpenSandbox UUID (not the
-      # `harborbox-{sandbox.id}` form, which is the Docker-runtime backend's
-      # naming and is not what this job's HARBORBOX_RUNTIME_PROVIDER=opensandbox
-      # config uses). `--tail` bounds each container's output so one stuck
-      # or noisy sandbox cannot flood the job log, for whenever one is
-      # actually still present to inspect.
+      # absence itself the evidence.
+      #
+      # Selecting the sandboxes out of that list is done on the
+      # `harborbox.sandbox_id` label, which `opensandbox_runtime.py` puts in
+      # every sandbox's metadata. This step used to subtract this compose
+      # project's three service names instead and call the remainder
+      # "sandboxes", which is only true on a runner that runs nothing else.
+      # The runner is build-server, which also hosts `coolify-proxy`,
+      # `coolify-sentinel` and `buildx_buildkit_trigger0`; all three matched,
+      # so a failing run dumped 500 lines of Traefik access log into the job
+      # output and labelled it sandbox evidence. The label makes no assumption
+      # about the host.
+      #
+      # Names are still printed rather than matched on: a sandbox is named with
+      # its own OpenSandbox UUID (not the `harborbox-{sandbox.id}` form, which
+      # is the Docker-runtime backend's naming and is not what this job's
+      # HARBORBOX_RUNTIME_PROVIDER=opensandbox config uses), so the name says
+      # nothing about who created it. `--tail` bounds each container's output
+      # so one stuck or noisy sandbox cannot flood the job log.
       - name: Sandbox container logs on failure
         if: failure()
         run: |
           set -uo pipefail
           echo "All containers on the runner:"
           docker ps -a --format '{{.Names}}\t{{.Status}}\t{{.Image}}'
-          sandbox_containers=$(docker ps -a --format '{{.Names}}' \
-            | grep -Ev '^harborbox-(postgres|opensandbox|api)-[0-9]+$' || true)
+          sandbox_containers=$(docker ps -a --filter label=harborbox.sandbox_id \
+            --format '{{.Names}}')
           if [ -z "$sandbox_containers" ]; then
             echo "No sandbox containers found on the runner."
             exit 0
@@ -308,6 +319,44 @@ jobs:
       - name: Tear down
         if: always()
         run: |
+          # Before the `down`s, and it has to be its own step of the script:
+          # `docker compose down` removes the services this project declares,
+          # and a sandbox is not one of them. Sandboxes are spawned by the
+          # opensandbox server straight against the host Docker socket that
+          # compose.yaml mounts into it, so they belong to no compose project
+          # and no `down` -- of either project, with any flags -- can reach
+          # them.
+          #
+          # They also carry `opensandbox.io/manual-cleanup=true`, so
+          # opensandbox's own reaper leaves them alone: killing one is the
+          # creating test's job, in `finally: sandbox.kill()`. That covers
+          # every green run and nothing else. A test that dies before its
+          # `finally`, or a cancelled job, strands the container -- and it then
+          # survives every later run too, because until now nothing here ever
+          # looked for one.
+          #
+          # Two did exactly that on 2026-08-25 and were still running 23 hours
+          # later on a box at 87% disk. Slow enough that nobody notices, and
+          # permanent, which is the combination worth a step of its own.
+          #
+          # `--filter label=` rather than a name prefix: sandbox names are bare
+          # OpenSandbox UUIDs and say nothing about who created them, while
+          # this label is set by opensandbox_runtime.py on everything harborbox
+          # creates and on nothing else.
+          #
+          # This does not distinguish *this* job's sandboxes from a sibling
+          # runner's. Neither does the `docker compose down -v` below, which
+          # would already tear down a concurrent e2e job's stack: both projects
+          # are fixed-name and this box runs three runners. So the reap is no
+          # wider than the teardown it joins, and narrowing it would mean
+          # giving both a per-run identity, which is a bigger change than the
+          # leak justifies.
+          #
+          # `xargs -r` so the empty case -- every passing run -- is a no-op
+          # rather than a `docker rm` with no arguments, which exits non-zero
+          # and would turn a green job's teardown red.
+          docker ps -aq --filter label=harborbox.sandbox_id \
+            | xargs -r docker rm -f
           docker compose down -v
           docker compose -f compose.builder.yaml -f compose.builder.local.yaml down -v
           # Same reason as the reclaim step: leave the workspace in a state the
