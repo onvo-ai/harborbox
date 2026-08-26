@@ -742,3 +742,67 @@ def test_local_development_does_not_export_to_the_estate(local_compose: dict) ->
         f"{LOCAL_COMPOSE.name} would export under {SERVICE_NAME!r} if anyone "
         f"set an endpoint, which is exactly the collision DEV-1824 cost a week."
     )
+
+
+# Linux's default ephemeral range, and the one both harborbox hosts actually
+# run (`/proc/sys/net/ipv4/ip_local_port_range` reads `32768 60999` on
+# build-server and on infrastructure). The kernel draws from this range for
+# every outbound connection and every bind to port 0.
+EPHEMERAL_PORT_RANGE = (32768, 60999)
+
+# Ports below this need CAP_NET_BIND_SERVICE to bind.
+FIRST_UNPRIVILEGED_PORT = 1024
+
+SANDBOX_PORT_RANGE = re.compile(
+    r"port_range_min\s*=\s*(\d+)\s*\n\s*port_range_max\s*=\s*(\d+)"
+)
+
+
+@pytest.mark.parametrize("path", [COMPOSE, LOCAL_COMPOSE])
+def test_sandbox_ports_do_not_overlap_the_kernel_ephemeral_range(path: Path) -> None:
+    """A published sandbox port must be one the kernel will never hand out.
+
+    OpenSandbox publishes each sandbox on a host port drawn from
+    `[port_range_min, port_range_max]`, and it *remembers* the port: resuming a
+    cold-paused sandbox asks for the same one back. Between the pause and the
+    resume the container is gone and the port is free, so anything may take it.
+
+    While these ranges sat inside the kernel's ephemeral range, "anything"
+    included every outbound socket on the box -- a `pip install`, a
+    `docker pull`, another runner's git fetch. On 2026-08-26 a resume lost that
+    race on a CI host with 80 ephemeral sockets open:
+
+        failed to bind host port 0.0.0.0:51068/tcp: address already in use
+        FAILED tests/e2e_pause_ladder.py::test_a_cold_pause_preserves_the_filesystem
+
+    51068 was inside 40000-60000 (this file's old range) and inside
+    32768-60999 (the kernel's). Nothing had leaked and nothing was misbehaving;
+    two allocators were simply dealing from the same deck.
+
+    The deployed stack had the same overlap with a narrower range, so this was
+    never CI-only -- a production resume could fail the same way and surface as
+    a 503 `SANDBOX_START_FAILED`.
+
+    Staying below 32768 is what makes the sandbox range exclusively
+    OpenSandbox's to allocate. Explicit binds there still work; the kernel just
+    never chooses them on its own.
+    """
+    text = path.read_text(encoding="utf-8")
+    match = SANDBOX_PORT_RANGE.search(text)
+    assert match is not None, f"{path.name} declares no sandbox port range"
+
+    low, high = int(match.group(1)), int(match.group(2))
+    ephemeral_low, ephemeral_high = EPHEMERAL_PORT_RANGE
+
+    assert low <= high, f"{path.name} has an inverted port range: {low}-{high}"
+    assert high < ephemeral_low, (
+        f"{path.name} publishes sandboxes on {low}-{high}, which overlaps the "
+        f"kernel's ephemeral range {ephemeral_low}-{ephemeral_high}. A resumed "
+        f"sandbox will intermittently fail to bind its own port because an "
+        f"unrelated outbound connection took it. Keep the range below "
+        f"{ephemeral_low}."
+    )
+    assert low >= FIRST_UNPRIVILEGED_PORT, (
+        f"{path.name} publishes sandboxes from {low}, inside the privileged "
+        f"port range."
+    )
