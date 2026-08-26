@@ -132,8 +132,23 @@ configs:
       [docker]
       network_mode = "bridge"
       host_ip = "host.docker.internal"
-      port_range_min = 40000
-      port_range_max = 45000
+      # Below 32768, and that is the whole point: the kernel's ephemeral range
+      # on both harborbox hosts is 32768-60999, and it draws from that range
+      # for every outbound connection and every bind to port 0.
+      #
+      # OpenSandbox remembers the host port it published a sandbox on and asks
+      # for the same one back when resuming a cold-paused sandbox. Between the
+      # pause and the resume the container is gone and the port is free, so
+      # while this range sat at 40000-45000 -- inside the ephemeral range --
+      # any unrelated outbound socket could take it first and the resume died
+      # on `address already in use`, surfacing as a 503 SANDBOX_START_FAILED.
+      # Nothing leaks; two allocators just deal from the same deck.
+      #
+      # Same width as before (5001 ports). Explicit binds below 32768 work
+      # exactly as they did -- the kernel simply never picks them on its own.
+      # tests/test_compose_deployment.py pins the non-overlap.
+      port_range_min = 20000
+      port_range_max = 25000
       drop_capabilities = ["AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG"]
       no_new_privileges = true
       pids_limit = 4096
