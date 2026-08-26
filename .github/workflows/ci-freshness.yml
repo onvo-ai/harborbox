@@ -37,9 +37,14 @@ jobs:
     # `ubuntu-latest` job on this repo starts and succeeds in about 20s.
     runs-on: ubuntu-latest
     permissions:
-      # actions:read for the workflow-run history, issues:write for the alarm.
+      # actions:read for the workflow-run history, contents:read for the head
+      # commit dates, pull-requests:read for the open PR heads, issues:write
+      # for the alarm. Without pull-requests:read the third check silently
+      # judges nothing, which is the failure mode this whole file exists to
+      # avoid - so tests/test_ci_freshness.py pins it.
       actions: read
       contents: read
+      pull-requests: read
       issues: write
 
     steps:
