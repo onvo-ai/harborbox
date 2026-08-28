@@ -25,9 +25,9 @@ jobs:
     # with_for_update(skip_locked=True). SQLite cannot execute either, so its
     # tests need the real thing rather than a fake session.
     #
-    # No test uses this service or HARBORBOX_TEST_DATABASE_URL yet - both
-    # arrive with the coverage branch (postgres_pool_store.py coverage). Not
-    # dead configuration, just not wired up yet.
+    # tests/test_postgres_pool_store.py reads HARBORBOX_TEST_DATABASE_URL and
+    # skips without it, so this service is what keeps the `postgres` marker's
+    # tests -- and the coverage floors below -- honest.
     services:
       postgres:
         image: postgres:17-alpine
@@ -84,17 +84,34 @@ jobs:
       - name: Typecheck
         run: uv run mypy
 
-      # Tests are a blocking gate: a failing test fails this job. Coverage is
-      # measured and reported (see the PR comment) but not yet enforced -
-      # `[tool.coverage.report]` in pyproject.toml sets no fail_under, so the
-      # command can't fail on coverage regardless. `if: always()` keeps
-      # coverage measurement running even if Lint or Typecheck failed above,
-      # so the PR comment still has numbers to show.
+      # Tests are a blocking gate: a failing test fails this job. `if: always()`
+      # keeps coverage measurement running even if Lint or Typecheck failed
+      # above, so the PR comment still has numbers to show.
       - name: Tests and coverage
         if: always()
         run: >-
           uv run pytest --cov --cov-report=json --cov-report=term-missing
           --json-report --json-report-file=unit-results.json
+
+      # The ratchet. Two floors, and neither may be lowered to get a PR green -
+      # a coverage failure means the change needs tests, not a smaller number.
+      #
+      # They live here rather than in `[tool.coverage.report] fail_under`
+      # because they are only meaningful next to the postgres service above:
+      # test_postgres_pool_store.py skips without HARBORBOX_TEST_DATABASE_URL,
+      # and its 196 statements are ~6 points of the repo total. A fail_under in
+      # pyproject.toml would fail every laptop run that has no database.
+      #
+      # The per-file floor is the house pattern (see the `test-coverage` skill):
+      # a module that reached 100% is pinned there, so the next change to it
+      # arrives with its tests. Raise the repo floor whenever a climb lifts it;
+      # add a new --include line whenever a module reaches 100%.
+      - name: Coverage floors
+        if: always()
+        run: |
+          uv run coverage report --fail-under=68
+          uv run coverage report --fail-under=100 \
+            --include='src/harborbox/postgres_pool_store.py'
 
       # The backlog behind the ignore list, printed on every run rather than
       # discovered by someone going looking. Expected to be non-zero: it is the
