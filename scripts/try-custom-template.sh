@@ -3,9 +3,9 @@
 # End-to-end proof that a caller-supplied Dockerfile becomes a running sandbox.
 #
 # Builds an image from a Dockerfile this script writes -- installing a package
-# that is deliberately NOT on HARBORBOX_TEMPLATE_APT_ALLOWLIST, and COPYing a
-# file from an uploaded build context -- then runs a command inside a sandbox
-# created from it and checks both arrived.
+# no allowlist would ever have carried, since there is no package allowlist any
+# more, and COPYing a file from an uploaded build context -- then runs a command
+# inside a sandbox created from it and checks both arrived.
 #
 # Requires a running stack with:
 #   HARBORBOX_TEMPLATE_RAW_DOCKERFILE_ENABLED=true
