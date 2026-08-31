@@ -1,0 +1,40 @@
+# Publishes site/index.html -- the illustrated architecture walkthrough linked
+# from the README -- to GitHub Pages.
+#
+# The page is a single self-contained HTML file: no build step, no Jekyll, no
+# dependencies beyond Google Fonts. `upload-pages-artifact` takes the directory
+# as-is, so adding a file to site/ is all it takes to add a page.
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never cancel a deploy midway; queue the next one behind it instead.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4

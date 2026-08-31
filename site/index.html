@@ -1,0 +1,1487 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="How Harborbox schedules sandboxes: the lifecycle state machine, the admission controller, the concurrency limits that actually bind, and what a Kubernetes deployment would take.">
+<meta property="og:title" content="Harborbox Control Plane">
+<meta property="og:description" content="How Harborbox schedules sandboxes: the lifecycle state machine, the admission controller, the concurrency limits that actually bind, and what a Kubernetes deployment would take.">
+<meta property="og:type" content="article">
+<meta name="color-scheme" content="light dark">
+<title>Harborbox Control Plane</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap">
+
+<style>
+  :root {
+    --ground:        #E6EBEC;
+    --surface:       #FAFCFC;
+    --surface-sunk:  #DFE6E8;
+    --ink:           #0F1E24;
+    --ink-soft:      #33474F;
+    --muted:         #5F757D;
+    --line:          #C2D0D4;
+    --line-soft:     #D6E0E2;
+    --signal:        #A06A00;
+    --signal-flat:   #C98A0E;
+    --ok:            #2C7355;
+    --block:         #A8412A;
+    --frozen:        #2F5F8C;
+    --cold:          #61757D;
+    --shadow:        0 1px 0 rgba(15,30,36,.05), 0 8px 24px -18px rgba(15,30,36,.5);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:        #0B161B;
+      --surface:       #11222A;
+      --surface-sunk:  #0D1C22;
+      --ink:           #DEE9EC;
+      --ink-soft:      #B4C7CD;
+      --muted:         #849BA3;
+      --line:          #244049;
+      --line-soft:     #1B333B;
+      --signal:        #F0B429;
+      --signal-flat:   #F0B429;
+      --ok:            #57C08D;
+      --block:         #E2836A;
+      --frozen:        #78ADDD;
+      --cold:          #7C939B;
+      --shadow:        0 1px 0 rgba(0,0,0,.3), 0 10px 30px -20px #000;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground:        #0B161B;
+    --surface:       #11222A;
+    --surface-sunk:  #0D1C22;
+    --ink:           #DEE9EC;
+    --ink-soft:      #B4C7CD;
+    --muted:         #849BA3;
+    --line:          #244049;
+    --line-soft:     #1B333B;
+    --signal:        #F0B429;
+    --signal-flat:   #F0B429;
+    --ok:            #57C08D;
+    --block:         #E2836A;
+    --frozen:        #78ADDD;
+    --cold:          #7C939B;
+    --shadow:        0 1px 0 rgba(0,0,0,.3), 0 10px 30px -20px #000;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: "Source Serif 4", Georgia, "Times New Roman", serif;
+    font-size: 17px;
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 28px 120px; }
+  .col  { max-width: 660px; }
+
+  /* ---------- type ---------- */
+
+  h1, h2, h3, .eyebrow, .mono, code, kbd, button, input, select, table, .panel-title {
+    font-family: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  }
+
+  .mono, code, kbd, .num {
+    font-family: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  }
+
+  h1 {
+    font-size: clamp(2.6rem, 6vw, 4.1rem);
+    line-height: .96;
+    letter-spacing: -.035em;
+    font-weight: 700;
+    margin: 0;
+    text-wrap: balance;
+  }
+
+  h2 {
+    font-size: 1.65rem;
+    letter-spacing: -.02em;
+    font-weight: 600;
+    line-height: 1.15;
+    margin: 0 0 .35em;
+    text-wrap: balance;
+  }
+
+  h3 {
+    font-size: 1.02rem;
+    letter-spacing: -.005em;
+    font-weight: 600;
+    margin: 0 0 .3em;
+  }
+
+  .eyebrow {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: .715rem;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    color: var(--muted);
+    font-weight: 500;
+  }
+
+  p { margin: 0 0 1.05em; }
+  .col > p, .col > ul, .col > ol { max-width: 66ch; }
+
+  a { color: var(--ink); text-decoration-color: var(--signal); text-underline-offset: 3px; }
+  a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible {
+    outline: 2px solid var(--signal); outline-offset: 3px;
+  }
+
+  code {
+    font-size: .855em;
+    background: var(--surface-sunk);
+    border: 1px solid var(--line-soft);
+    border-radius: 3px;
+    padding: .06em .34em;
+    color: var(--ink-soft);
+  }
+
+  strong { font-weight: 600; }
+
+  ul, ol { padding-left: 1.15em; margin: 0 0 1.05em; }
+  li { margin-bottom: .45em; }
+
+  /* ---------- masthead ---------- */
+
+  header.mast {
+    border-bottom: 1px solid var(--line);
+    background: var(--surface);
+    padding: 54px 0 40px;
+    margin-bottom: 56px;
+  }
+
+  .mast-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 26px;
+  }
+
+  @media (min-width: 880px) {
+    .mast-grid { grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); align-items: end; gap: 48px; }
+  }
+
+  .lede {
+    font-size: 1.13rem;
+    color: var(--ink-soft);
+    margin: 18px 0 0;
+    max-width: 46ch;
+  }
+
+  .chain {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 0;
+    align-items: center;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: .74rem;
+    letter-spacing: .01em;
+  }
+  .chain span {
+    border: 1px solid var(--line);
+    border-radius: 2px;
+    padding: 5px 9px;
+    background: var(--ground);
+    white-space: nowrap;
+  }
+  .chain span.hb { border-color: var(--signal); color: var(--signal); font-weight: 600; }
+  .chain i { color: var(--muted); font-style: normal; padding: 0 7px; }
+
+  /* ---------- sections ---------- */
+
+  section { margin-bottom: 76px; scroll-margin-top: 20px; }
+
+  .sec-head {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    border-top: 1px solid var(--line);
+    padding-top: 14px;
+    margin-bottom: 22px;
+  }
+  .sec-head .eyebrow { flex: none; }
+
+  /* ---------- panels ---------- */
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    box-shadow: var(--shadow);
+    margin: 30px 0;
+    overflow: hidden;
+  }
+
+  .panel-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+    justify-content: space-between;
+    padding: 11px 16px;
+    border-bottom: 1px solid var(--line-soft);
+    background: var(--surface-sunk);
+  }
+
+  .panel-title {
+    font-size: .78rem;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    font-weight: 600;
+    color: var(--ink-soft);
+  }
+
+  .panel-body { padding: 20px 16px; }
+
+  .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+  button {
+    font-size: .78rem;
+    font-weight: 600;
+    letter-spacing: .01em;
+    padding: 6px 13px;
+    border-radius: 3px;
+    border: 1px solid var(--line);
+    background: var(--surface);
+    color: var(--ink);
+    cursor: pointer;
+    transition: border-color .15s, color .15s, background .15s;
+  }
+  button:hover { border-color: var(--signal); color: var(--signal); }
+  button.primary { background: var(--signal); border-color: var(--signal); color: var(--surface); }
+  button.primary:hover { filter: brightness(1.08); color: var(--surface); }
+  button[disabled] { opacity: .4; cursor: default; }
+  button[disabled]:hover { border-color: var(--line); color: var(--ink); }
+
+  .stepcount {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: .72rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ---------- lifecycle svg ---------- */
+
+  .figscroll { overflow-x: auto; }
+  svg.diagram { display: block; width: 100%; min-width: 660px; height: auto; color: var(--ink); }
+
+  .nodebox { fill: var(--surface); stroke: var(--line); stroke-width: 1.4; }
+  .nodelabel { font-family: "IBM Plex Mono", monospace; font-size: 13px; fill: var(--ink); font-weight: 500; }
+  .nodesub  { font-family: "IBM Plex Mono", monospace; font-size: 10px; fill: var(--muted); }
+  .edge { stroke: var(--line); stroke-width: 1.4; fill: none; }
+  .edgelabel { font-family: "IBM Plex Mono", monospace; font-size: 10.5px; fill: var(--muted); }
+  .edge.dash { stroke-dasharray: 4 3; }
+
+  g.state.on .nodebox { stroke: var(--signal); stroke-width: 2.4; fill: var(--surface); }
+  g.state.on .nodelabel { fill: var(--signal); font-weight: 600; }
+  g.state.on .nodesub { fill: var(--ink-soft); }
+  g.state .nodebox, g.state .nodelabel { transition: stroke .3s, fill .3s, stroke-width .3s; }
+
+  g.edge-g { transition: opacity .3s; opacity: .5; }
+  g.edge-g.lit { opacity: 1; }
+  g.edge-g.lit .edge { stroke: var(--signal); stroke-width: 2.2; }
+  g.edge-g.lit .edgelabel { fill: var(--signal); font-weight: 500; }
+
+  #token { transition: transform .55s cubic-bezier(.5,.05,.2,1); }
+  #token circle.core { fill: var(--signal); }
+  #token circle.halo { fill: var(--signal); opacity: .18; }
+  #token.pulse circle.halo { animation: halo 1.5s ease-out infinite; }
+  @keyframes halo { 0% { r: 11; opacity: .3 } 100% { r: 26; opacity: 0 } }
+
+  @media (prefers-reduced-motion: reduce) {
+    #token { transition: none; }
+    #token.pulse circle.halo { animation: none; }
+    .bar span, .berth { transition: none !important; }
+  }
+
+  /* ---------- readouts ---------- */
+
+  .readout {
+    display: grid;
+    gap: 14px;
+    grid-template-columns: minmax(0,1fr);
+    padding: 15px 16px;
+    border-top: 1px solid var(--line-soft);
+    background: var(--surface-sunk);
+  }
+  @media (min-width: 760px) { .readout { grid-template-columns: minmax(0,1.7fr) minmax(0,1fr); } }
+
+  .narr { font-size: .95rem; color: var(--ink-soft); margin: 0; min-height: 3.1em; }
+  .narr b { font-family: "IBM Plex Mono", monospace; font-size: .88em; font-weight: 600; color: var(--ink); }
+
+  .holds { display: flex; gap: 10px; flex-wrap: wrap; align-content: start; }
+  .hold {
+    flex: 1 1 96px;
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    padding: 7px 9px;
+    background: var(--surface);
+  }
+  .hold .k { font-family: "IBM Plex Mono", monospace; font-size: .64rem; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); display: block; }
+  .hold .v { font-family: "IBM Plex Mono", monospace; font-size: .96rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .hold.held .v { color: var(--signal); }
+  .hold.free .v { color: var(--muted); }
+
+  /* ---------- admission board ---------- */
+
+  .board { display: grid; gap: 20px; grid-template-columns: minmax(0,1fr); }
+  @media (min-width: 780px) { .board { grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); } }
+
+  .queue { display: flex; flex-direction: column; gap: 6px; }
+  .qrow {
+    display: grid;
+    grid-template-columns: 22px minmax(0,1fr) auto;
+    gap: 9px;
+    align-items: center;
+    border: 1px solid var(--line);
+    border-left-width: 3px;
+    border-radius: 3px;
+    padding: 7px 10px;
+    background: var(--surface);
+    font-family: "IBM Plex Mono", monospace;
+    font-size: .76rem;
+    transition: border-color .3s, background .3s, opacity .3s;
+  }
+  .qrow .idx { color: var(--muted); font-size: .68rem; }
+  .qrow .tag { font-size: .66rem; letter-spacing: .05em; text-transform: uppercase; font-weight: 600; }
+  .qrow.queued  { border-left-color: var(--line); }
+  .qrow.scan    { border-left-color: var(--signal); border-color: var(--signal); }
+  .qrow.admit   { border-left-color: var(--ok); background: color-mix(in srgb, var(--ok) 9%, var(--surface)); }
+  .qrow.admit .tag { color: var(--ok); }
+  .qrow.defer   { border-left-color: var(--block); }
+  .qrow.defer .tag { color: var(--block); }
+  .qrow.aged    { border-left-color: var(--block); border-color: var(--block); }
+  .qrow.aged .tag { color: var(--block); }
+  .qrow.gone    { opacity: .3; }
+
+  .gauges { display: flex; flex-direction: column; gap: 16px; }
+  .gauge .glabel {
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-family: "IBM Plex Mono", monospace; font-size: .7rem;
+    letter-spacing: .06em; text-transform: uppercase; color: var(--muted);
+    margin-bottom: 5px;
+  }
+  .gauge .gval { font-size: .85rem; color: var(--ink); font-variant-numeric: tabular-nums; text-transform: none; letter-spacing: 0; }
+  .bar {
+    height: 26px;
+    background: var(--surface-sunk);
+    border: 1px solid var(--line);
+    border-radius: 3px;
+    display: flex;
+    overflow: hidden;
+  }
+  .bar span { display: block; height: 100%; transition: width .45s ease; }
+  .bar .warm { background: repeating-linear-gradient(45deg, var(--cold), var(--cold) 3px, transparent 3px, transparent 6px); }
+  .bar .used { background: var(--signal); }
+  .bar .pend { background: color-mix(in srgb, var(--signal) 35%, transparent); }
+
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; font-family: "IBM Plex Mono", monospace; font-size: .67rem; color: var(--muted); }
+  .legend i { display: inline-block; width: 11px; height: 11px; border-radius: 2px; vertical-align: -1px; margin-right: 5px; }
+
+  /* ---------- calculator ---------- */
+
+  .calc { display: grid; gap: 22px; grid-template-columns: minmax(0,1fr); }
+  @media (min-width: 800px) { .calc { grid-template-columns: minmax(0,300px) minmax(0,1fr); } }
+
+  .fields { display: flex; flex-direction: column; gap: 15px; }
+  .field label {
+    display: flex; justify-content: space-between; align-items: baseline;
+    font-family: "IBM Plex Mono", monospace; font-size: .7rem;
+    letter-spacing: .04em; color: var(--muted); margin-bottom: 4px;
+  }
+  .field label b { color: var(--ink); font-weight: 600; font-size: .84rem; font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 100%; accent-color: var(--signal); }
+
+  .verdict {
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 18px;
+    background: var(--surface-sunk);
+    display: flex; flex-direction: column; gap: 14px;
+  }
+  .bignum { display: flex; align-items: baseline; gap: 12px; }
+  .bignum .n {
+    font-family: "Archivo", sans-serif; font-weight: 700;
+    font-size: 3.6rem; line-height: .85; letter-spacing: -.04em;
+    color: var(--signal); font-variant-numeric: tabular-nums;
+  }
+  .bignum .t { font-size: .95rem; color: var(--ink-soft); max-width: 24ch; }
+
+  .berths { display: flex; flex-wrap: wrap; gap: 5px; }
+  .berth {
+    width: 30px; height: 30px; border-radius: 3px;
+    border: 1px solid var(--line);
+    background: var(--surface);
+    transition: background .25s, border-color .25s;
+  }
+  .berth.run { background: var(--signal); border-color: var(--signal); }
+  .berth.warm { background: repeating-linear-gradient(45deg, var(--cold), var(--cold) 3px, transparent 3px, transparent 6px); border-color: var(--cold); }
+
+  .math {
+    font-family: "IBM Plex Mono", monospace;
+    font-size: .74rem;
+    line-height: 1.75;
+    color: var(--ink-soft);
+    background: var(--surface);
+    border: 1px solid var(--line-soft);
+    border-radius: 3px;
+    padding: 11px 13px;
+    overflow-x: auto;
+    white-space: pre;
+  }
+  .math .bind { color: var(--block); font-weight: 600; }
+  .math .slack { color: var(--muted); }
+
+  /* ---------- tables ---------- */
+
+  .tablescroll { overflow-x: auto; margin: 26px 0; border: 1px solid var(--line); border-radius: 4px; background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: .8rem; min-width: 620px; }
+  th, td { text-align: left; padding: 9px 13px; border-bottom: 1px solid var(--line-soft); vertical-align: top; }
+  th {
+    font-size: .67rem; letter-spacing: .11em; text-transform: uppercase;
+    color: var(--muted); font-weight: 600; background: var(--surface-sunk);
+    position: sticky; top: 0;
+  }
+  tr:last-child td { border-bottom: 0; }
+  td.k { font-family: "IBM Plex Mono", monospace; font-size: .75rem; color: var(--ink); white-space: nowrap; }
+  td.v { font-family: "IBM Plex Mono", monospace; font-size: .78rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.d { font-family: "Source Serif 4", serif; font-size: .88rem; color: var(--ink-soft); min-width: 240px; }
+
+  /* ---------- callouts ---------- */
+
+  .note {
+    border-left: 3px solid var(--signal);
+    background: var(--surface);
+    border-top: 1px solid var(--line-soft);
+    border-right: 1px solid var(--line-soft);
+    border-bottom: 1px solid var(--line-soft);
+    border-radius: 0 4px 4px 0;
+    padding: 15px 18px;
+    margin: 26px 0;
+  }
+  .note p:last-child { margin-bottom: 0; }
+  .note .eyebrow { display: block; margin-bottom: 7px; }
+
+  .verdicts { display: grid; gap: 12px; margin: 26px 0; }
+  .vrow {
+    display: grid; grid-template-columns: 84px minmax(0,1fr); gap: 16px;
+    border: 1px solid var(--line); border-radius: 4px;
+    background: var(--surface); padding: 13px 16px; align-items: start;
+  }
+  .vrow .stamp {
+    font-family: "IBM Plex Mono", monospace; font-size: .64rem;
+    letter-spacing: .1em; text-transform: uppercase; font-weight: 600;
+    padding-top: 3px;
+  }
+  .vrow.yes .stamp { color: var(--ok); }
+  .vrow.no .stamp  { color: var(--block); }
+  .vrow.part .stamp { color: var(--signal); }
+  .vrow p { margin: 0; font-size: .93rem; }
+  .vrow h3 { font-size: .95rem; }
+
+  figure { margin: 26px 0; }
+  figcaption {
+    font-family: "IBM Plex Mono", monospace; font-size: .7rem;
+    color: var(--muted); margin-top: 10px; line-height: 1.55; max-width: 68ch;
+  }
+
+  footer {
+    border-top: 1px solid var(--line);
+    padding-top: 20px; margin-top: 40px;
+    font-family: "IBM Plex Mono", monospace; font-size: .7rem; color: var(--muted);
+  }
+</style>
+
+<style>
+  /* standalone-only: the published page has no host to inherit a theme from */
+  #themetoggle {
+    position: fixed; top: 14px; right: 14px; z-index: 20;
+    font-family: "IBM Plex Mono", monospace; font-size: .68rem;
+    letter-spacing: .08em; text-transform: uppercase;
+    padding: 7px 11px; border-radius: 3px;
+    border: 1px solid var(--line); background: var(--surface); color: var(--muted);
+    cursor: pointer;
+  }
+  #themetoggle:hover { border-color: var(--signal); color: var(--signal); }
+  img, svg { max-width: 100%; }
+  @media (max-width: 620px) { #themetoggle { top: 8px; right: 8px; } }
+</style>
+</head>
+<body>
+<button id="themetoggle" type="button" aria-label="Switch between light and dark theme">theme</button>
+<header class="mast">
+  <div class="wrap">
+    <div class="mast-grid">
+      <div>
+        <p class="eyebrow" style="margin:0 0 14px">Control plane &#xB7; admission &#xB7; lifecycle</p>
+        <h1>Harborbox</h1>
+        <p class="lede">A durable queue and an admission controller in front of OpenSandbox. It decides <em>whether</em> a sandbox may run and <em>when</em>. OpenSandbox decides what a sandbox <em>is</em>.</p>
+      </div>
+      <div>
+        <p class="eyebrow" style="margin:0 0 10px">The whole chain</p>
+        <div class="chain">
+          <span>client</span><i>&#x2192;</i><span class="hb">Harborbox API</span><i>&#x2192;</i><span class="hb">Postgres queue</span><i>&#x2192;</i><span class="hb">scheduler</span><i>&#x2192;</i><span>OpenSandbox</span><i>&#x2192;</i><span>runtime</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <!-- ===================== 1. SHAPE ===================== -->
+  <section id="shape">
+    <div class="sec-head"><span class="eyebrow">01</span><h2>What the thing actually is</h2></div>
+    <div class="col">
+      <p>Harborbox is not a container runtime. It owns four things and delegates everything else: a PostgreSQL execution queue, an aggregate memory and CPU budget for the host, a scheduling policy, and a product-facing lifecycle API. Container creation, commands, files, snapshots and isolation belong to upstream OpenSandbox.</p>
+      <p>The split matters because it explains every design decision below. Harborbox never touches Docker. It writes rows, decides who goes next, and makes HTTP calls to OpenSandbox. That is the whole job.</p>
+    </div>
+
+    <figure>
+      <div class="panel">
+        <div class="panel-bar"><span class="panel-title">Components and what crosses between them</span></div>
+        <div class="panel-body figscroll">
+          <svg class="diagram" viewBox="0 0 940 470" role="img" aria-label="Harborbox architecture: the API and scheduler share one PostgreSQL database, the scheduler calls OpenSandbox over HTTP, OpenSandbox holds the Docker socket, and a separately deployed rootless BuildKit builder pushes template images to a registry OpenSandbox pulls from.">
+            <defs>
+              <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+              </marker>
+              <marker id="ars" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--signal)"/>
+              </marker>
+            </defs>
+
+            <!-- trust boundary -->
+            <rect x="26" y="38" width="452" height="270" rx="5" fill="none" stroke="var(--line)" stroke-dasharray="5 4"/>
+            <text class="nodesub" x="38" y="58">harborbox control plane &#x2014; no docker socket</text>
+
+            <!-- client -->
+            <rect class="nodebox" x="42" y="86" width="120" height="44" rx="3"/>
+            <text class="nodelabel" x="102" y="113" text-anchor="middle">client / SDK</text>
+
+            <!-- api -->
+            <rect class="nodebox" x="42" y="184" width="120" height="52" rx="3"/>
+            <text class="nodelabel" x="102" y="207" text-anchor="middle">FastAPI</text>
+            <text class="nodesub"   x="102" y="223" text-anchor="middle">api.py</text>
+
+            <!-- postgres -->
+            <rect class="nodebox" x="228" y="140" width="140" height="96" rx="3" stroke="var(--signal)" stroke-width="2"/>
+            <text class="nodelabel" x="298" y="164" text-anchor="middle" fill="var(--signal)">PostgreSQL</text>
+            <text class="nodesub"   x="298" y="181" text-anchor="middle">execution queue</text>
+            <text class="nodesub"   x="298" y="196" text-anchor="middle">warm-pool leases</text>
+            <text class="nodesub"   x="298" y="211" text-anchor="middle">template registry</text>
+            <text class="nodesub"   x="298" y="226" text-anchor="middle">LISTEN / NOTIFY</text>
+
+            <!-- scheduler -->
+            <rect class="nodebox" x="42" y="256" width="120" height="40" rx="3"/>
+            <text class="nodelabel" x="102" y="281" text-anchor="middle">scheduler</text>
+
+            <!-- opensandbox -->
+            <rect class="nodebox" x="546" y="150" width="150" height="76" rx="3"/>
+            <text class="nodelabel" x="621" y="176" text-anchor="middle">OpenSandbox</text>
+            <text class="nodesub"   x="621" y="193" text-anchor="middle">server v0.2.2</text>
+            <text class="nodesub"   x="621" y="209" text-anchor="middle">holds docker.sock</text>
+
+            <!-- containers -->
+            <rect class="nodebox" x="770" y="128" width="132" height="34" rx="3"/>
+            <text class="nodelabel" x="836" y="150" text-anchor="middle">sandbox</text>
+            <rect class="nodebox" x="770" y="172" width="132" height="34" rx="3"/>
+            <text class="nodelabel" x="836" y="194" text-anchor="middle">sandbox</text>
+            <rect class="nodebox" x="770" y="216" width="132" height="34" rx="3"/>
+            <text class="nodelabel" x="836" y="238" text-anchor="middle">sandbox</text>
+
+            <!-- builder project -->
+            <rect x="516" y="316" width="392" height="126" rx="5" fill="none" stroke="var(--line)" stroke-dasharray="5 4"/>
+            <text class="nodesub" x="528" y="336">separate compose project &#x2014; a caller's RUN lives here</text>
+
+            <rect class="nodebox" x="536" y="352" width="150" height="46" rx="3"/>
+            <text class="nodelabel" x="611" y="374" text-anchor="middle">rootless BuildKit</text>
+            <text class="nodesub"   x="611" y="389" text-anchor="middle">no docker socket</text>
+
+            <rect class="nodebox" x="742" y="352" width="146" height="46" rx="3"/>
+            <text class="nodelabel" x="815" y="374" text-anchor="middle">registry</text>
+            <text class="nodesub"   x="815" y="389" text-anchor="middle">127.0.0.1:5050</text>
+
+            <!-- edges -->
+            <g class="edge-g lit">
+              <path class="edge" d="M 102 130 V 178" marker-end="url(#ar)"/>
+              <text class="edgelabel" x="110" y="158">HTTP + X-API-Key</text>
+            </g>
+            <g class="edge-g lit">
+              <path class="edge" d="M 162 198 H 222" marker-end="url(#ar)"/>
+              <text class="edgelabel" x="166" y="192">enqueue</text>
+            </g>
+            <g class="edge-g lit">
+              <path class="edge" d="M 228 222 H 168" marker-end="url(#ar)"/>
+              <text class="edgelabel" x="172" y="238">NOTIFY</text>
+            </g>
+            <g class="edge-g lit">
+              <path class="edge" d="M 162 276 H 200 V 214 H 222" marker-end="url(#ar)"/>
+              <text class="edgelabel" x="120" y="316">claim + reserve &#xB7; SELECT &#x2026; FOR UPDATE</text>
+            </g>
+            <g class="edge-g lit">
+              <path class="edge" d="M 162 268 H 420 V 188 H 540" marker-end="url(#ar)"/>
+              <text class="edgelabel" x="424" y="181">create &#xB7; exec &#xB7; pause &#xB7; kill</text>
+            </g>
+            <g class="edge-g lit">
+              <path class="edge" d="M 696 172 H 764" marker-end="url(#ar)"/>
+              <path class="edge" d="M 696 188 H 764" marker-end="url(#ar)"/>
+              <text class="edgelabel" x="700" y="216">docker</text>
+            </g>
+            <g class="edge-g lit">
+              <path class="edge" d="M 686 375 H 736" marker-end="url(#ar)"/>
+              <text class="edgelabel" x="676" y="366">push</text>
+            </g>
+            <g class="edge-g lit">
+              <path class="edge" d="M 815 352 V 262" marker-end="url(#ar)"/>
+              <text class="edgelabel" x="822" y="306">pull image</text>
+            </g>
+            <g class="edge-g lit">
+              <path class="edge dash" d="M 162 288 H 452 V 375 H 530" marker-end="url(#ar)"/>
+              <text class="edgelabel" x="360" y="368">build over mutual-TLS TCP</text>
+            </g>
+          </svg>
+        </div>
+      </div>
+      <figcaption>The dashed box on the left holds no Docker socket. That is the point: a leaked <code>HARBORBOX_API_KEY</code> buys you an image build, not host code execution. The builder is a separate Compose project because a BuildKit step runs inside buildkitd's own network namespace, so every network that container joins is one a caller's <code>RUN</code> can dial.</figcaption>
+    </figure>
+
+    <div class="col">
+      <h3>The two background loops</h3>
+      <p>Everything time-based happens in two <code>asyncio</code> loops inside the API process, both started in <code>Scheduler.start()</code>.</p>
+      <ul>
+        <li><strong>The admission loop</strong> scans the queue and admits what fits. It is woken by a Postgres <code>NOTIFY</code> on enqueue, not by a clock. The <code>scheduler_poll_seconds</code> interval (0.25 s) survives only as a fallback timeout, so a lost notification costs latency, never a stall.</li>
+        <li><strong>The reaper loop</strong> runs every 5 s and does three sweeps: kill expired sandboxes, walk idle ones down the pause ladder, and &#x2014; rate-limited to once an hour &#x2014; garbage-collect unused template images.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ===================== 2. LIFECYCLE ===================== -->
+  <section id="lifecycle">
+    <div class="sec-head"><span class="eyebrow">02</span><h2>A sandbox, cradle to grave</h2></div>
+    <div class="col">
+      <p>Press play. The highlighted box is the <code>status</code> column on the sandbox row; the two counters underneath are what that status <em>reserves</em> from the host budget. That second part is the whole trick &#x2014; a sandbox holds capacity in some states and not others, and the pause ladder exists to move it between them.</p>
+    </div>
+
+    <div class="panel">
+      <div class="panel-bar">
+        <span class="panel-title">Sandbox lifecycle</span>
+        <div class="controls">
+          <button id="lc-play" class="primary">Play</button>
+          <button id="lc-prev">Back</button>
+          <button id="lc-next">Step</button>
+          <button id="lc-reset">Reset</button>
+          <span class="stepcount" id="lc-count">1 / 11</span>
+        </div>
+      </div>
+      <div class="panel-body figscroll">
+        <svg class="diagram" id="lc-svg" viewBox="0 0 940 500" role="img" aria-label="Sandbox state machine: created goes to starting, starting to running, running down an idle ladder to paused_memory then paused_cold, back up through starting on the next call, and out to killed on delete or expiry. A warm pool feeds starting directly.">
+          <defs>
+            <marker id="lar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+            </marker>
+          </defs>
+
+          <!-- edges first, under the boxes -->
+          <g class="edge-g" data-edge="e-create">
+            <path class="edge" d="M 160 180 H 224" marker-end="url(#lar)"/>
+            <text class="edgelabel" x="192" y="170" text-anchor="middle">first call</text>
+          </g>
+          <g class="edge-g" data-edge="e-acquire">
+            <path class="edge dash" d="M 300 84 V 152" marker-end="url(#lar)"/>
+            <text class="edgelabel" x="310" y="124">acquire &#xB7; saves ~3 s</text>
+          </g>
+          <g class="edge-g" data-edge="e-ready">
+            <path class="edge" d="M 376 180 H 484" marker-end="url(#lar)"/>
+            <text class="edgelabel" x="430" y="170" text-anchor="middle">container answers</text>
+          </g>
+          <g class="edge-g" data-edge="e-kill">
+            <path class="edge" d="M 630 172 H 800 V 88" marker-end="url(#lar)"/>
+            <text class="edgelabel" x="638" y="164">DELETE &#xB7; expiry</text>
+          </g>
+          <g class="edge-g" data-edge="e-freeze">
+            <path class="edge" d="M 530 208 V 272" marker-end="url(#lar)"/>
+            <text class="edgelabel" x="518" y="244" text-anchor="end">idle 60 s &#xB7; freeze 65 ms</text>
+          </g>
+          <g class="edge-g" data-edge="e-unfreeze">
+            <path class="edge" d="M 590 272 V 208" marker-end="url(#lar)"/>
+            <text class="edgelabel" x="602" y="244">unfreeze 97 ms</text>
+          </g>
+          <g class="edge-g" data-edge="e-cool">
+            <path class="edge" d="M 530 328 V 392" marker-end="url(#lar)"/>
+            <text class="edgelabel" x="518" y="352" text-anchor="end">idle timeout &#xB7; thaw first,</text>
+            <text class="edgelabel" x="518" y="366" text-anchor="end">then snapshot 5.1 s</text>
+          </g>
+          <g class="edge-g" data-edge="e-direct">
+            <path class="edge dash" d="M 630 192 H 700 V 412 H 636" marker-end="url(#lar)"/>
+            <text class="edgelabel" x="708" y="308">straight to cold when</text>
+            <text class="edgelabel" x="708" y="322">the hot tier is full</text>
+          </g>
+          <g class="edge-g" data-edge="e-restore">
+            <path class="edge" d="M 484 412 H 300 V 208" marker-end="url(#lar)"/>
+            <text class="edgelabel" x="308" y="454">restore 465 ms &#xB7; a new container from the snapshot</text>
+          </g>
+
+          <!-- nodes -->
+          <g class="state" data-state="pooled">
+            <rect class="nodebox" x="230" y="38" width="140" height="46" rx="3"/>
+            <text class="nodelabel" x="300" y="60" text-anchor="middle">pooled</text>
+            <text class="nodesub"   x="300" y="76" text-anchor="middle">warm pool</text>
+          </g>
+          <g class="state" data-state="killed">
+            <rect class="nodebox" x="730" y="42" width="140" height="46" rx="3"/>
+            <text class="nodelabel" x="800" y="64" text-anchor="middle">killed</text>
+            <text class="nodesub"   x="800" y="80" text-anchor="middle">terminal</text>
+          </g>
+          <g class="state" data-state="created">
+            <rect class="nodebox" x="20" y="157" width="140" height="46" rx="3"/>
+            <text class="nodelabel" x="90" y="179" text-anchor="middle">created</text>
+            <text class="nodesub"   x="90" y="195" text-anchor="middle">a row, no container</text>
+          </g>
+          <g class="state" data-state="starting">
+            <rect class="nodebox" x="230" y="157" width="140" height="46" rx="3"/>
+            <text class="nodelabel" x="300" y="179" text-anchor="middle">starting</text>
+            <text class="nodesub"   x="300" y="195" text-anchor="middle">budget 120 s</text>
+          </g>
+          <g class="state" data-state="running">
+            <rect class="nodebox" x="490" y="157" width="140" height="46" rx="3"/>
+            <text class="nodelabel" x="560" y="179" text-anchor="middle">running</text>
+            <text class="nodesub"   x="560" y="195" text-anchor="middle">accepts commands</text>
+          </g>
+          <g class="state" data-state="paused_memory">
+            <rect class="nodebox" x="490" y="277" width="140" height="46" rx="3"/>
+            <text class="nodelabel" x="560" y="299" text-anchor="middle">paused_memory</text>
+            <text class="nodesub"   x="560" y="315" text-anchor="middle">frozen, processes live</text>
+          </g>
+          <g class="state" data-state="paused_cold">
+            <rect class="nodebox" x="490" y="389" width="140" height="46" rx="3"/>
+            <text class="nodelabel" x="560" y="411" text-anchor="middle">paused_cold</text>
+            <text class="nodesub"   x="560" y="427" text-anchor="middle">snapshot, files only</text>
+          </g>
+
+          <g id="token" class="pulse" style="transform: translate(20px, 180px)">
+            <circle class="halo" r="11"/>
+            <circle class="core" r="6.5"/>
+          </g>
+        </svg>
+      </div>
+      <div class="readout">
+        <p class="narr" id="lc-narr"></p>
+        <div class="holds">
+          <div class="hold" id="lc-mem"><span class="k">memory held</span><span class="v">&#x2014;</span></div>
+          <div class="hold" id="lc-cpu"><span class="k">cpu held</span><span class="v">&#x2014;</span></div>
+          <div class="hold" id="lc-cost"><span class="k">transition</span><span class="v">&#x2014;</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col">
+      <p>Two details in that animation are easy to miss and both are load-bearing.</p>
+      <p><strong>Reservation starts at <code>starting</code>, not at <code>running</code>.</strong> The moment admission says yes, the scheduler flips the row and the memory is counted as spent. It reserves the sandbox's entire hard limit, not its current usage &#x2014; a 1 GiB sandbox costs 1 GiB of budget whether it is running <code>numpy</code> or <code>sleep</code>.</p>
+      <p><strong>A frozen sandbox still holds all of its memory.</strong> <code>paused_memory</code> is in <code>RESERVED_SANDBOX_STATES</code>; only <code>paused_cold</code> gives the memory back. That is why the hot tier has its own separate cap, <code>HARBORBOX_HOT_PAUSE_BUDGET_MB</code> &#x2014; past it, idle sandboxes skip the freeze and go straight to snapshot.</p>
+    </div>
+
+    <div class="note">
+      <span class="eyebrow">Measured, not assumed</span>
+      <p>The timings in the animation come from <code>tests/e2e_pause_ladder.py</code> against a live stack at 256 MB / 0.5 CPU. Freezing costs 65 ms and snapshotting costs 5,075 ms &#x2014; so the pause side is where the hot tier overwhelmingly pays. On the resume side it buys about 370 ms (97 ms unfreeze against 465 ms restore), which is a real win but a much narrower one than "sub-second versus seconds" suggests. Set <code>HARBORBOX_HOT_PAUSE_IDLE_SECONDS=0</code> where memory is the binding constraint.</p>
+    </div>
+  </section>
+
+  <!-- ===================== 3. EXECUTION PATH ===================== -->
+  <section id="path">
+    <div class="sec-head"><span class="eyebrow">03</span><h2>What happens when you run a command</h2></div>
+    <div class="col">
+      <p>The API never runs anything. <code>POST /v1/sandboxes/{id}/commands</code> writes a queued row and returns. Everything after that is the scheduler.</p>
+    </div>
+
+    <figure>
+      <div class="panel">
+        <div class="panel-bar"><span class="panel-title">One command, end to end</span></div>
+        <div class="panel-body figscroll">
+          <svg class="diagram" viewBox="0 0 940 330" role="img" aria-label="Sequence of a command: the API writes a queued execution row and notifies Postgres, the scheduler wakes and admits it, ensures the sandbox is running behind a per-sandbox lock, calls OpenSandbox to execute, writes the result, and notifies again so a waiting client returns immediately.">
+            <defs>
+              <marker id="sar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+              </marker>
+            </defs>
+            <!-- lanes -->
+            <text class="nodesub" x="14" y="40" font-size="11">client</text>
+            <text class="nodesub" x="14" y="105" font-size="11">API</text>
+            <text class="nodesub" x="14" y="175" font-size="11">Postgres</text>
+            <text class="nodesub" x="14" y="245" font-size="11">scheduler</text>
+            <text class="nodesub" x="14" y="308" font-size="11">OpenSandbox</text>
+            <line class="edge" x1="86" y1="36"  x2="928" y2="36"  stroke-dasharray="2 4"/>
+            <line class="edge" x1="86" y1="101" x2="928" y2="101" stroke-dasharray="2 4"/>
+            <line class="edge" x1="86" y1="171" x2="928" y2="171" stroke-dasharray="2 4"/>
+            <line class="edge" x1="86" y1="241" x2="928" y2="241" stroke-dasharray="2 4"/>
+            <line class="edge" x1="86" y1="304" x2="928" y2="304" stroke-dasharray="2 4"/>
+
+            <g class="edge-g lit"><path class="edge" d="M 110 40 V 96" marker-end="url(#sar)"/><text class="edgelabel" x="118" y="72">1 POST /commands</text></g>
+            <g class="edge-g lit"><path class="edge" d="M 268 105 V 166" marker-end="url(#sar)"/><text class="edgelabel" x="276" y="140">2 INSERT status=queued</text></g>
+            <g class="edge-g lit"><path class="edge" d="M 402 175 V 236" marker-end="url(#sar)"/><text class="edgelabel" x="410" y="212">3 NOTIFY harborbox_queue</text></g>
+            <g class="edge-g lit"><path class="edge" d="M 520 236 V 178" marker-end="url(#sar)"/><text class="edgelabel" x="528" y="205">4 scan FOR UPDATE &#xB7; admit</text></g>
+            <g class="edge-g lit"><path class="edge" d="M 660 245 V 299" marker-end="url(#sar)"/><text class="edgelabel" x="668" y="276">5 start or resume &#xB7; per-sandbox lock</text></g>
+            <g class="edge-g lit"><path class="edge" d="M 762 299 V 250" marker-end="url(#sar)"/><text class="edgelabel" x="770" y="276">6 stdout / exit code</text></g>
+            <g class="edge-g lit"><path class="edge" d="M 830 236 V 178" marker-end="url(#sar)"/><text class="edgelabel" x="700" y="160">7 result + NOTIFY harborbox_execution</text></g>
+            <g class="edge-g lit"><path class="edge" d="M 900 166 V 46" marker-end="url(#sar)"/><text class="edgelabel" x="852" y="76" text-anchor="end">8 the held request returns 200</text></g>
+          </svg>
+        </div>
+      </div>
+      <figcaption>Step 8 is what <code>"wait": true</code> buys: the API holds the connection on a notification, not a poll, and answers 200 with the result instead of 202 with a job id. Run out of patience and it still answers 202, so the client just polls as before.</figcaption>
+    </figure>
+
+    <div class="col">
+      <p>Four separate poll loops used to sit between a caller and its result. On a warm sandbox running trivial code, those intervals were most of the observed latency &#x2014; the work itself was single-digit milliseconds. The <code>LISTEN</code>/<code>NOTIFY</code> pair replaced them. Nothing in it is load-bearing for correctness: every waiter still has a timeout, and every timeout degrades to exactly the polling behaviour it replaced.</p>
+    </div>
+  </section>
+
+  <!-- ===================== 4. CONCURRENCY ===================== -->
+  <section id="concurrency">
+    <div class="sec-head"><span class="eyebrow">04</span><h2>How concurrency works</h2></div>
+    <div class="col">
+      <p>There are three different concurrency questions in this system and they are governed by three different mechanisms. Keeping them apart is most of understanding the scheduler.</p>
+      <ol>
+        <li><strong>How many sandboxes may hold host resources</strong> &#x2014; the admission controller, on memory and CPU. This is the interesting one.</li>
+        <li><strong>How many executions may run inside one sandbox</strong> &#x2014; a flat count, <code>HARBORBOX_MAX_CONCURRENT_EXECUTIONS_PER_SANDBOX</code>. The container's own hard limits bound whatever they do.</li>
+        <li><strong>How many control-plane processes may exist</strong> &#x2014; exactly one, today. More on that in section 07.</li>
+      </ol>
+
+      <h3>The admission test</h3>
+      <p>Every queued execution is scanned in FIFO order. For each one, the scheduler asks what admitting it would <em>add</em> to the current reservations &#x2014; nothing at all if its sandbox is already running &#x2014; and applies three tests in order:</p>
+    </div>
+
+    <div class="panel">
+      <div class="panel-bar"><span class="panel-title">admission.py &#xB7; can_admit</span></div>
+      <div class="panel-body">
+        <div class="math">reserved_memory + requested_memory  &lt;=  sandbox_budget_mb        <span class="slack">&#x2192; else waiting_for: "memory"</span>
+host_available_memory - requested_memory  &gt;=  emergency_reserve  <span class="slack">&#x2192; else waiting_for: "memory"</span>
+reserved_cpu    + requested_cpu     &lt;=  max_parallel_cpu        <span class="slack">&#x2192; else waiting_for: "cpu"</span></div>
+      </div>
+    </div>
+
+    <div class="col">
+      <p>The second test is the emergency guard, and it is the only one that looks at the real machine rather than the ledger: it reads <code>MemAvailable</code> from <code>/proc/meminfo</code> live. Harborbox can stop its own queue from overcommitting, but it cannot stop unrelated processes from eating the host &#x2014; this is the check that notices when they have.</p>
+
+      <h3>FIFO, with backfilling, with aging</h3>
+      <p>A strict queue wastes capacity: a 4 GiB job at the head blocks a 256 MB job behind it even when 512 MB is free. A pure best-fit queue starves the big job forever. Harborbox does both, switching between them on a timer:</p>
+      <ul>
+        <li>Scan the queue in order. If a job does not fit, <strong>skip it and keep scanning</strong> &#x2014; that is the backfill, and it is what keeps small work moving.</li>
+        <li>Unless the job that did not fit is at the <em>head</em> of the queue <strong>and</strong> has waited longer than <code>HARBORBOX_QUEUE_AGING_SECONDS</code> (60 s). Then the scan stops dead. Nothing behind it is admitted until it goes.</li>
+      </ul>
+      <p>So the queue is opportunistic for the first minute of any job's wait and strictly first-come after that. One sweep looks at <code>scheduler_scan_limit</code> = 100 rows.</p>
+    </div>
+
+    <div class="panel">
+      <div class="panel-bar">
+        <span class="panel-title">Admission sweep &#xB7; FIFO, backfill, aging</span>
+        <div class="controls">
+          <button id="ad-play" class="primary">Play</button>
+          <button id="ad-next">Step</button>
+          <button id="ad-reset">Reset</button>
+          <span class="stepcount" id="ad-count">1 / 9</span>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="board">
+          <div>
+            <p class="eyebrow" style="margin:0 0 9px">queued executions &#x2014; oldest first</p>
+            <div class="queue" id="ad-queue"></div>
+          </div>
+          <div class="gauges">
+            <div class="gauge">
+              <div class="glabel"><span>sandbox memory budget</span><span class="gval" id="ad-memv">0 / 4096 MB</span></div>
+              <div class="bar"><span class="warm" id="ad-memwarm" style="width:0%"></span><span class="used" id="ad-memused" style="width:0%"></span></div>
+            </div>
+            <div class="gauge">
+              <div class="glabel"><span>max parallel cpu</span><span class="gval" id="ad-cpuv">0.0 / 4.0</span></div>
+              <div class="bar"><span class="warm" id="ad-cpuwarm" style="width:0%"></span><span class="used" id="ad-cpuused" style="width:0%"></span></div>
+            </div>
+            <div class="legend">
+              <span><i style="background:repeating-linear-gradient(45deg,var(--cold),var(--cold) 3px,transparent 3px,transparent 6px);border:1px solid var(--cold)"></i>warm pool, held always</span>
+              <span><i style="background:var(--signal)"></i>admitted sandboxes</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="readout">
+        <p class="narr" id="ad-narr"></p>
+        <div class="holds">
+          <div class="hold" id="ad-run"><span class="k">running</span><span class="v">0</span></div>
+          <div class="hold" id="ad-wait"><span class="k">still queued</span><span class="v">0</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col">
+      <h3>Inside the process</h3>
+      <p>Admitted executions become independent <code>asyncio</code> tasks. Two of them landing on the same cold sandbox at once would happily create two containers, so every start goes through a per-sandbox <code>asyncio.Lock</code>; whichever task loses the race re-reads <code>running</code> from the database and does nothing. A caller that gives up waiting does not cancel the start &#x2014; it is <code>asyncio.shield</code>ed, because aborting mid-<code>start_sandbox</code> would strand a container the row never learns about.</p>
+    </div>
+  </section>
+
+  <!-- ===================== 5. LIMITS ===================== -->
+  <section id="limits">
+    <div class="sec-head"><span class="eyebrow">05</span><h2>Where the limits come from</h2></div>
+    <div class="col">
+      <p>The memory ceiling is not one number. It is the smallest of several, computed fresh on every sweep:</p>
+    </div>
+
+    <div class="panel">
+      <div class="panel-bar"><span class="panel-title">Capacity.sandbox_budget_mb</span></div>
+      <div class="panel-body">
+        <div class="math">host_budget  = host_total_memory
+             - max(RESERVE_MIN_MB, host_total &#xD7; RESERVE_PERCENT / 100)
+             - PLATFORM_MEMORY_RESERVE_MB
+
+budget       = min(host_budget, SANDBOX_MEMORY_BUDGET_MB)</div>
+      </div>
+    </div>
+
+    <div class="col">
+      <p><code>host_total_memory</code> is <code>MemTotal</code> from <code>/proc/meminfo</code> &#x2014; inside the API container, so on Docker Desktop or OrbStack it is the Linux VM's memory, not the Mac's. Cap that VM below physical RAM (50&#x2013;65% is a reasonable start) and Harborbox then holds back a further 25% of it.</p>
+    </div>
+
+    <div class="tablescroll">
+      <table>
+        <thead><tr><th>Setting</th><th>Code default</th><th>compose.yaml</th><th>What it bounds</th></tr></thead>
+        <tbody>
+          <tr><td class="k">SANDBOX_MEMORY_BUDGET_MB</td><td class="v">unset</td><td class="v">4096</td><td class="d">Hard aggregate ceiling on reserved sandbox memory. Not preallocated &#x2014; idle usage is zero.</td></tr>
+          <tr><td class="k">HOST_MEMORY_RESERVE_PERCENT</td><td class="v">25</td><td class="v">25</td><td class="d">Share of host memory kept away from sandboxes entirely.</td></tr>
+          <tr><td class="k">HOST_MEMORY_RESERVE_MIN_MB</td><td class="v">1024</td><td class="v">1024</td><td class="d">Floor under that percentage, for small hosts.</td></tr>
+          <tr><td class="k">PLATFORM_MEMORY_RESERVE_MB</td><td class="v">512</td><td class="v">512</td><td class="d">Headroom for Harborbox, Postgres and OpenSandbox themselves.</td></tr>
+          <tr><td class="k">EMERGENCY_AVAILABLE_MEMORY_MB</td><td class="v">512</td><td class="v">512</td><td class="d">Live floor under <code>MemAvailable</code>. Blocks admission when the real machine is tight regardless of the ledger.</td></tr>
+          <tr><td class="k">MAX_PARALLEL_CPU</td><td class="v">host cpu count</td><td class="v">4</td><td class="d">Aggregate CPU allotment across all <code>starting</code> and <code>running</code> sandboxes. <strong>The usual binding constraint.</strong></td></tr>
+          <tr><td class="k">MAX_SANDBOX_MEMORY_MB</td><td class="v">4096</td><td class="v">4096</td><td class="d">Per-sandbox ceiling. A larger request is a 422.</td></tr>
+          <tr><td class="k">MAX_SANDBOX_CPU</td><td class="v">4.0</td><td class="v">4.0</td><td class="d">Per-sandbox CPU ceiling.</td></tr>
+          <tr><td class="k">DEFAULT_SANDBOX_MEMORY_MB</td><td class="v">512</td><td class="v">1024</td><td class="d">Sizing for a custom template registered without explicit numbers.</td></tr>
+          <tr><td class="k">DEFAULT_SANDBOX_CPU</td><td class="v">1.0</td><td class="v">2.0</td><td class="d">Same, for CPU.</td></tr>
+          <tr><td class="k">BASE_TEMPLATE_MEMORY_MB / _CPU</td><td class="v">512 / 1.0</td><td class="v">512 / 1.0</td><td class="d">Sizing of the one shipped template, <code>base</code>. Not overridden by the defaults above.</td></tr>
+          <tr><td class="k">HOT_PAUSE_BUDGET_MB</td><td class="v">2048</td><td class="v">2048</td><td class="d">Cap on memory held by frozen sandboxes. Past it, idle sandboxes go straight to cold.</td></tr>
+          <tr><td class="k">MAX_CONCURRENT_EXECUTIONS_PER_SANDBOX</td><td class="v">1</td><td class="v">2</td><td class="d">Overlapping commands inside one sandbox.</td></tr>
+          <tr><td class="k">MAX_QUEUE_DEPTH</td><td class="v">1000</td><td class="v">1000</td><td class="d">Queued rows before <code>POST /commands</code> answers 429.</td></tr>
+          <tr><td class="k">QUEUE_AGING_SECONDS</td><td class="v">60</td><td class="v">60</td><td class="d">How long backfilling may skip the head of the queue.</td></tr>
+          <tr><td class="k">TEMPLATE_MAX_CONCURRENT_BUILDS</td><td class="v">2</td><td class="v">2</td><td class="d">Simultaneous image builds. Separate budget from sandboxes.</td></tr>
+          <tr><td class="k">WARM_POOL</td><td class="v">{"base":1}</td><td class="v">{"base":1}</td><td class="d">Pool size per template. Its maximum is reserved permanently, even at zero idle, so a refill cannot race admission over the cap.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note">
+      <span class="eyebrow">Stale keys in .env.example</span>
+      <p><code>.env.example</code> still lists <code>HARBORBOX_WARM_POOL_RELAYDECK</code>, <code>HARBORBOX_WARM_POOL_ONVO_PRO</code> and per-product <code>*_TEMPLATE_MEMORY_MB</code> keys. The code reads none of them &#x2014; pools come from the single <code>HARBORBOX_WARM_POOL</code> JSON object, and the only static template sizing left is <code>base</code>. Pydantic is configured <code>extra="ignore"</code>, so setting them silently does nothing.</p>
+    </div>
+  </section>
+
+  <!-- ===================== 6. HOW MANY ===================== -->
+  <section id="howmany">
+    <div class="sec-head"><span class="eyebrow">06</span><h2>So how many can run at once?</h2></div>
+    <div class="col">
+      <p>Two numbers, and the smaller wins:</p>
+    </div>
+
+    <div class="panel">
+      <div class="panel-bar"><span class="panel-title">The count</span></div>
+      <div class="panel-body">
+        <div class="math">by memory = floor( (budget_mb - warm_pool_mb)   / sandbox_memory_mb )
+by cpu    = floor( (max_parallel_cpu - warm_cpu) / sandbox_cpu )
+
+concurrent running sandboxes = min(by memory, by cpu)</div>
+      </div>
+    </div>
+
+    <div class="col">
+      <p>Drag the sliders. The presets are the two real cases you get out of this repo without touching anything.</p>
+    </div>
+
+    <div class="panel">
+      <div class="panel-bar">
+        <span class="panel-title">Capacity calculator</span>
+        <div class="controls">
+          <button id="p-base">Preset: base template</button>
+          <button id="p-custom">Preset: custom template</button>
+          <button id="p-nopool">Preset: warm pool off</button>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div class="calc">
+          <div class="fields">
+            <div class="field">
+              <label for="c-budget">SANDBOX_MEMORY_BUDGET_MB <b id="c-budget-v">4096</b></label>
+              <input id="c-budget" type="range" min="1024" max="32768" step="512" value="4096">
+            </div>
+            <div class="field">
+              <label for="c-maxcpu">MAX_PARALLEL_CPU <b id="c-maxcpu-v">4.0</b></label>
+              <input id="c-maxcpu" type="range" min="1" max="32" step="0.5" value="4">
+            </div>
+            <div class="field">
+              <label for="c-mem">sandbox memory_mb <b id="c-mem-v">512</b></label>
+              <input id="c-mem" type="range" min="128" max="4096" step="128" value="512">
+            </div>
+            <div class="field">
+              <label for="c-cpu">sandbox cpu <b id="c-cpu-v">1.0</b></label>
+              <input id="c-cpu" type="range" min="0.25" max="4" step="0.25" value="1">
+            </div>
+            <div class="field">
+              <label for="c-pool">warm pool size (base, 512 MB / 1.0 cpu) <b id="c-pool-v">1</b></label>
+              <input id="c-pool" type="range" min="0" max="6" step="1" value="1">
+            </div>
+          </div>
+          <div class="verdict">
+            <div class="bignum"><span class="n" id="c-n">3</span><span class="t" id="c-t">sandboxes can be <code>running</code> at the same time</span></div>
+            <div class="berths" id="c-berths"></div>
+            <div class="math" id="c-math"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col">
+      <h3>The two shipped answers</h3>
+      <p>On the bundled Compose stack, with a 16 GiB Docker VM and nothing overridden:</p>
+      <ul>
+        <li><strong>Sandboxes on the <code>base</code> template (512 MB / 1.0 CPU): three at a time.</strong> Memory would allow seven; CPU allows three, because the warm pool permanently holds 1.0 of the 4.0 allotment. A fourth container exists &#x2014; the warm one &#x2014; but it is idle and holds no CPU.</li>
+        <li><strong>Sandboxes on a custom template with no explicit sizing (1024 MB / 2.0 CPU): one at a time.</strong> Memory would allow three. CPU allows one. Everything else queues.</li>
+      </ul>
+      <p>If that second number is a surprise, it is the honest one, and it is the number worth acting on: <code>MAX_PARALLEL_CPU=4</code> against a 2-CPU default sandbox size is a tight pairing. Raising <code>HARBORBOX_MAX_PARALLEL_CPU</code> to the host's real core count, or sizing sandboxes at 1.0 CPU, is what moves it.</p>
+
+      <h3>Three counts that are not that one</h3>
+      <ul>
+        <li><strong>Sandboxes that exist</strong> is far larger. <code>paused_cold</code> holds no memory and no CPU, so cold-suspended sandboxes are bounded only by row retention. Cold-start each one back and they queue.</li>
+        <li><strong>Sandboxes holding memory</strong> sits between the two: <code>running</code> plus <code>starting</code> plus <code>paused_memory</code> plus the pool. Frozen sandboxes count against the memory budget but not the CPU one.</li>
+        <li><strong>Concurrent executions</strong> is the running count multiplied by <code>MAX_CONCURRENT_EXECUTIONS_PER_SANDBOX</code>. A second command into an already-running sandbox costs nothing in admission &#x2014; its incremental memory and CPU are both zero &#x2014; so it is gated only by that per-sandbox limit.</li>
+      </ul>
+      <p><code>GET /v1/capacity</code> reports all of it live: budget, reservations, warm-pool headroom, running sandboxes, running and queued executions.</p>
+    </div>
+  </section>
+
+  <!-- ===================== 7. KUBERNETES ===================== -->
+  <section id="k8s">
+    <div class="sec-head"><span class="eyebrow">07</span><h2>Kubernetes, and multiple deployments</h2></div>
+    <div class="col">
+      <p>You are right that OpenSandbox has a Kubernetes backend, and Harborbox is already positioned to use it &#x2014; but "use the K8s runtime" and "run Harborbox across multiple systems" are two separate changes, and only the first one is free today.</p>
+    </div>
+
+    <figure>
+      <div class="panel">
+        <div class="panel-bar"><span class="panel-title">What moves, and what does not</span></div>
+        <div class="panel-body figscroll">
+          <svg class="diagram" viewBox="0 0 940 300" role="img" aria-label="Today the API, scheduler and OpenSandbox share one host and admission reads that host's meminfo. Pointed at a Kubernetes OpenSandbox, the data plane moves to the cluster but the single scheduler still reads its own local meminfo, which is now the wrong machine.">
+            <defs>
+              <marker id="kar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+              </marker>
+            </defs>
+
+            <text class="nodesub" x="20" y="26" font-size="11.5">TODAY &#x2014; one host</text>
+            <rect x="20" y="38" width="400" height="222" rx="5" fill="none" stroke="var(--line)"/>
+            <rect class="nodebox" x="46" y="66" width="150" height="42" rx="3"/>
+            <text class="nodelabel" x="121" y="92" text-anchor="middle">API + scheduler</text>
+            <rect class="nodebox" x="46" y="132" width="150" height="42" rx="3"/>
+            <text class="nodelabel" x="121" y="158" text-anchor="middle">OpenSandbox</text>
+            <rect class="nodebox" x="46" y="198" width="150" height="38" rx="3"/>
+            <text class="nodelabel" x="121" y="222" text-anchor="middle">containers</text>
+            <rect class="nodebox" x="244" y="66" width="150" height="42" rx="3" stroke="var(--signal)" stroke-width="2"/>
+            <text class="nodelabel" x="319" y="86" text-anchor="middle" fill="var(--signal)">/proc/meminfo</text>
+            <text class="nodesub"   x="319" y="101" text-anchor="middle">the right machine</text>
+            <g class="edge-g lit"><path class="edge" d="M 240 87 H 202" marker-end="url(#kar)"/></g>
+            <g class="edge-g lit"><path class="edge" d="M 121 108 V 128" marker-end="url(#kar)"/></g>
+            <g class="edge-g lit"><path class="edge" d="M 121 174 V 194" marker-end="url(#kar)"/></g>
+
+            <text class="nodesub" x="520" y="26" font-size="11.5">POINTED AT A CLUSTER</text>
+            <rect x="520" y="38" width="180" height="222" rx="5" fill="none" stroke="var(--line)"/>
+            <rect class="nodebox" x="542" y="66" width="140" height="42" rx="3"/>
+            <text class="nodelabel" x="612" y="92" text-anchor="middle">API + scheduler</text>
+            <rect class="nodebox" x="542" y="132" width="140" height="42" rx="3" stroke="var(--block)" stroke-width="2"/>
+            <text class="nodelabel" x="612" y="152" text-anchor="middle" fill="var(--block)">/proc/meminfo</text>
+            <text class="nodesub"   x="612" y="167" text-anchor="middle" fill="var(--block)">the wrong machine</text>
+            <g class="edge-g lit"><path class="edge" d="M 612 108 V 128" marker-end="url(#kar)"/></g>
+
+            <rect x="740" y="38" width="184" height="222" rx="5" fill="none" stroke="var(--line)" stroke-dasharray="5 4"/>
+            <text class="nodesub" x="752" y="58">kubernetes</text>
+            <rect class="nodebox" x="762" y="70" width="142" height="40" rx="3"/>
+            <text class="nodelabel" x="833" y="94" text-anchor="middle">OpenSandbox</text>
+            <rect class="nodebox" x="762" y="126" width="142" height="34" rx="3"/>
+            <text class="nodelabel" x="833" y="148" text-anchor="middle" font-size="11.5">node &#xB7; gVisor</text>
+            <rect class="nodebox" x="762" y="168" width="142" height="34" rx="3"/>
+            <text class="nodelabel" x="833" y="190" text-anchor="middle" font-size="11.5">node &#xB7; gVisor</text>
+            <rect class="nodebox" x="762" y="210" width="142" height="34" rx="3"/>
+            <text class="nodelabel" x="833" y="232" text-anchor="middle" font-size="11.5">node &#xB7; gVisor</text>
+
+            <g class="edge-g lit"><path class="edge" d="M 686 90 H 756" marker-end="url(#kar)"/><text class="edgelabel" x="690" y="82">HTTP</text></g>
+          </svg>
+        </div>
+      </div>
+      <figcaption>Moving the data plane to a cluster is a settings change. What does not move with it is the admission controller's idea of "the host": it reads the API container's own <code>/proc/meminfo</code>, which after the move describes a machine that runs no sandboxes.</figcaption>
+    </figure>
+
+    <div class="verdicts">
+      <div class="vrow yes">
+        <span class="stamp">works now</span>
+        <div>
+          <h3>Pointing at a Kubernetes OpenSandbox</h3>
+          <p>Harborbox reaches OpenSandbox over plain HTTP through <code>HARBORBOX_OPENSANDBOX_DOMAIN</code>, <code>_PROTOCOL</code> and <code>_API_KEY</code>. Nothing in the control plane assumes a local runtime, and the <code>SandboxRuntime</code> protocol exists precisely so that a different provider is an addition rather than a change to the scheduler, admission or API. This is also the repo's own recommendation for hostile workloads &#x2014; Docker containers share the host kernel, so gVisor, Kata or Firecracker behind a RuntimeClass is the isolation story, not this.</p>
+        </div>
+      </div>
+      <div class="vrow yes">
+        <span class="stamp">works now</span>
+        <div>
+          <h3>Shared state across instances</h3>
+          <p>Two of the hard parts are already done. Warm pools coordinate through PostgreSQL with distributed leases and leader fencing (<code>postgres_pool_store.py</code>), and the wake-up path uses <code>LISTEN</code>/<code>NOTIFY</code> on that same database specifically so it reaches every API replica without adding a broker. Both were written for more than one process.</p>
+        </div>
+      </div>
+      <div class="vrow no">
+        <span class="stamp">blocked</span>
+        <div>
+          <h3>More than one Harborbox process</h3>
+          <p>The single-start guarantee is an in-process <code>asyncio.Lock</code> dictionary. Two replicas against one database hold two unrelated lock dicts, race the same sandbox row, and can produce two containers for one sandbox. <code>Dockerfile.api</code>'s uvicorn has no <code>--workers</code> for exactly this reason. The fix is known and small in shape &#x2014; a <code>SELECT &#x2026; FOR UPDATE</code> on the sandbox row, the same pattern admission already uses &#x2014; but it is not written.</p>
+        </div>
+      </div>
+      <div class="vrow no">
+        <span class="stamp">blocked</span>
+        <div>
+          <h3>Admission across more than one machine</h3>
+          <p>Capacity is a single global budget measured from the API container's own <code>/proc/meminfo</code>. <code>HARBORBOX_TOTAL_MEMORY_MB</code> can override the total, but the live emergency guard still reads local <code>MemAvailable</code> &#x2014; on a split deployment it is watching a machine that runs nothing. And a single flat budget cannot express per-node capacity, so against a cluster you would have two schedulers bin-packing the same workload with different information. Multi-node needs capacity to come <em>from</em> the runtime rather than from <code>/proc</code>.</p>
+        </div>
+      </div>
+      <div class="vrow part">
+        <span class="stamp">needs work</span>
+        <div>
+          <h3>The template registry address</h3>
+          <p>BuildKit pushes to <code>registry:5000</code> over the build network; the reference handed to OpenSandbox is <code>127.0.0.1:5050</code>, because the Docker daemon resolves it from the host. That pairing only holds while OpenSandbox is on the same host. A split or clustered deployment needs a real DNS name with TLS &#x2014; the design doc already calls this out as the option for exactly this case.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="col">
+      <h3>The short version</h3>
+      <p>Harborbox can run <em>on top of</em> Kubernetes today: point it at a clustered OpenSandbox, set <code>HARBORBOX_TOTAL_MEMORY_MB</code> deliberately, give the registry a real name, and accept that one API process is scheduling the whole cluster from a budget you typed in rather than measured.</p>
+      <p>Harborbox cannot yet <em>be</em> a multi-instance deployment. Three things stand between here and there, in dependency order: replace the in-process start lock with a row lock; source capacity from the runtime instead of local <code>/proc</code>; then decide whether Harborbox still schedules at all once Kubernetes is doing it &#x2014; because at that point one of the two schedulers is redundant, and the interesting question becomes whether Harborbox keeps the queue and admission and hands placement to the cluster, or steps back to being the durable queue and lifecycle API alone.</p>
+      <p>That last question is a design decision, not a missing feature, and it is worth settling before the other two are built.</p>
+    </div>
+  </section>
+
+  <footer>
+    Sources read for this: <span class="mono">src/harborbox/{admission,scheduler,warm_pool,config,api,notify,opensandbox_runtime,runtime_protocol,models,templates}.py</span>, <span class="mono">compose.yaml</span>, <span class="mono">.env.example</span>, <span class="mono">README.md</span>, <span class="mono">docs/arbitrary-dockerfile-templates.md</span>. Timings are the repo's own measured figures from <span class="mono">tests/e2e_pause_ladder.py</span> and <span class="mono">scripts/bench/</span>.
+  </footer>
+
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  /* ============ 1. LIFECYCLE ============ */
+
+  // The marker rides the left edge of the active box rather than its centre,
+  // so it never sits on top of the state name.
+  var POS = {
+    created:       [20, 180],
+    pooled:        [230, 61],
+    starting:      [230, 180],
+    running:       [490, 180],
+    paused_memory: [490, 300],
+    paused_cold:   [490, 412],
+    killed:        [730, 65]
+  };
+
+  var LC = [
+    { s: "created", e: null, mem: 0, cpu: 0, cost: "\u2014",
+      t: "<b>POST /v1/sandboxes</b> writes a row and returns 201. No container exists yet, and the sandbox holds nothing against the host budget. It can sit here indefinitely." },
+    { s: "created", e: "e-create", mem: 0, cpu: 0, cost: "\u2014",
+      t: "The first call that needs a live container \u2014 a command, or even a file write \u2014 enqueues work. The scheduler's sweep finds it and runs the admission test." },
+    { s: "starting", e: "e-create", mem: 1, cpu: 1, cost: "\u2014",
+      t: "Admitted. The status flips to <b>starting</b> and <em>the reservation is taken right now</em>, before any container exists. The scheduler reserves the sandbox's whole hard limit, not its expected usage." },
+    { s: "pooled", e: "e-acquire", mem: 1, cpu: 1, cost: "saves ~3 s",
+      t: "If the template is named in <b>HARBORBOX_WARM_POOL</b> and the size matches exactly, a ready container is claimed from the pool instead of created. Pooled sandboxes are disposable \u2014 this one is never returned." },
+    { s: "starting", e: "e-ready", mem: 1, cpu: 1, cost: "budget 120 s",
+      t: "Otherwise OpenSandbox creates a container from the template image. <b>wait_until_ready</b> polls until it answers. Overrun the 120 s budget and the execution fails but the sandbox stays retryable \u2014 slow is not dead." },
+    { s: "running", e: null, mem: 1, cpu: 1, cost: "\u2014",
+      t: "<b>running</b>. Commands execute here. Up to MAX_CONCURRENT_EXECUTIONS_PER_SANDBOX may overlap; the container's own hard memory and CPU limits bound whatever they do together." },
+    { s: "paused_memory", e: "e-freeze", mem: 1, cpu: 0, cost: "65 ms",
+      t: "Idle for HOT_PAUSE_IDLE_SECONDS. The reaper freezes the container \u2014 processes survive, so the whole memory reservation survives with them. Only the CPU allotment comes back." },
+    { s: "paused_cold", e: "e-cool", mem: 0, cpu: 0, cost: "5,075 ms",
+      t: "Idle past its own idle_timeout_seconds. OpenSandbox refuses to snapshot a frozen container, so the reaper thaws it first, then snapshots and terminates. Memory is released; files survive, live processes do not." },
+    { s: "starting", e: "e-restore", mem: 1, cpu: 1, cost: "465 ms",
+      t: "The next call restores a <em>new</em> container from that snapshot. Same files, fresh processes. Back through the same admission test as any cold start." },
+    { s: "running", e: null, mem: 1, cpu: 1, cost: "\u2014",
+      t: "Running again. This ladder can repeat for as long as the sandbox lives." },
+    { s: "killed", e: "e-kill", mem: 0, cpu: 0, cost: "\u2014",
+      t: "<b>DELETE /v1/sandboxes/{id}</b>, or the reaper finding it past expiry. Terminal \u2014 <b>killed</b> and <b>failed</b> sandboxes never come back, and any queued execution bound to one is resolved as failed rather than admitted." }
+  ];
+
+  var svg = document.getElementById("lc-svg");
+  if (svg) {
+    var token = document.getElementById("token");
+    var narr = document.getElementById("lc-narr");
+    var count = document.getElementById("lc-count");
+    var memEl = document.getElementById("lc-mem");
+    var cpuEl = document.getElementById("lc-cpu");
+    var costEl = document.getElementById("lc-cost");
+    var i = 0, timer = null;
+
+    function paintHold(el, on, text) {
+      el.className = "hold " + (on ? "held" : "free");
+      el.querySelector(".v").textContent = text;
+    }
+
+    function render() {
+      var f = LC[i];
+      Array.prototype.forEach.call(svg.querySelectorAll("g.state"), function (g) {
+        g.classList.toggle("on", g.getAttribute("data-state") === f.s);
+      });
+      Array.prototype.forEach.call(svg.querySelectorAll("g.edge-g"), function (g) {
+        g.classList.toggle("lit", g.getAttribute("data-edge") === f.e);
+      });
+      var p = POS[f.s];
+      token.style.transform = "translate(" + p[0] + "px, " + p[1] + "px)";
+      narr.innerHTML = f.t;
+      count.textContent = (i + 1) + " / " + LC.length;
+      paintHold(memEl, f.mem === 1, f.mem === 1 ? "full limit" : "none");
+      paintHold(cpuEl, f.cpu === 1, f.cpu === 1 ? "full allotment" : "none");
+      paintHold(costEl, f.cost !== "\u2014", f.cost);
+      document.getElementById("lc-prev").disabled = i === 0;
+      document.getElementById("lc-next").disabled = i === LC.length - 1;
+    }
+
+    function stop() {
+      if (timer) { clearInterval(timer); timer = null; }
+      document.getElementById("lc-play").textContent = "Play";
+    }
+
+    function play() {
+      if (timer) { stop(); return; }
+      if (i >= LC.length - 1) { i = 0; render(); }
+      document.getElementById("lc-play").textContent = "Pause";
+      timer = setInterval(function () {
+        if (i >= LC.length - 1) { stop(); return; }
+        i += 1; render();
+      }, reduce ? 4200 : 3000);
+    }
+
+    document.getElementById("lc-play").addEventListener("click", play);
+    document.getElementById("lc-next").addEventListener("click", function () {
+      stop(); if (i < LC.length - 1) { i += 1; render(); }
+    });
+    document.getElementById("lc-prev").addEventListener("click", function () {
+      stop(); if (i > 0) { i -= 1; render(); }
+    });
+    document.getElementById("lc-reset").addEventListener("click", function () {
+      stop(); i = 0; render();
+    });
+    render();
+  }
+
+  /* ============ 2. ADMISSION SWEEP ============ */
+
+  var BUDGET = 4096, MAXCPU = 4.0, WARM_MEM = 512, WARM_CPU = 1.0;
+
+  var JOBS = [
+    { id: "exec_a1", sb: "sbx_big",  mem: 2048, cpu: 2.0, age: 4 },
+    { id: "exec_b2", sb: "sbx_one",  mem: 512,  cpu: 1.0, age: 3 },
+    { id: "exec_c3", sb: "sbx_two",  mem: 512,  cpu: 1.0, age: 2 },
+    { id: "exec_d4", sb: "sbx_one",  mem: 0,    cpu: 0,   age: 1, same: true },
+    { id: "exec_e5", sb: "sbx_thr",  mem: 512,  cpu: 1.0, age: 0 }
+  ];
+
+  // each step: array of per-job tags, plus reserved mem/cpu and narration
+  var AD = [
+    { tags: ["queued","queued","queued","queued","queued"], mem: 0, cpu: 0,
+      t: "Five executions are queued, oldest at the top. Before the scan, the warm pool already holds 512 MB and 1.0 CPU \u2014 reserved permanently, even when the pool has scaled to zero idle, so a refill can never race admission over the cap." },
+    { tags: ["scan","queued","queued","queued","queued"], mem: 0, cpu: 0,
+      t: "The sweep takes up to 100 queued rows with <b>SELECT \u2026 FOR UPDATE</b>, so nothing else can change them mid-decision \u2014 in particular a DELETE cancelling them." },
+    { tags: ["admit","queued","queued","queued","queued"], mem: 2048, cpu: 2.0,
+      t: "<b>exec_a1</b> wants a 2048 MB / 2.0 CPU sandbox. 2048+512 \u2264 4096 and 2.0+1.0 \u2264 4.0, so it is admitted. Its sandbox flips to <b>starting</b> and the capacity snapshot is decremented in place for the rest of this sweep." },
+    { tags: ["admit","admit","queued","queued","queued"], mem: 2560, cpu: 3.0,
+      t: "<b>exec_b2</b> needs 512 MB / 1.0 CPU. Memory 2560+512 \u2264 4096 and CPU 3.0+1.0 \u2264 4.0 \u2014 just fits. Both budgets are now within one sandbox of full." },
+    { tags: ["admit","admit","defer","queued","queued"], mem: 2560, cpu: 3.0,
+      t: "<b>exec_c3</b> fails the third test: 3.0 + 1.0 would leave nothing, and 4.0 + 1.0 > 4.0. It is deferred with <b>waiting_for: \"cpu\"</b> \u2014 memory was never the problem." },
+    { tags: ["admit","admit","defer","admit","queued"], mem: 2560, cpu: 3.0,
+      t: "The scan does not stop there \u2014 it backfills. <b>exec_d4</b> targets <b>sbx_one</b>, which is already starting, so its incremental cost is zero on both axes. Admitted for free. This is why a second command into a live sandbox never queues behind capacity." },
+    { tags: ["admit","admit","defer","admit","defer"], mem: 2560, cpu: 3.0,
+      t: "<b>exec_e5</b> needs a new sandbox and there is no CPU left. Deferred too. The sweep ends; both deferred rows stay <b>queued</b> and are rescanned on the next tick." },
+    { tags: ["gone","gone","aged","gone","defer"], mem: 1024, cpu: 1.0,
+      t: "A minute later. The first sandboxes have finished and released their reservations, and <b>exec_c3</b> is now the head of the queue having waited past QUEUE_AGING_SECONDS. From here backfilling is switched off for it." },
+    { tags: ["gone","gone","admit","gone","defer"], mem: 1536, cpu: 2.0,
+      t: "<b>exec_c3</b> goes first. Had it still not fit, the scan would have <em>stopped at the head</em> rather than skipping ahead \u2014 that head-of-line block is the whole anti-starvation mechanism, and it is the one moment the queue is strictly FIFO." }
+  ];
+
+  var qEl = document.getElementById("ad-queue");
+  if (qEl) {
+    var adNarr = document.getElementById("ad-narr");
+    var adCount = document.getElementById("ad-count");
+    var j = 0, adTimer = null;
+
+    var TAGTEXT = { queued: "queued", scan: "scanning", admit: "admitted", defer: "deferred", aged: "aged \u00b7 head", gone: "finished" };
+
+    function pct(v, max) { return Math.max(0, Math.min(100, (v / max) * 100)) + "%"; }
+
+    function adRender() {
+      var st = AD[j];
+      qEl.innerHTML = "";
+      JOBS.forEach(function (job, k) {
+        var tag = st.tags[k];
+        var row = document.createElement("div");
+        row.className = "qrow " + tag;
+        var size = job.same ? job.sb + " \u00b7 already live" : job.sb + " \u00b7 " + job.mem + " MB / " + job.cpu.toFixed(1) + " cpu";
+        row.innerHTML =
+          '<span class="idx">' + (k + 1) + '</span>' +
+          '<span>' + job.id + ' <span style="color:var(--muted)">' + size + '</span></span>' +
+          '<span class="tag">' + TAGTEXT[tag] + '</span>';
+        qEl.appendChild(row);
+      });
+
+      document.getElementById("ad-memwarm").style.width = pct(WARM_MEM, BUDGET);
+      document.getElementById("ad-memused").style.width = pct(st.mem, BUDGET);
+      document.getElementById("ad-cpuwarm").style.width = pct(WARM_CPU, MAXCPU);
+      document.getElementById("ad-cpuused").style.width = pct(st.cpu, MAXCPU);
+      document.getElementById("ad-memv").textContent = (st.mem + WARM_MEM) + " / " + BUDGET + " MB";
+      document.getElementById("ad-cpuv").textContent = (st.cpu + WARM_CPU).toFixed(1) + " / " + MAXCPU.toFixed(1);
+
+      var running = st.tags.filter(function (t) { return t === "admit"; }).length;
+      var waiting = st.tags.filter(function (t) { return t === "queued" || t === "defer" || t === "aged" || t === "scan"; }).length;
+      document.getElementById("ad-run").querySelector(".v").textContent = running;
+      document.getElementById("ad-wait").querySelector(".v").textContent = waiting;
+
+      adNarr.innerHTML = st.t;
+      adCount.textContent = (j + 1) + " / " + AD.length;
+      document.getElementById("ad-next").disabled = j === AD.length - 1;
+    }
+
+    function adStop() {
+      if (adTimer) { clearInterval(adTimer); adTimer = null; }
+      document.getElementById("ad-play").textContent = "Play";
+    }
+
+    document.getElementById("ad-play").addEventListener("click", function () {
+      if (adTimer) { adStop(); return; }
+      if (j >= AD.length - 1) { j = 0; adRender(); }
+      document.getElementById("ad-play").textContent = "Pause";
+      adTimer = setInterval(function () {
+        if (j >= AD.length - 1) { adStop(); return; }
+        j += 1; adRender();
+      }, reduce ? 5200 : 3800);
+    });
+    document.getElementById("ad-next").addEventListener("click", function () {
+      adStop(); if (j < AD.length - 1) { j += 1; adRender(); }
+    });
+    document.getElementById("ad-reset").addEventListener("click", function () {
+      adStop(); j = 0; adRender();
+    });
+    adRender();
+  }
+
+  /* ============ 3. CALCULATOR ============ */
+
+  var ids = ["budget", "maxcpu", "mem", "cpu", "pool"];
+  var inputs = {};
+  ids.forEach(function (k) { inputs[k] = document.getElementById("c-" + k); });
+
+  if (inputs.budget) {
+    var POOL_MEM = 512, POOL_CPU = 1.0;
+
+    function calc() {
+      var budget = +inputs.budget.value;
+      var maxcpu = +inputs.maxcpu.value;
+      var mem = +inputs.mem.value;
+      var cpu = +inputs.cpu.value;
+      var pool = +inputs.pool.value;
+
+      document.getElementById("c-budget-v").textContent = budget;
+      document.getElementById("c-maxcpu-v").textContent = maxcpu.toFixed(1);
+      document.getElementById("c-mem-v").textContent = mem;
+      document.getElementById("c-cpu-v").textContent = cpu.toFixed(2);
+      document.getElementById("c-pool-v").textContent = pool;
+
+      var wMem = pool * POOL_MEM, wCpu = pool * POOL_CPU;
+      var byMem = Math.max(0, Math.floor((budget - wMem) / mem));
+      var byCpu = Math.max(0, Math.floor((maxcpu - wCpu) / cpu));
+      var n = Math.min(byMem, byCpu);
+      var bind = byCpu < byMem ? "cpu" : (byMem < byCpu ? "mem" : "both");
+
+      document.getElementById("c-n").textContent = n;
+      var t = n === 1 ? "sandbox can be <code>running</code> at the same time" : "sandboxes can be <code>running</code> at the same time";
+      var why = bind === "cpu" ? " \u2014 bound by <strong>MAX_PARALLEL_CPU</strong>"
+              : bind === "mem" ? " \u2014 bound by the <strong>memory budget</strong>"
+              : " \u2014 both budgets run out together";
+      document.getElementById("c-t").innerHTML = t + why;
+
+      var berths = document.getElementById("c-berths");
+      berths.innerHTML = "";
+      for (var p = 0; p < pool; p++) {
+        var w = document.createElement("div");
+        w.className = "berth warm";
+        w.title = "warm pool";
+        berths.appendChild(w);
+      }
+      for (var q = 0; q < Math.min(n, 48); q++) {
+        var r = document.createElement("div");
+        r.className = "berth run";
+        r.title = "running sandbox";
+        berths.appendChild(r);
+      }
+      if (n === 0 && pool === 0) { berths.textContent = ""; }
+
+      var memLine = "by memory  floor((" + budget + " - " + wMem + ") / " + mem + ")   = " + byMem;
+      var cpuLine = "by cpu     floor((" + maxcpu.toFixed(1) + " - " + wCpu.toFixed(1) + ") / " + cpu.toFixed(2) + ")   = " + byCpu;
+      var cls = function (isBind) { return isBind ? "bind" : "slack"; };
+      document.getElementById("c-math").innerHTML =
+        '<span class="' + cls(byMem <= byCpu) + '">' + memLine + '</span>\n' +
+        '<span class="' + cls(byCpu <= byMem) + '">' + cpuLine + '</span>\n' +
+        'min                                = ' + n;
+    }
+
+    ids.forEach(function (k) { inputs[k].addEventListener("input", calc); });
+
+    function preset(budget, maxcpu, mem, cpu, pool) {
+      inputs.budget.value = budget;
+      inputs.maxcpu.value = maxcpu;
+      inputs.mem.value = mem;
+      inputs.cpu.value = cpu;
+      inputs.pool.value = pool;
+      calc();
+    }
+    document.getElementById("p-base").addEventListener("click", function () { preset(4096, 4, 512, 1, 1); });
+    document.getElementById("p-custom").addEventListener("click", function () { preset(4096, 4, 1024, 2, 1); });
+    document.getElementById("p-nopool").addEventListener("click", function () { preset(4096, 4, 512, 1, 0); });
+
+    calc();
+  }
+})();
+</script>
+
+<script>
+(function () {
+  var root = document.documentElement;
+  var btn = document.getElementById("themetoggle");
+  function label() {
+    var t = root.getAttribute("data-theme");
+    btn.textContent = t === "dark" ? "light" : t === "light" ? "dark" : "theme";
+  }
+  try {
+    var saved = localStorage.getItem("harborbox-theme");
+    if (saved === "dark" || saved === "light") { root.setAttribute("data-theme", saved); }
+  } catch (e) { /* private mode, blocked storage - the OS preference still applies */ }
+  label();
+  btn.addEventListener("click", function () {
+    var cur = root.getAttribute("data-theme");
+    var isDark = cur ? cur === "dark"
+      : window.matchMedia("(prefers-color-scheme: dark)").matches;
+    var next = isDark ? "light" : "dark";
+    root.setAttribute("data-theme", next);
+    try { localStorage.setItem("harborbox-theme", next); } catch (e) { /* ignore */ }
+    label();
+  });
+})();
+</script>
+</body>
+</html>
