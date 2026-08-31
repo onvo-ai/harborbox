@@ -340,6 +340,16 @@ services:
       # result -- what a build installs is unbounded, what it starts from is not.
       HARBORBOX_TEMPLATE_FROM_ALLOWLIST: ${HARBORBOX_TEMPLATE_FROM_ALLOWLIST:-["docker.io/library"]}
       HARBORBOX_TEMPLATE_CONTEXT_ROOT: /var/lib/harborbox/build-contexts
+      # The rest of what constrains a caller's Dockerfile: its size, and the
+      # size of the context it may COPY from. The byte cap applies to the
+      # upload and to the sum of the members' declared sizes, so an archive
+      # that compresses to nothing and expands to gigabytes is refused without
+      # being expanded. Values match the Settings defaults; they are here so a
+      # deployment can lower them.
+      HARBORBOX_TEMPLATE_MAX_DOCKERFILE_BYTES: ${HARBORBOX_TEMPLATE_MAX_DOCKERFILE_BYTES:-65536}
+      HARBORBOX_TEMPLATE_MAX_DOCKERFILE_INSTRUCTIONS: ${HARBORBOX_TEMPLATE_MAX_DOCKERFILE_INSTRUCTIONS:-200}
+      HARBORBOX_TEMPLATE_MAX_CONTEXT_BYTES: ${HARBORBOX_TEMPLATE_MAX_CONTEXT_BYTES:-33554432}
+      HARBORBOX_TEMPLATE_MAX_CONTEXT_FILES: ${HARBORBOX_TEMPLATE_MAX_CONTEXT_FILES:-2000}
       HARBORBOX_TEMPLATE_MAX_CONCURRENT_BUILDS: ${HARBORBOX_TEMPLATE_MAX_CONCURRENT_BUILDS:-2}
       HARBORBOX_TEMPLATE_GC_ENABLED: ${HARBORBOX_TEMPLATE_GC_ENABLED:-true}
       HARBORBOX_TEMPLATE_GC_MAX_IDLE_DAYS: ${HARBORBOX_TEMPLATE_GC_MAX_IDLE_DAYS:-14}
@@ -350,6 +360,11 @@ services:
       HARBORBOX_WARM_POOL_IDLE_TTL_SECONDS: ${HARBORBOX_WARM_POOL_IDLE_TTL_SECONDS:-900}
       HARBORBOX_WARM_POOL_RELEASE_AFTER_INACTIVITY_SECONDS: ${HARBORBOX_WARM_POOL_RELEASE_AFTER_INACTIVITY_SECONDS:-300}
       HARBORBOX_WARM_POOL_RELEASE_ON_SHUTDOWN: ${HARBORBOX_WARM_POOL_RELEASE_ON_SHUTDOWN:-true}
+      # Sizing for `base`, the one statically registered template, and so also
+      # the per-sandbox cost of a `{"base":N}` warm pool against the budgets
+      # below. Derived templates carry their own sizing on their database row.
+      HARBORBOX_BASE_TEMPLATE_MEMORY_MB: ${HARBORBOX_BASE_TEMPLATE_MEMORY_MB:-512}
+      HARBORBOX_BASE_TEMPLATE_CPU: ${HARBORBOX_BASE_TEMPLATE_CPU:-1.0}
       HARBORBOX_SANDBOX_NETWORK: harborbox-net
       HARBORBOX_SANDBOX_EGRESS_NETWORK: harborbox-egress
       HARBORBOX_SANDBOX_RUNTIME: ${HARBORBOX_SANDBOX_RUNTIME:-}
@@ -363,6 +378,11 @@ services:
       HARBORBOX_DEFAULT_SANDBOX_MEMORY_MB: ${HARBORBOX_ONVO_SANDBOX_MEMORY_MB:-1024}
       HARBORBOX_MAX_SANDBOX_MEMORY_MB: ${HARBORBOX_MAX_SANDBOX_MEMORY_MB:-4096}
       HARBORBOX_DEFAULT_SANDBOX_CPU: ${HARBORBOX_ONVO_SANDBOX_CPU:-2}
+      HARBORBOX_MAX_SANDBOX_CPU: ${HARBORBOX_MAX_SANDBOX_CPU:-4.0}
+      # Aggregate CPU across every starting/running sandbox, warm pool
+      # included, and usually the constraint that binds before memory does: at
+      # these defaults the memory budget allows three 1 GiB sandboxes while
+      # this allows one 2.0-cpu one.
       HARBORBOX_MAX_PARALLEL_CPU: ${HARBORBOX_MAX_PARALLEL_CPU:-4}
       HARBORBOX_MAX_CONCURRENT_EXECUTIONS_PER_SANDBOX: ${HARBORBOX_ONVO_CONCURRENCY:-2}
       # Match the deployed defaults. At 0.05 the scheduler ran `capacity()` —
@@ -372,8 +392,21 @@ services:
       # pickup latency, against seconds of sandbox startup.
       HARBORBOX_SCHEDULER_POLL_SECONDS: ${HARBORBOX_SCHEDULER_POLL_SECONDS:-0.25}
       HARBORBOX_REAPER_POLL_SECONDS: ${HARBORBOX_REAPER_POLL_SECONDS:-5}
+      HARBORBOX_MAX_QUEUE_DEPTH: ${HARBORBOX_MAX_QUEUE_DEPTH:-1000}
+      HARBORBOX_SCHEDULER_SCAN_LIMIT: ${HARBORBOX_SCHEDULER_SCAN_LIMIT:-100}
+      # How long backfilling may skip the head of the queue. Past this, a
+      # failed admission at the head stops the sweep instead of scanning on,
+      # which is what stops a large job starving behind a stream of small ones.
+      HARBORBOX_QUEUE_AGING_SECONDS: ${HARBORBOX_QUEUE_AGING_SECONDS:-60}
       HARBORBOX_MAX_UPLOAD_BYTES: ${HARBORBOX_MAX_UPLOAD_BYTES:-157286400}
       HARBORBOX_DEFAULT_IDLE_TIMEOUT_SECONDS: ${HARBORBOX_ONVO_IDLE_TIMEOUT_SECONDS:-1200}
+      # The hot rung of the idle ladder. A frozen sandbox holds its whole
+      # memory reservation, so the tier is capped separately; past the cap idle
+      # sandboxes go straight to cold. 0 in either disables it, which the
+      # README recommends where memory is the binding constraint -- that
+      # instruction only works because these are forwarded.
+      HARBORBOX_HOT_PAUSE_IDLE_SECONDS: ${HARBORBOX_HOT_PAUSE_IDLE_SECONDS:-60}
+      HARBORBOX_HOT_PAUSE_BUDGET_MB: ${HARBORBOX_HOT_PAUSE_BUDGET_MB:-2048}
     volumes:
       # A client certificate, and nothing else that grants anything. This
       # replaces the Docker socket the API used to mount for POST
