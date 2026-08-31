@@ -14,6 +14,11 @@ before treating it as an isolation boundary for hostile public workloads.
 client -> Harborbox API -> PostgreSQL queue -> scheduler -> OpenSandbox -> runtime
 ```
 
+An illustrated walkthrough of the same material -- the sandbox state machine,
+an animated admission sweep, and a capacity calculator -- is published at
+<https://onvo-ai.github.io/harborbox/>. It is generated from `site/index.html`
+in this repository.
+
 ## What is included
 
 - Durable PostgreSQL execution queue
@@ -333,14 +338,20 @@ client automatically warms or resumes a lazy sandbox before file operations.
 
 ## Scheduling and memory safety
 
-Every sandbox receives a hard OpenSandbox memory limit. The scheduler reserves
-that entire limit rather than assuming current low usage will continue. A new sandbox is
-admitted only when both conditions hold:
+Every sandbox receives hard OpenSandbox memory and CPU limits. The scheduler
+reserves those entire limits rather than assuming current low usage will
+continue. A queued execution is admitted only when all three conditions hold:
 
 ```text
 reserved sandbox memory + requested memory <= sandbox budget
-host available memory - requested memory >= emergency reserve
+host available memory   - requested memory >= emergency reserve
+reserved cpu            + requested cpu    <= HARBORBOX_MAX_PARALLEL_CPU
 ```
+
+The first and third are ledger checks against Harborbox's own reservations. The
+second is the only one that looks at the real machine: it reads `MemAvailable`
+from `/proc/meminfo` on every sweep, so unrelated host processes eating memory
+block admission even when the ledger says there is room.
 
 The effective sandbox budget is the smallest applicable ceiling derived from:
 
@@ -349,24 +360,95 @@ HARBORBOX_SANDBOX_MEMORY_BUDGET_MB
 host memory - host reserve - platform reserve
 ```
 
-For example, an 8 GiB sandbox budget can run eight 1 GiB sandboxes, four 2 GiB
-sandboxes, or any safe combination. Different sandboxes run concurrently.
-Executions within one sandbox may overlap up to
-`HARBORBOX_MAX_CONCURRENT_EXECUTIONS_PER_SANDBOX`; the container's hard memory
-and CPU limits still bound their combined usage.
+### What each status reserves
 
-The `/v1/capacity` endpoint reports current reservations, warm-pool headroom,
-and queue counts.
+Memory and CPU are not held across the same set of states. A frozen sandbox
+keeps its whole memory reservation and gives back its CPU allotment; a cold one
+gives back both. That asymmetry is the entire reason the pause ladder exists.
+
+| Status | Memory held | CPU held |
+| --- | --- | --- |
+| `created` | no | no |
+| `starting` | yes | yes |
+| `running` | yes | yes |
+| `paused_memory` | yes | no |
+| `paused_cold` | no | no |
+| `pooling` / `pooled` | yes | no |
+| `killed` / `failed` | no | no |
+
+Reservation begins at `starting`, not at `running`: admission takes it before
+any container exists.
+
+### How many sandboxes run at once
+
+Two numbers, and the smaller wins:
+
+```text
+by memory = floor((sandbox budget - warm pool memory) / sandbox memory)
+by cpu    = floor((max parallel cpu - warm pool cpu)  / sandbox cpu)
+
+concurrent running sandboxes = min(by memory, by cpu)
+```
+
+The warm pool's configured maximum is reserved permanently, even after an idle
+pool scales to zero, so a refill cannot race admission over the cap.
+
+On the bundled Compose stack with a 16 GiB Docker VM and nothing overridden:
+
+| Sandbox shape | By memory | By cpu | Concurrent |
+| --- | --- | --- | --- |
+| `base` template, 512 MB / 1.0 cpu | 7 | 3 | **3** |
+| custom template at the defaults, 1024 MB / 2.0 cpu | 3 | 1 | **1** |
+
+CPU is the binding constraint in both cases, because `compose.yaml` defaults
+`HARBORBOX_MAX_PARALLEL_CPU` to 4 and the warm pool holds 1.0 of it
+permanently. If those numbers are lower than you expected, raise
+`HARBORBOX_MAX_PARALLEL_CPU` toward the host's real core count, or size
+sandboxes at 1.0 cpu. The memory budget is not what is stopping you.
+
+Three counts that are not that one:
+
+- **Sandboxes that exist** is far larger. `paused_cold` holds nothing, so
+  cold-suspended sandboxes are bounded only by row retention.
+- **Sandboxes holding memory** is `running` plus `starting` plus
+  `paused_memory` plus the pool, per the table above.
+- **Concurrent executions** is the running count times
+  `HARBORBOX_MAX_CONCURRENT_EXECUTIONS_PER_SANDBOX`. A second command into an
+  already-running sandbox adds zero memory and zero cpu at admission, so it is
+  gated only by that per-sandbox limit. The container's hard limits still bound
+  what the overlapping executions do together.
+
+The `/v1/capacity` endpoint reports all of it live: budget, reservations,
+warm-pool headroom, running sandboxes, and running and queued executions.
+
+### Queue order
+
+Queued executions are scanned oldest first, up to
+`HARBORBOX_SCHEDULER_SCAN_LIMIT` rows per sweep, under `SELECT ... FOR UPDATE`
+so nothing else can change them mid-decision. An execution that does not fit is
+skipped and the scan continues, so small work is not stuck behind a large job
+that cannot start yet.
+
+One exception stops that from starving the large job. Once the row at the head
+of the queue has waited longer than `HARBORBOX_QUEUE_AGING_SECONDS`, a failed
+admission stops the sweep outright, and nothing behind it is admitted until it
+goes. The queue is therefore opportunistic for the first minute of any job's
+wait and strictly first-come after that.
+
+Admitted executions run as independent tasks, but every sandbox start goes
+through a per-sandbox lock, so two executions landing on the same cold sandbox
+can never produce two containers. A caller that gives up waiting does not cancel
+the start: it is shielded, because aborting mid-`start_sandbox` would strand a
+container the sandbox row never learns about.
 
 ### Pause behavior
 
 - `sandbox.pause(memory=True)` delegates to OpenSandbox pause. On Docker,
   processes survive and the full memory remains reserved. Resuming is an
-  unfreeze, which is the only resume path that is plausibly sub-second.
+  unfreeze.
 - `sandbox.pause(memory=False)` creates an OpenSandbox filesystem snapshot and
   terminates the runtime. CPU and memory are released; files survive, live
-  processes do not. Resuming builds a new container from the snapshot, which
-  costs seconds.
+  processes do not. Resuming builds a new container from the snapshot.
 
 Idle sandboxes walk down both tiers rather than dropping straight to cold:
 
@@ -381,6 +463,23 @@ memory reservation, the tier is capped by `HARBORBOX_HOT_PAUSE_BUDGET_MB`;
 past the cap, sandboxes go straight to cold. Set
 `HARBORBOX_HOT_PAUSE_IDLE_SECONDS=0` to disable the tier entirely and restore
 the previous behavior. `idle_timeout_seconds: 0` still means "never suspend".
+
+What the tier is worth, measured by `tests/e2e_pause_ladder.py` against a live
+stack at 256 MB / 0.5 cpu:
+
+```text
+freeze     65 ms      snapshot   5075 ms
+unfreeze   97 ms      restore     465 ms
+```
+
+Read the right-hand column before enabling it. The pause side is where the tier
+overwhelmingly pays: freezing an idle sandbox costs almost nothing, while
+snapshotting one is the single most expensive thing the scheduler does. The
+resume side is a much narrower win than it looks, because restoring from a
+snapshot is also sub-second. Freezing buys roughly 370 ms on resume in exchange
+for holding the sandbox's entire memory reservation until it is used again --
+worth having where a sandbox is likely to be touched again within the minute
+and memory is not the binding constraint, and worth turning off where it is.
 
 ## Parent-machine protection
 
@@ -397,6 +496,56 @@ Important settings are documented in `.env.example`.
 For a stronger isolation boundary, configure OpenSandbox's `[secure_runtime]`
 block for gVisor or Kata on Linux, or deploy its Kubernetes backend with an
 appropriate RuntimeClass.
+
+## Running on more than one machine
+
+Harborbox reaches OpenSandbox over ordinary HTTP, so pointing it at a remote or
+Kubernetes-backed OpenSandbox is a settings change: `HARBORBOX_OPENSANDBOX_DOMAIN`,
+`_PROTOCOL` and `_API_KEY`. Nothing in the control plane assumes a local
+runtime, and the `SandboxRuntime` protocol in `runtime_protocol.py` exists so
+that another provider is an addition rather than a change to the scheduler,
+admission controller or API. This is the recommended shape for hostile
+workloads, since ordinary Docker containers share the host kernel.
+
+Two parts of the control plane are already written for more than one instance.
+Warm pools coordinate through PostgreSQL with distributed leases and leader
+fencing (`postgres_pool_store.py`), and queue wake-ups use `LISTEN`/`NOTIFY` on
+that same database specifically so they reach every API replica without adding a
+broker.
+
+Three things still stand between that and an actual multi-instance deployment,
+in dependency order:
+
+1. **One control-plane process only.** The single-start guarantee is an
+   in-process `asyncio.Lock` per sandbox. Two replicas against one database hold
+   two unrelated lock dictionaries, race the same sandbox row, and can create
+   two containers for one sandbox. `Dockerfile.api`'s `uvicorn` has no
+   `--workers` for exactly this reason. The fix is a database-level lock --
+   `SELECT ... FOR UPDATE` on the sandbox row, the same pattern
+   `_admit_available_jobs` already uses for admission.
+2. **Capacity is measured locally.** `total_memory_mb` and
+   `available_memory_mb` read `/proc/meminfo` inside the API container.
+   `HARBORBOX_TOTAL_MEMORY_MB` can override the total, but the live emergency
+   guard still reads local `MemAvailable`, which on a split deployment describes
+   a machine that runs no sandboxes. A single flat budget also cannot express
+   per-node capacity. Multi-node admission needs capacity to come from the
+   runtime rather than from `/proc`.
+3. **The registry has one address per deployment shape.** BuildKit pushes to
+   `registry:5000` over the build network, while the reference Harborbox hands
+   to OpenSandbox is `127.0.0.1:5050`, because the Docker daemon resolves it
+   from the host. That pairing only holds while OpenSandbox is on the same host.
+   A split or clustered deployment needs a real DNS name with TLS; see
+   `docs/arbitrary-dockerfile-templates.md` section 9.
+
+Until those land, a Kubernetes deployment is possible but comes with conditions:
+one API process schedules the whole cluster, `HARBORBOX_TOTAL_MEMORY_MB` has to
+be set deliberately because nothing can measure it, and the registry needs a
+routable name.
+
+There is also a design question worth settling before any of that is built. Once
+Kubernetes is scheduling pods, one of the two schedulers is redundant. Either
+Harborbox keeps the queue and admission and hands placement to the cluster, or
+it steps back to being the durable queue and lifecycle API alone.
 
 ## Telemetry
 
