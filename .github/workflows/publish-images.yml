@@ -19,6 +19,24 @@
 # cannot see the host daemon's image store. That is the same reason
 # docker-bake.hcl carries a TEMPLATE_REGISTRY at all; this workflow is what
 # makes the public registry a usable value for it.
+#
+# --------------------------------------------------------------------------
+# Why every architecture gets its own runner rather than one buildx call with
+# `platforms: linux/amd64,linux/arm64`.
+#
+# The obvious single-job shape emulates arm64 through QEMU, and that is a trap
+# for any image with a heavyweight build. Measured on onvo-ai/toolspoke on
+# 2026-09-03: commands that take two minutes natively had not finished after
+# sixty minutes emulated, and the run was cancelled. Split across native
+# runners the same work took six.
+#
+# harborbox's own builds are lighter than that, but the failure mode is the
+# same and gets worse as the image grows. So each architecture builds on a
+# machine of its own architecture, nothing is emulated, and the four build
+# jobs run in parallel. They push by digest with no tag; `merge` assembles the
+# digests belonging to one image into a multi-architecture manifest and puts
+# that image's tags on it.
+# --------------------------------------------------------------------------
 name: Publish images
 
 on:
@@ -37,48 +55,54 @@ permissions:
   contents: read
   packages: write
 
+# One publish at a time, across both images, so that two runs cannot race to
+# move the same tag. `cancel-in-progress` is wrong here: a half-cancelled push
+# is worse than a queued one.
+concurrency:
+  group: publish-images
+  cancel-in-progress: false
+
 jobs:
-  publish:
-    name: Build and push ${{ matrix.image }}
-    # Hosted rather than the self-hosted runners CI uses. A multi-architecture
-    # build needs QEMU and a buildx builder, which the shared runners do not
-    # provide. harborbox is public, so these runners are free here.
-    runs-on: ubuntu-latest
+  build:
+    name: Build ${{ matrix.image }} ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
 
     strategy:
-      # One image failing should not cancel the other's push half-way. They
-      # are independent artifacts and a partial publish is easier to reason
-      # about than a cancelled one.
+      # One architecture failing should not cancel the other's push midway.
+      # `merge` requires both digests and checks that itself, so letting the
+      # rest finish tells us whether a failure is architecture-specific.
       fail-fast: false
+      # Two real dimensions, so this is a 2x2 cross product: four build jobs.
+      # `platform` has to be a matrix key rather than something the `include`
+      # entries introduce -- an include that adds a key absent from the base
+      # matrix applies to every combination, so listing the two platforms only
+      # under `include` would set them both on the same jobs and leave one
+      # architecture unbuilt. The includes below add `runner` and `dockerfile`
+      # to combinations that already exist, which is what include is for.
       matrix:
+        image: [harborbox-api, harborbox-sandbox-base]
+        platform: [linux/amd64, linux/arm64]
         include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            # A native arm64 runner. This is the whole point of the split:
+            # no QEMU anywhere in this workflow.
+            runner: ubuntu-24.04-arm
           - image: harborbox-api
             dockerfile: Dockerfile.api
-            title: Harborbox API
-            description: The Harborbox sandbox platform API - pool management, template builds and code execution.
           - image: harborbox-sandbox-base
             dockerfile: sandbox/Dockerfile
-            title: Harborbox sandbox base
-            description: The base image Harborbox sandboxes start FROM - uid/gid 10001, a writable /workspace and CA certificates.
-
-    # Per image, not per workflow. A shared group would make the two matrix
-    # legs queue behind each other for no reason: they push different names
-    # and cannot race. `cancel-in-progress` stays false because a half
-    # cancelled push is worse than a queued one.
-    concurrency:
-      group: publish-images-${{ matrix.image }}
-      cancel-in-progress: false
 
     steps:
       - name: Check out the tagged source
         uses: actions/checkout@v4
 
-      # arm64 is emulated on an amd64 runner, which is what makes the second
-      # architecture cost build time rather than a second machine. Both
-      # Dockerfiles are architecture-clean: the base is plain debian-slim and
-      # Dockerfile.api already switches on TARGETARCH.
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      # `linux/amd64` is not usable in a filename or an artifact name. This is
+      # the same value with the slash flattened, used for both.
+      - name: Name this platform
+        id: platform
+        run: echo "pair=${{ matrix.platform }}" | tr '/' '-' >> "$GITHUB_OUTPUT"
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -90,19 +114,90 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Tags and OCI labels in one place, so each image carries its own
-      # provenance. `type=sha` is the immutable one a deployment should pin;
-      # the semver tags are the readable ones.
-      #
-      # GHCR only. Docker Hub was considered and dropped: it would buy search
-      # visibility this repository does not need, at the cost of a rate limit
-      # on anonymous pulls that GHCR does not impose and a second place for a
-      # tag to be wrong.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          # Both images build from the repository root: sandbox/Dockerfile is
+          # addressed by `file`, not by moving the context into sandbox/.
+          context: .
+          file: ./${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platform }}
+          # Pushes without a tag and reports the digest. A tag here would be
+          # wrong twice over: the two architectures would fight over one name,
+          # and whichever finished last would win until `merge` corrected it.
+          outputs: type=image,name=ghcr.io/onvo-ai/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
+          # Scoped per image and per platform, so the four jobs do not evict
+          # each other's layers on every run.
+          cache-from: type=gha,scope=${{ matrix.image }}-${{ steps.platform.outputs.pair }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-${{ steps.platform.outputs.pair }}
+          provenance: false
+
+      - name: Hand the digest to the merge job
+        run: |
+          mkdir -p /tmp/digests
+          # The bare hex, with the `sha256:` prefix stripped. An artifact path
+          # may not contain a colon, and the merge job re-attaches the prefix
+          # when it builds the image reference -- so the two halves have to
+          # agree on which form travels between them.
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload the digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.image }}-${{ steps.platform.outputs.pair }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Merge and tag ${{ matrix.image }}
+    needs: build
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: harborbox-api
+            title: Harborbox API
+            description: The Harborbox sandbox platform API - pool management, template builds and code execution.
+          - image: harborbox-sandbox-base
+            title: Harborbox sandbox base
+            description: The base image Harborbox sandboxes start FROM - uid/gid 10001, a writable /workspace and CA certificates.
+
+    steps:
+      # Only this image's digests. The pattern matters: without it a merge job
+      # would collect the other image's digests too and publish a manifest
+      # mixing two unrelated images under one name.
+      - name: Collect the digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-${{ matrix.image }}-*
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Sign in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Work out tags and labels
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/onvo-ai/${{ matrix.image }}
+          # `latest=false` because the rule below states when `latest` moves,
+          # explicitly. Left on `auto`, metadata-action adds its own `latest`
+          # for any semver tag as well, and two rules would decide one tag with
+          # only one of them written down here.
+          flavor: latest=false
           tags: |
             type=sha,format=long,prefix=
             type=semver,pattern={{version}}
@@ -113,27 +208,53 @@ jobs:
             org.opencontainers.image.title=${{ matrix.title }}
             org.opencontainers.image.description=${{ matrix.description }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          # Both images build from the repository root: sandbox/Dockerfile is
-          # addressed by `file`, not by moving the context into sandbox/.
-          context: .
-          file: ./${{ matrix.dockerfile }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          # GitHub Actions cache, scoped per image so the two matrix legs do
-          # not evict each other's layers.
-          cache-from: type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
-          provenance: false
-
-      - name: Say what was published
+      # Both single-architecture images are already in the registry; this
+      # writes the manifest list that points at them and hangs every tag off
+      # it. A `docker pull` then resolves to the puller's own architecture.
+      #
+      # Guarded on both digests being present. Without the check, one failed
+      # build job would publish a manifest advertising a single architecture
+      # under `latest` -- worse than publishing nothing, because an arm64 host
+      # would fail to pull an image that claims to exist.
+      - name: Create the multi-architecture manifest
+        working-directory: /tmp/digests
         run: |
-          echo "### Published ${{ matrix.image }}" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          echo "Built from ${{ github.sha }} for linux/amd64 and linux/arm64." >> "$GITHUB_STEP_SUMMARY"
+          count="$(find . -type f | wc -l | tr -d ' ')"
+          if [ "$count" -ne 2 ]; then
+            echo "::error::Expected a digest from each of the two build jobs for ${{ matrix.image }}, found $count." \
+                 "Refusing to publish a manifest that would advertise only one architecture."
+            exit 1
+          fi
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< '${{ steps.meta.outputs.json }}') \
+            $(printf 'ghcr.io/onvo-ai/${{ matrix.image }}@sha256:%s ' *)
+
+      # Proves the manifest carries both architectures rather than trusting
+      # that the command above did what it was asked.
+      #
+      # Retried, because a registry read straight after a write is not
+      # guaranteed to see it. Cutting toolspoke 0.1.0 failed exactly here: the
+      # manifest had been pushed four seconds earlier and the inspect six
+      # seconds later still answered `not found`. A verification step that
+      # fails at random is worse than none, because the next person learns to
+      # re-run it rather than read it.
+      - name: Check what was published
+        run: |
+          tag="$(echo '${{ steps.meta.outputs.tags }}' | head -n1)"
+          for attempt in 1 2 3 4 5; do
+            if docker buildx imagetools inspect "$tag"; then break; fi
+            if [ "$attempt" = 5 ]; then
+              echo "::error::$tag is still not readable after five attempts." \
+                   "The manifest push above reported success, so check the registry by hand."
+              exit 1
+            fi
+            echo "Not visible yet, retrying in $((attempt * 5))s (attempt $attempt of 5)."
+            sleep "$((attempt * 5))"
+          done
+          {
+            echo "### Published ${{ matrix.image }}"
+            echo '```'
+            echo "${{ steps.meta.outputs.tags }}"
+            echo '```'
+            echo "Built from ${{ github.sha }} for linux/amd64 and linux/arm64, each on a native runner."
+          } >> "$GITHUB_STEP_SUMMARY"
