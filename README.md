@@ -40,6 +40,24 @@ in this repository.
 - OpenSandbox egress, credential vault, and secure runtime compatibility
 - OpenAPI documentation at `/docs`
 
+## Published images
+
+Two images are published on every GitHub release, for `linux/amd64` and
+`linux/arm64`, to GitHub Container Registry:
+
+| Image | What it is |
+| --- | --- |
+| `ghcr.io/onvo-ai/harborbox-api` | The service. Speaks the HTTP API, owns the warm pool, and builds product templates at runtime. |
+| `ghcr.io/onvo-ai/harborbox-sandbox-base` | The image sandboxes start `FROM`. Almost empty by design: uid/gid 10001, a writable `/workspace`, and CA certificates. |
+
+Pin a version tag rather than tracking `latest` on anything you care about;
+every image is also published under its git SHA if you want to pin exactly.
+
+The base image is published rather than left to a local build because the
+API's builder resolves a derived template's `FROM` over its own network and
+cannot see the host daemon's image store. Point `TEMPLATE_REGISTRY` at a
+registry both can reach, and `HARBORBOX_BASE_IMAGE` at the tag you pinned.
+
 ## Quick start
 
 Create a local configuration:

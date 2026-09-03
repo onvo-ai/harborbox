@@ -1,0 +1,139 @@
+# Publishes the two container images Harborbox ships.
+#
+# Deliberately NOT triggered by pushes to main. An image is a thing other
+# people run, and publishing one on every merge means `latest` moves under a
+# deployment several times a day with nothing to read about what changed.
+# Publishing is an act, so it has an act behind it: cutting a release, or
+# somebody choosing to run this by hand.
+#
+# The two images are not variants of each other and are not interchangeable:
+#
+#   harborbox-api           the service. Speaks the HTTP API, owns the pool,
+#                           builds product templates at runtime.
+#   harborbox-sandbox-base  the image sandboxes start FROM. Almost empty by
+#                           design -- uid/gid 10001, a writable /workspace and
+#                           CA certificates -- see sandbox/Dockerfile.
+#
+# The base image has to be published rather than built locally because the
+# API's builder resolves a derived template's FROM over its own network and
+# cannot see the host daemon's image store. That is the same reason
+# docker-bake.hcl carries a TEMPLATE_REGISTRY at all; this workflow is what
+# makes the public registry a usable value for it.
+name: Publish images
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Extra tag to publish alongside the commit SHA (for example 0.3.0). Leave empty for the SHA only."
+        required: false
+        type: string
+
+# Least privilege. `packages: write` is what pushing to GHCR needs;
+# `contents: read` is what checkout needs. Nothing here writes to the repo.
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: Build and push ${{ matrix.image }}
+    # Hosted rather than the self-hosted runners CI uses. A multi-architecture
+    # build needs QEMU and a buildx builder, which the shared runners do not
+    # provide. harborbox is public, so these runners are free here.
+    runs-on: ubuntu-latest
+
+    strategy:
+      # One image failing should not cancel the other's push half-way. They
+      # are independent artifacts and a partial publish is easier to reason
+      # about than a cancelled one.
+      fail-fast: false
+      matrix:
+        include:
+          - image: harborbox-api
+            dockerfile: Dockerfile.api
+            title: Harborbox API
+            description: The Harborbox sandbox platform API - pool management, template builds and code execution.
+          - image: harborbox-sandbox-base
+            dockerfile: sandbox/Dockerfile
+            title: Harborbox sandbox base
+            description: The base image Harborbox sandboxes start FROM - uid/gid 10001, a writable /workspace and CA certificates.
+
+    # Per image, not per workflow. A shared group would make the two matrix
+    # legs queue behind each other for no reason: they push different names
+    # and cannot race. `cancel-in-progress` stays false because a half
+    # cancelled push is worse than a queued one.
+    concurrency:
+      group: publish-images-${{ matrix.image }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@v4
+
+      # arm64 is emulated on an amd64 runner, which is what makes the second
+      # architecture cost build time rather than a second machine. Both
+      # Dockerfiles are architecture-clean: the base is plain debian-slim and
+      # Dockerfile.api already switches on TARGETARCH.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Sign in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Tags and OCI labels in one place, so each image carries its own
+      # provenance. `type=sha` is the immutable one a deployment should pin;
+      # the semver tags are the readable ones.
+      #
+      # GHCR only. Docker Hub was considered and dropped: it would buy search
+      # visibility this repository does not need, at the cost of a rate limit
+      # on anonymous pulls that GHCR does not impose and a second place for a
+      # tag to be wrong.
+      - name: Work out tags and labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/onvo-ai/${{ matrix.image }}
+          tags: |
+            type=sha,format=long,prefix=
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'release' && !github.event.release.prerelease }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.title }}
+            org.opencontainers.image.description=${{ matrix.description }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          # Both images build from the repository root: sandbox/Dockerfile is
+          # addressed by `file`, not by moving the context into sandbox/.
+          context: .
+          file: ./${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # GitHub Actions cache, scoped per image so the two matrix legs do
+          # not evict each other's layers.
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          provenance: false
+
+      - name: Say what was published
+        run: |
+          echo "### Published ${{ matrix.image }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.meta.outputs.tags }}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "Built from ${{ github.sha }} for linux/amd64 and linux/arm64." >> "$GITHUB_STEP_SUMMARY"
