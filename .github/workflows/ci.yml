@@ -102,16 +102,20 @@ jobs:
       # and its 196 statements are ~6 points of the repo total. A fail_under in
       # pyproject.toml would fail every laptop run that has no database.
       #
-      # The per-file floor is the house pattern (see the `test-coverage` skill):
-      # a module that reached 100% is pinned there, so the next change to it
-      # arrives with its tests. Raise the repo floor whenever a climb lifts it;
-      # add a new --include line whenever a module reaches 100%.
+      # The per-file floors are the house pattern (see the `test-coverage`
+      # skill): a module that reached 100% is pinned there, so the next change
+      # to it arrives with its tests. postgres_pool_store.py and
+      # opensandbox_compat.py are both at 100% and both pinned. Raise the repo
+      # floor whenever a climb lifts it; add a new --include line whenever a
+      # module reaches 100%.
       - name: Coverage floors
         if: always()
         run: |
           uv run coverage report --fail-under=68
           uv run coverage report --fail-under=100 \
             --include='src/harborbox/postgres_pool_store.py'
+          uv run coverage report --fail-under=100 \
+            --include='src/harborbox/opensandbox_compat.py'
 
       # The backlog behind the ignore list, printed on every run rather than
       # discovered by someone going looking. Expected to be non-zero: it is the
