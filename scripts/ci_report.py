@@ -22,8 +22,9 @@ FOOTNOTE = (
     "whole tree in `src`. E2E tests run against a local Compose stack built from "
     "this commit. The lint backlog is what `ruff --select ALL` reports with "
     "nothing ignored; the blocking `ruff check` gate is green at zero. Coverage "
-    "is reported but not yet enforced - the blocking pytest job runs tests, "
-    "not a coverage threshold; that gate arrives with the coverage work.</sub>"
+    "is enforced by the blocking `Coverage floors` step: a repo-total floor plus "
+    "a 100% pin on each module that has reached it. A floor is never lowered to "
+    "get a build green - a coverage failure means the change needs tests.</sub>"
 )
 
 
