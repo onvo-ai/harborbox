@@ -84,17 +84,39 @@ jobs:
       - name: Typecheck
         run: uv run mypy
 
-      # Tests are a blocking gate: a failing test fails this job. Coverage is
-      # measured and reported (see the PR comment) but not yet enforced -
-      # `[tool.coverage.report]` in pyproject.toml sets no fail_under, so the
-      # command can't fail on coverage regardless. `if: always()` keeps
-      # coverage measurement running even if Lint or Typecheck failed above,
-      # so the PR comment still has numbers to show.
+      # Tests are a blocking gate: a failing test fails this job. `if: always()`
+      # keeps coverage measurement running even if Lint or Typecheck failed
+      # above, so the PR comment still has numbers to show.
       - name: Tests and coverage
         if: always()
         run: >-
           uv run pytest --cov --cov-report=json --cov-report=term-missing
           --json-report --json-report-file=unit-results.json
+
+      # The ratchet. Neither floor may be lowered to get a PR green: a coverage
+      # failure means the change needs tests, not a smaller number.
+      #
+      # They live here rather than in `[tool.coverage.report] fail_under`
+      # because a fail_under in pyproject.toml applies to every laptop run too,
+      # including ones that skip a suite for want of a service (the postgres
+      # marker above is the first of those), and a floor that fails locally for
+      # environment reasons is a floor people learn to pass with `-p no:cov`.
+      #
+      # The per-file floor is the house pattern (see the `test-coverage`
+      # skill): a module that reached 100% is pinned there, so the next change
+      # to it arrives with its tests. Raise the repo floor whenever a climb
+      # lifts it; add a --include line whenever a module reaches 100%.
+      #
+      # The repo total sits at 65.8% today. The floor is 65 rather than 66
+      # because `coverage report` compares a value rounded to the configured
+      # precision, so a 66 floor is one uncovered statement from failing on a
+      # change that adds no risk at all.
+      - name: Coverage floors
+        if: always()
+        run: |
+          uv run coverage report --fail-under=65
+          uv run coverage report --fail-under=100 \
+            --include='src/harborbox/opensandbox_compat.py'
 
       # The backlog behind the ignore list, printed on every run rather than
       # discovered by someone going looking. Expected to be non-zero: it is the
