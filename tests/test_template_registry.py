@@ -26,8 +26,11 @@ from harborbox.db import Base, get_session
 from harborbox.models import Sandbox, SandboxTemplate, utc_now
 from harborbox.security import require_api_key
 from harborbox.templates import (
+    ResolvedTemplate,
     TemplateNotReadyError,
     UnknownTemplateError,
+    list_derived_templates,
+    mark_template_used,
     resolve_template,
     validate_template_spec,
 )
@@ -1104,3 +1107,120 @@ async def test_a_pooled_custom_template_reports_its_pool_size(
         app.state.settings = Settings()
 
     assert response.json()["warm_pool"] == pool_size
+
+
+async def test_derived_templates_are_listed_in_creation_order(
+    session: AsyncSession,
+) -> None:
+    """`GET /v1/templates` reads this, and order is the part callers see.
+
+    The query orders by `created_at` rather than by the primary key, which is a
+    content hash and therefore in no useful order at all. A listing sorted by
+    hash would reshuffle itself every time someone added a template.
+    """
+    older = derived_row(
+        dockerfile="FROM debian:bookworm-slim\nRUN echo older\n",
+        created_at=utc_now() - timedelta(hours=2),
+    )
+    newer = derived_row(
+        dockerfile="FROM debian:bookworm-slim\nRUN echo newer\n",
+        created_at=utc_now(),
+    )
+    session.add_all([newer, older])
+    await session.commit()
+
+    listed = await list_derived_templates(session)
+
+    assert [row.name for row in listed] == [older.name, newer.name]
+
+
+async def test_listing_derived_templates_on_an_empty_registry_is_not_an_error(
+    session: AsyncSession,
+) -> None:
+    """A deployment that has never built a derived template still lists fine.
+
+    Static templates are configuration rather than rows, so an empty table is
+    the normal state of a fresh deployment, not a missing one.
+    """
+    assert await list_derived_templates(session) == []
+
+
+async def test_marking_a_static_template_used_records_nothing(
+    session: AsyncSession,
+) -> None:
+    """Static templates have no row, so there is nothing to stamp.
+
+    Image GC uses `last_used_at` to tell a live derived image from a dead one.
+    Static templates are never collected, and looking one up by name would find
+    no row and — worse — read as a derived template that has fallen out of the
+    registry.
+    """
+    static = ResolvedTemplate(
+        name="base",
+        base="base",
+        image="harborbox-sandbox-base:local",
+        memory_mb=512,
+        cpu=1.0,
+        status="ready",
+        derived=False,
+    )
+
+    await mark_template_used(session, static)
+
+    assert await list_derived_templates(session) == []
+
+
+async def test_marking_a_derived_template_used_moves_its_last_used_at(
+    session: AsyncSession,
+) -> None:
+    """The stamp is all that stands between a live image and image GC.
+
+    A template in daily use whose `last_used_at` never moves looks exactly like
+    one abandoned weeks ago, and the collector cannot tell them apart.
+    """
+    stale = utc_now() - timedelta(days=30)
+    template = derived_row(last_used_at=stale)
+    session.add(template)
+    await session.commit()
+
+    resolved = ResolvedTemplate(
+        name=template.name,
+        base=template.base,
+        image=template.image,
+        memory_mb=template.memory_mb,
+        cpu=template.cpu,
+        status=template.status,
+        derived=True,
+        spec_hash=template.spec_hash,
+    )
+    await mark_template_used(session, resolved)
+    await session.commit()
+
+    refreshed = await session.get(SandboxTemplate, template.name)
+    assert refreshed is not None
+    assert refreshed.last_used_at > stale
+
+
+async def test_marking_a_vanished_derived_template_used_does_not_raise(
+    session: AsyncSession,
+) -> None:
+    """A row deleted between resolve and use is a race, not a crash.
+
+    `resolve_template` and the create path that follows it run in separate
+    statements, so image GC can remove the row in between. Sandbox creation must
+    not fail because the bookkeeping it was about to write had nowhere to go.
+    """
+    vanished = ResolvedTemplate(
+        name="custom-deadbeefcafe",
+        base="",
+        image="harborbox-sandbox-custom-deadbeefcafe:local",
+        memory_mb=512,
+        cpu=1.0,
+        status="ready",
+        derived=True,
+        spec_hash="deadbeefcafe",
+    )
+
+    await mark_template_used(session, vanished)
+
+    assert await session.get(SandboxTemplate, vanished.name) is None
