@@ -6,6 +6,23 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# All three jobs run on the shared, fixed-name `onvo-ci` self-hosted runners
+# (build-server, three runner instances, one host). Two overlapping E2E
+# (Compose) jobs there fight over the same container and network names --
+# `docker compose up` for one run sees the other's `harborbox-opensandbox-1`
+# still starting and its dependency check fails, or the shared
+# `harborbox-control` network can't be removed because the sibling run's
+# containers are still attached to it. Confirmed from two CI re-runs of the
+# same commit on 2026-09-08 (runs 34211897250, 34211367996): E2E (Compose)
+# failed on attempt 1 and passed on attempt 2 with nothing else changed.
+# onvo hit the identical class of shared-host contention (DEV-2025, fixed
+# ports colliding across simultaneous Playwright runs) and closed it the same
+# way: serialise same-ref runs so a superseded one is cancelled rather than
+# racing a fresh one for the host's fixed names.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Unit tests
