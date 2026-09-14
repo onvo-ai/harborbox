@@ -104,18 +104,38 @@ jobs:
       #
       # The per-file floors are the house pattern (see the `test-coverage`
       # skill): a module that reached 100% is pinned there, so the next change
-      # to it arrives with its tests. postgres_pool_store.py and
-      # opensandbox_compat.py are both at 100% and both pinned. Raise the repo
-      # floor whenever a climb lifts it; add a new --include line whenever a
-      # module reaches 100%.
+      # to it arrives with its tests. Raise the repo floor whenever a climb
+      # lifts it; add a new --include line whenever a module reaches 100%.
+      #
+      # Every pin except postgres_pool_store.py is verifiable on a laptop, and
+      # for a reason worth writing down: running *more* tests than a local run
+      # does cannot lower a percentage, so a file at 100% without the database
+      # is still at 100% with it.
+      #
+      # The repo floor is the one number that does NOT work that way — it is a
+      # denominator over the whole tree, and postgres_pool_store.py's 196
+      # skipped statements are ~5 points of it. So raise it only from a run that
+      # had a database. 70 is `achieved - 1` against 71.16% (2233/3138),
+      # measured 2026-09-11 against a local PostgreSQL with the full 391-test
+      # suite and no skips.
       - name: Coverage floors
         if: always()
         run: |
-          uv run coverage report --fail-under=68
+          uv run coverage report --fail-under=70
           uv run coverage report --fail-under=100 \
             --include='src/harborbox/postgres_pool_store.py'
           uv run coverage report --fail-under=100 \
             --include='src/harborbox/opensandbox_compat.py'
+          uv run coverage report --fail-under=100 \
+            --include='src/harborbox/templates.py'
+          uv run coverage report --fail-under=100 \
+            --include='src/harborbox/admission.py'
+          uv run coverage report --fail-under=100 \
+            --include='src/harborbox/models.py'
+          uv run coverage report --fail-under=100 \
+            --include='src/harborbox/errors.py'
+          uv run coverage report --fail-under=100 \
+            --include='src/harborbox/runtime_protocol.py'
 
       # The backlog behind the ignore list, printed on every run rather than
       # discovered by someone going looking. Expected to be non-zero: it is the

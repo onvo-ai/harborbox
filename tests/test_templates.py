@@ -240,3 +240,106 @@ def test_the_conformance_layer_tolerates_a_base_that_already_conforms() -> None:
     rendered = render_dockerfile("FROM debian:12\n")
 
     assert "getent" in rendered
+
+
+def test_a_dockerfile_with_no_content_is_refused_before_anything_else() -> None:
+    """An empty spec must not reach the builder as an empty image.
+
+    `POST /v1/templates` takes the Dockerfile as a string, so "" and a file of
+    blank lines are both things a caller can send by accident — a template
+    request whose payload silently lost its body. Refusing here is what stops
+    that becoming a build of the conformance layer alone.
+    """
+    for empty in ("", "   ", "\n\n", "  \n\t\n  "):
+        with pytest.raises(TemplateSpecError, match="a dockerfile is required"):
+            validate_template_spec(raw_settings(), dockerfile=empty)
+
+
+def test_a_build_context_must_be_a_sha256_digest() -> None:
+    """The context is an opaque handle from POST /v1/build-contexts, not a path.
+
+    Anything else is either a caller inventing a reference or a path it hopes
+    the builder will read, and both have to stop at validation rather than at
+    whatever the builder does with an unknown digest.
+    """
+    digest = "sha256:" + "ab" * 32
+    spec = validate_template_spec(raw_settings(), dockerfile=RAW, context=digest)
+    assert spec.context_digest == digest
+
+    for bad in ("../etc/passwd", "sha256:short", "ab" * 32, "SHA256:" + "ab" * 32):
+        with pytest.raises(TemplateSpecError, match="invalid build context digest"):
+            validate_template_spec(raw_settings(), dockerfile=RAW, context=bad)
+
+
+def test_comments_and_blank_lines_are_not_instructions() -> None:
+    """The instruction cap counts build steps, not lines of text.
+
+    A well-commented Dockerfile would otherwise be refused for being
+    well-commented, which is the sort of limit people route around by deleting
+    the comments.
+    """
+    settings = raw_settings(template_max_dockerfile_instructions=2)
+    commented = (
+        "# what this image is for\n"
+        "FROM debian:bookworm-slim\n"
+        "\n"
+        "   \n"
+        "# install the toolchain\n"
+        "RUN apt-get update\n"
+    )
+
+    spec = validate_template_spec(settings, dockerfile=commented)
+
+    assert spec.dockerfile == commented
+
+
+def test_a_line_continuation_counts_as_one_instruction() -> None:
+    """A wrapped RUN is one build step, and the cap has to agree.
+
+    Every non-trivial Dockerfile chains `apt-get` across wrapped lines. Counting
+    each physical line would make the instruction cap a line-length cap, so the
+    two forms of the same build must count the same.
+    """
+    settings = raw_settings(template_max_dockerfile_instructions=2)
+    wrapped = (
+        "FROM debian:bookworm-slim\n"
+        "RUN apt-get update \\\n && apt-get install -y \\\n    curl\n"
+    )
+
+    spec = validate_template_spec(settings, dockerfile=wrapped)
+    assert spec.dockerfile == wrapped
+
+    # The same steps unwrapped are three instructions, and the same cap refuses
+    # them — which is what proves the joining above, not a cap that never bit.
+    unwrapped = "FROM debian:bookworm-slim\nRUN apt-get update\nRUN apt-get install -y curl\n"
+    with pytest.raises(TemplateSpecError, match="instructions"):
+        validate_template_spec(settings, dockerfile=unwrapped)
+
+
+def test_a_dockerfile_ending_mid_continuation_still_counts_its_last_step() -> None:
+    """A trailing backslash must not make the last instruction disappear.
+
+    The joiner only appends when it meets a line that does *not* end in a
+    backslash, so a file whose final line does would leave that step buffered
+    and uncounted — and an uncounted instruction is one that walks past both the
+    instruction cap and the FROM allowlist.
+    """
+    settings = raw_settings(template_max_dockerfile_instructions=1)
+    dangling = "FROM debian:bookworm-slim\nRUN apt-get update \\\n"
+
+    with pytest.raises(TemplateSpecError, match="has 2 instructions"):
+        validate_template_spec(settings, dockerfile=dangling)
+
+
+def test_a_from_carrying_only_flags_names_no_image() -> None:
+    """`FROM --platform=…` with nothing after it is refused, not allowlisted.
+
+    Flags are stripped before the allowlist check, so a FROM whose arguments are
+    all flags leaves nothing to check. Reading that as "no image, therefore
+    nothing disallowed" would be a hole straight through the supply-chain
+    control.
+    """
+    with pytest.raises(TemplateSpecError, match="names no image"):
+        validate_template_spec(
+            raw_settings(), dockerfile="FROM --platform=linux/amd64\nRUN true\n"
+        )
