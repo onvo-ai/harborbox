@@ -132,9 +132,11 @@ jobs:
       # The repo floor is the one number that does NOT work that way — it is a
       # denominator over the whole tree, and postgres_pool_store.py's 196
       # skipped statements are ~5 points of it. So raise it only from a run that
-      # had a database. 70 is `achieved - 1` against 71.16% (2233/3138),
-      # measured 2026-09-11 against a local PostgreSQL with the full 391-test
-      # suite and no skips.
+      # had a database. 70 is `achieved - 1` against 71.45% (2242/3138),
+      # measured 2026-09-15 against a local PostgreSQL with the full 409-test
+      # suite and no skips. Re-measured rather than re-derived: config.py's 9
+      # newly covered statements are 0.29 points, which does not move a floor
+      # already sitting at `achieved - 1`, so the number below is unchanged.
       - name: Coverage floors
         if: always()
         run: |
@@ -153,6 +155,13 @@ jobs:
             --include='src/harborbox/errors.py'
           uv run coverage report --fail-under=100 \
             --include='src/harborbox/runtime_protocol.py'
+          uv run coverage report --fail-under=100 \
+            --include='src/harborbox/config.py'
+          # Already at 100% and holding nothing but a docstring and __version__.
+          # Pinned so that the first piece of logic anyone puts in the package
+          # __init__ arrives with a test rather than quietly lowering the tree.
+          uv run coverage report --fail-under=100 \
+            --include='src/harborbox/__init__.py'
 
       # The backlog behind the ignore list, printed on every run rather than
       # discovered by someone going looking. Expected to be non-zero: it is the
