@@ -285,7 +285,11 @@ async def ensure_ready(
     settings = settings_from(request)
     scheduler = scheduler_from(request)
     if sandbox.status not in RESERVED_SANDBOX_STATES:
-        capacity = await scheduler.capacity()
+        # Pass the already-open `session` (this is ensure_ready's own
+        # parameter, on the lazy-start path shared by every file/command/
+        # process call) rather than let capacity() open its own second one
+        # alongside it -- see DEV-2400.
+        capacity = await scheduler.capacity(session)
         decision = can_admit(
             capacity,
             incremental_memory_mb=sandbox.memory_mb,
@@ -753,7 +757,9 @@ async def resume_sandbox(
         raise HTTPException(status_code=409, detail=f"cannot resume {sandbox.status}")
 
     scheduler = scheduler_from(request)
-    capacity = await scheduler.capacity()
+    # Pass the already-open `session` rather than let capacity() open its own
+    # second one alongside it -- see DEV-2400.
+    capacity = await scheduler.capacity(session)
     already_reserved = sandbox.status == "paused_memory"
     decision = can_admit(
         capacity,
@@ -1303,7 +1309,9 @@ async def get_execution(
         if blocked_by_sandbox:
             waiting_for = "sandbox"
         else:
-            capacity = await scheduler_from(request).capacity()
+            # Pass the already-open `session` rather than let capacity() open
+            # its own second one alongside it -- see DEV-2400.
+            capacity = await scheduler_from(request).capacity(session)
             already_reserved = sandbox.status in RESERVED_SANDBOX_STATES
             decision = can_admit(
                 capacity,
@@ -1502,7 +1510,9 @@ async def get_capacity(
     request: Request,
     session: AsyncSession = Depends(get_session),
 ) -> CapacityResponse:
-    capacity = await scheduler_from(request).capacity()
+    # Pass the already-open `session` rather than let capacity() open its own
+    # second one alongside it -- see DEV-2400.
+    capacity = await scheduler_from(request).capacity(session)
     running_sandboxes = await session.scalar(
         select(func.count()).select_from(Sandbox).where(
             Sandbox.status.in_(RESERVED_SANDBOX_STATES)
