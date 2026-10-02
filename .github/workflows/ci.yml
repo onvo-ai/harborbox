@@ -155,6 +155,13 @@ jobs:
             --include='src/harborbox/runtime_protocol.py'
           uv run coverage report --fail-under=100 \
             --include='src/harborbox/warm_pool.py'
+          uv run coverage report --fail-under=100 \
+            --include='src/harborbox/config.py'
+          # Already at 100% and holding nothing but a docstring and __version__.
+          # Pinned so that the first piece of logic anyone puts in the package
+          # __init__ arrives with a test rather than quietly lowering the tree.
+          uv run coverage report --fail-under=100 \
+            --include='src/harborbox/__init__.py'
 
       # The backlog behind the ignore list, printed on every run rather than
       # discovered by someone going looking. Expected to be non-zero: it is the
