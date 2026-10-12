@@ -132,15 +132,16 @@ jobs:
       # The repo floor is the one number that does NOT work that way — it is a
       # denominator over the whole tree, and postgres_pool_store.py's 196
       # skipped statements are ~5 points of it. So raise it only from a run that
-      # had a database. 70 is `achieved - 1` against 71.45% (2242/3138),
-      # measured 2026-09-15 against a local PostgreSQL with the full 409-test
-      # suite and no skips. Re-measured rather than re-derived: config.py's 9
-      # newly covered statements are 0.29 points, which does not move a floor
-      # already sitting at `achieved - 1`, so the number below is unchanged.
+      # had a database. 71 is `achieved - 1` against 72.53% (2276/3138),
+      # measured 2026-09-14 when warm_pool.py was pinned. Re-measured
+      # 2026-10-12 after config.py's climb and #42 landed on top of it: 73.29%
+      # (2313/3156) against a local PostgreSQL with the full 441-test suite and
+      # no skips (14 e2e deselected, as in this job). The floor stays at 71
+      # here; lifting it to 72 is the next climb's change, not a merge's.
       - name: Coverage floors
         if: always()
         run: |
-          uv run coverage report --fail-under=70
+          uv run coverage report --fail-under=71
           uv run coverage report --fail-under=100 \
             --include='src/harborbox/postgres_pool_store.py'
           uv run coverage report --fail-under=100 \
@@ -155,6 +156,8 @@ jobs:
             --include='src/harborbox/errors.py'
           uv run coverage report --fail-under=100 \
             --include='src/harborbox/runtime_protocol.py'
+          uv run coverage report --fail-under=100 \
+            --include='src/harborbox/warm_pool.py'
           uv run coverage report --fail-under=100 \
             --include='src/harborbox/config.py'
           # Already at 100% and holding nothing but a docstring and __version__.
