@@ -133,8 +133,11 @@ jobs:
       # denominator over the whole tree, and postgres_pool_store.py's 196
       # skipped statements are ~5 points of it. So raise it only from a run that
       # had a database. 71 is `achieved - 1` against 72.53% (2276/3138),
-      # measured 2026-09-14 against a local PostgreSQL with the full 416-test
-      # suite and no skips (14 e2e deselected, as in this job).
+      # measured 2026-09-14 when warm_pool.py was pinned. Re-measured
+      # 2026-10-12 after config.py's climb and #42 landed on top of it: 73.29%
+      # (2313/3156) against a local PostgreSQL with the full 441-test suite and
+      # no skips (14 e2e deselected, as in this job). The floor stays at 71
+      # here; lifting it to 72 is the next climb's change, not a merge's.
       - name: Coverage floors
         if: always()
         run: |
@@ -155,6 +158,13 @@ jobs:
             --include='src/harborbox/runtime_protocol.py'
           uv run coverage report --fail-under=100 \
             --include='src/harborbox/warm_pool.py'
+          uv run coverage report --fail-under=100 \
+            --include='src/harborbox/config.py'
+          # Already at 100% and holding nothing but a docstring and __version__.
+          # Pinned so that the first piece of logic anyone puts in the package
+          # __init__ arrives with a test rather than quietly lowering the tree.
+          uv run coverage report --fail-under=100 \
+            --include='src/harborbox/__init__.py'
 
       # The backlog behind the ignore list, printed on every run rather than
       # discovered by someone going looking. Expected to be non-zero: it is the
