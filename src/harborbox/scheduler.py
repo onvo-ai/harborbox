@@ -26,8 +26,10 @@ from harborbox.schemas import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable
     from datetime import datetime
+
+    from sqlalchemy.ext.asyncio import AsyncSession
 
     from harborbox.config import Settings
     from harborbox.notify import ExecutionNotifier
@@ -73,6 +75,13 @@ ERROR_NAME_MEMORY_LIMIT_EXCEEDED = "MemoryLimitExceeded"
 ERROR_NAME_SANDBOX_STARTING = "SandboxStarting"
 
 TERMINAL_EXECUTION_STATES = ("succeeded", "failed", "cancelled")
+
+# Ceiling on a failing reaper stage's own backoff (see `_run_reaper_stage`),
+# on top of the ordinary `reaper_poll_seconds` cadence. Five minutes: long
+# enough that a stage stuck behind something slow (the DB pool, OpenSandbox)
+# stops adding to that pressure every few seconds, short enough that a fixed
+# operator is felt within one checkup cycle rather than needing a restart.
+REAPER_STAGE_BACKOFF_CAP_SECONDS = 300.0
 
 
 def lazy_start_action(status: str) -> Literal["ready", "start", "unavailable"]:
@@ -345,6 +354,10 @@ class Scheduler:
         # is not garbage-collected while nothing else holds a reference to it.
         self._pending_starts: dict[str, asyncio.Task[None]] = {}
         self._last_template_sweep: float | None = None
+        # Consecutive-failure count per reaper stage, by name. Backs off a
+        # stage that keeps failing rather than retrying it at a fixed
+        # cadence forever; reset to absent the moment that stage succeeds.
+        self._reaper_stage_failures: dict[str, int] = {}
 
     async def start(self) -> None:
         await self._recover_interrupted_jobs()
@@ -367,7 +380,19 @@ class Scheduler:
         if self._pending_starts:
             await asyncio.gather(*self._pending_starts.values(), return_exceptions=True)
 
-    async def capacity(self) -> Capacity:
+    async def capacity(self, session: AsyncSession | None = None) -> Capacity:
+        """Snapshot total, reserved and available capacity right now.
+
+        Pass an already-open `session` when the caller holds one open for
+        other work in the same request or transaction. Without it, this opens
+        its own -- but only *after* the two `self.runtime` calls below, which
+        are HTTP round trips to OpenSandbox's control plane: doing them while
+        any session (this method's own, or a caller's) is checked out ties up
+        a pool connection for as long as that control-plane call takes, which
+        under load is exactly the shape that exhausted the connection pool in
+        DEV-2400. A caller that already has a session should pass it in
+        rather than let this open a second one on top of its own.
+        """
         total_memory_mb = await self.runtime.total_memory_mb()
         host_available_memory_mb = await self.runtime.available_memory_mb()
         warm_pool = self.runtime.warm_pool_reservation()
@@ -378,17 +403,13 @@ class Scheduler:
         )
         max_cpu = self.settings.max_parallel_cpu or float(max(1, os.cpu_count() or 1))
 
-        async with session_factory() as session:
-            reserved_memory = await session.scalar(
-                select(func.coalesce(func.sum(Sandbox.memory_mb), 0)).where(
-                    Sandbox.status.in_(RESERVED_SANDBOX_STATES)
+        if session is None:
+            async with session_factory() as owned_session:
+                reserved_memory, reserved_cpu = await self._reserved_totals(
+                    owned_session
                 )
-            )
-            reserved_cpu = await session.scalar(
-                select(func.coalesce(func.sum(Sandbox.cpu), 0.0)).where(
-                    Sandbox.status.in_(("starting", "running"))
-                )
-            )
+        else:
+            reserved_memory, reserved_cpu = await self._reserved_totals(session)
 
         return Capacity(
             total_memory_mb=total_memory_mb,
@@ -405,6 +426,21 @@ class Scheduler:
             warm_pool_reserved_cpu=warm_pool.cpu,
             warm_pool_target_sandboxes=warm_pool.sandboxes,
         )
+
+    @staticmethod
+    async def _reserved_totals(session: AsyncSession) -> tuple[int | None, float | None]:
+        """Run the two aggregate reads `capacity()` needs, against one session."""
+        reserved_memory = await session.scalar(
+            select(func.coalesce(func.sum(Sandbox.memory_mb), 0)).where(
+                Sandbox.status.in_(RESERVED_SANDBOX_STATES)
+            )
+        )
+        reserved_cpu = await session.scalar(
+            select(func.coalesce(func.sum(Sandbox.cpu), 0.0)).where(
+                Sandbox.status.in_(("starting", "running"))
+            )
+        )
+        return reserved_memory, reserved_cpu
 
     async def _scheduler_loop(self) -> None:
         while not self._stop.is_set():
@@ -429,6 +465,17 @@ class Scheduler:
     async def _admit_available_jobs(self) -> None:
         now = utc_now()
         admitted_ids: list[str] = []
+        # Read before the admission session opens below, not nested inside
+        # it: `capacity()` makes two HTTP round trips to OpenSandbox before it
+        # touches the database at all. Calling it while this session's FOR
+        # UPDATE lock is held ties up that connection -- and, before
+        # `capacity()` grew a `session` parameter, opened a *second* pool
+        # connection on top of it -- for as long as OpenSandbox's control
+        # plane takes to answer. That is the shape DEV-2400 found: this loop
+        # runs every `scheduler_poll_seconds` regardless of traffic, so it was
+        # a constant source of exactly the kind of long, network-bound
+        # checkout that starves everything else waiting on the pool.
+        capacity = await self.capacity()
         async with session_factory() as session:
             # FOR UPDATE so admission serialises against anything else that
             # touches these rows — in particular DELETE /v1/sandboxes, which
@@ -451,7 +498,7 @@ class Scheduler:
                     .group_by(Execution.sandbox_id)
                 )
             ).all()
-            state = _ScanState(capacity=await self.capacity())
+            state = _ScanState(capacity=capacity)
             for sandbox_id, count in active_rows:
                 state.active_counts[sandbox_id] = int(count)
 
@@ -924,15 +971,63 @@ class Scheduler:
 
     async def _reaper_loop(self) -> None:
         while not self._stop.is_set():
-            try:
-                await self._terminate_expired_sandboxes()
-                await self._cold_pause_idle_sandboxes()
-                await self._sweep_unused_templates()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("idle sandbox reaper failed")
-            await asyncio.sleep(self.settings.reaper_poll_seconds)
+            extra_backoff = 0.0
+            for name, stage in (
+                ("terminate_expired_sandboxes", self._terminate_expired_sandboxes),
+                ("cold_pause_idle_sandboxes", self._cold_pause_idle_sandboxes),
+                ("sweep_unused_templates", self._sweep_unused_templates),
+            ):
+                extra_backoff = max(
+                    extra_backoff, await self._run_reaper_stage(name, stage)
+                )
+            await asyncio.sleep(self.settings.reaper_poll_seconds + extra_backoff)
+
+    async def _run_reaper_stage(
+        self, name: str, stage: Callable[[], Awaitable[None]]
+    ) -> float:
+        """Run one reaper stage, isolated from its siblings' failures.
+
+        The three stages used to share one `try`/`except` around all of them:
+        a failure partway through -- `_cold_pause_idle_sandboxes` raising, say
+        -- aborted `_sweep_unused_templates` for that entire cycle, every
+        cycle, for as long as the failure lasted (DEV-2400). Isolating them
+        means a broken stage costs only itself; the other two keep running on
+        every tick regardless.
+
+        Returns extra backoff, beyond `reaper_poll_seconds`, to add before the
+        loop's next cycle. It escalates with *this* stage's own consecutive
+        failure count and resets to zero the moment the stage succeeds again,
+        so a stage that is failing because something it depends on is already
+        under pressure -- the connection pool, OpenSandbox's control plane --
+        does not keep retrying at a fixed, undamped cadence and add to that
+        pressure itself.
+        """
+        try:
+            await stage()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            failures = self._reaper_stage_failures.get(name, 0) + 1
+            self._reaper_stage_failures[name] = failures
+            # `extra={}` rather than folding the stage name into the message:
+            # this is what makes a failing stage findable as its own group in
+            # SigNoz (`errors.data.groups`, which telemetry.py already ships
+            # every `logger.exception` call to) instead of every stage's
+            # failure landing under one indistinguishable "idle sandbox
+            # reaper failed" line -- the "only signal is a log line nobody
+            # reads, and nobody can tell which loop it was" gap DEV-2400
+            # named.
+            logger.exception(
+                "reaper stage failed",
+                extra={"reaper_stage": name, "consecutive_failures": failures},
+            )
+            return min(
+                self.settings.reaper_poll_seconds * (2.0 ** min(failures, 6)),
+                REAPER_STAGE_BACKOFF_CAP_SECONDS,
+            )
+        else:
+            self._reaper_stage_failures.pop(name, None)
+            return 0.0
 
     async def _sweep_unused_templates(self) -> None:
         """Reclaim derived template images on the reaper's existing cadence.

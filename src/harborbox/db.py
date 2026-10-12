@@ -17,7 +17,15 @@ class Base(DeclarativeBase):
 
 
 settings = get_settings()
-engine: AsyncEngine = create_async_engine(settings.database_url, pool_pre_ping=True)
+# pool_size/max_overflow: see the long comment on Settings.database_pool_size
+# for why these are set explicitly rather than left to SQLAlchemy's defaults
+# (DEV-2400).
+engine: AsyncEngine = create_async_engine(
+    settings.database_url,
+    pool_pre_ping=True,
+    pool_size=settings.database_pool_size,
+    max_overflow=settings.database_max_overflow,
+)
 session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
 

@@ -33,6 +33,46 @@ class Settings(BaseSettings):
         "local-development-secret-change-me"
     )
     database_url: str = "postgresql+asyncpg://harborbox:harborbox@postgres/harborbox"
+    # `create_async_engine`'s own defaults -- pool_size 5, max_overflow 10, a
+    # ceiling of 15 -- were never deliberately sized for this workload; until
+    # DEV-2400 nothing here set them at all, so 15 was simply whatever
+    # SQLAlchemy ships with. DEV-2400: the idle-sandbox reaper hit
+    # `QueuePool limit of size 5 overflow 10 reached` in production on
+    # 2026-09-15T15:05:18Z, with all 15 checked out at once.
+    #
+    # The query that timed out was the reaper's own idle-sandbox read, which
+    # does not itself hold a connection across anything slow -- so the
+    # exhaustion was caused by concurrent holders elsewhere, not by that read.
+    # Two call sites turned out to be doubling their own connection use for no
+    # reason: `Scheduler._admit_available_jobs` was calling `capacity()` --
+    # two HTTP round trips to OpenSandbox's control plane, only *then* its own
+    # DB session -- while still holding its own FOR-UPDATE-locked session
+    # open, and four `/v1` handlers (`ensure_ready`, `resume_sandbox`,
+    # `get_execution`, `get_capacity`) did the same nested inside their
+    # request-scoped session. Both are fixed: `_admit_available_jobs` now
+    # calls `capacity()` before opening its session, and `capacity()` takes an
+    # optional `session` so a caller that already has one open passes it in
+    # instead of opening a second (see `Scheduler.capacity`). Together that
+    # roughly halves the connections a concurrent burst of capacity checks
+    # needs.
+    #
+    # That fix alone does not justify leaving the ceiling where it was,
+    # though: this one process serves every product's sandbox traffic through
+    # a scheduler loop polling every `scheduler_poll_seconds`, a reaper every
+    # `reaper_poll_seconds`, one `asyncio.Task` per in-flight execution, and
+    # one warm-pool reconciler per pooled template -- independent loops that
+    # were never sized against each other, and 15 was never chosen with their
+    # overlap in mind. Doubled to 30 (10 + 20), not raised further: Postgres
+    # here (compose.yaml) is dedicated to harborbox alone, at its own default
+    # `max_connections` of 100, and this remains the only process talking to
+    # it (see the `Scheduler` class docstring on why a second replica needs a
+    # different locking story before it could share this database), so 30
+    # leaves wide headroom on the server side rather than guessing at a number
+    # nothing here actually measures traffic against. If 30 is not enough,
+    # that is a reason to measure concurrency and revisit deliberately -- not
+    # to raise it again on the next occurrence.
+    database_pool_size: int = Field(default=10, ge=1)
+    database_max_overflow: int = Field(default=20, ge=0)
     opensandbox_domain: str = "opensandbox:8080"
     opensandbox_protocol: Literal["http", "https"] = "http"
     opensandbox_api_key: SecretStr = SecretStr("change-me-opensandbox")
