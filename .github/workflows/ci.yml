@@ -132,16 +132,15 @@ jobs:
       # The repo floor is the one number that does NOT work that way — it is a
       # denominator over the whole tree, and postgres_pool_store.py's 196
       # skipped statements are ~5 points of it. So raise it only from a run that
-      # had a database. 71 is `achieved - 1` against 72.53% (2276/3138),
-      # measured 2026-09-14 when warm_pool.py was pinned. Re-measured
-      # 2026-10-12 after config.py's climb and #42 landed on top of it: 73.29%
-      # (2313/3156) against a local PostgreSQL with the full 441-test suite and
-      # no skips (14 e2e deselected, as in this job). The floor stays at 71
-      # here; lifting it to 72 is the next climb's change, not a merge's.
+      # had a database. 76 is `achieved - 1` against 77.95% (2460/3156),
+      # measured 2026-10-13 when opensandbox_runtime.py was pinned, against a
+      # local PostgreSQL with the full 500-test suite and no skips (14 e2e
+      # deselected, as in this job). The previous floor, 71, was set against
+      # 72.53% on 2026-09-14 and had drifted to 73.29% by 2026-10-12.
       - name: Coverage floors
         if: always()
         run: |
-          uv run coverage report --fail-under=71
+          uv run coverage report --fail-under=76
           uv run coverage report --fail-under=100 \
             --include='src/harborbox/postgres_pool_store.py'
           uv run coverage report --fail-under=100 \
@@ -160,6 +159,8 @@ jobs:
             --include='src/harborbox/warm_pool.py'
           uv run coverage report --fail-under=100 \
             --include='src/harborbox/config.py'
+          uv run coverage report --fail-under=100 \
+            --include='src/harborbox/opensandbox_runtime.py'
           # Already at 100% and holding nothing but a docstring and __version__.
           # Pinned so that the first piece of logic anyone puts in the package
           # __init__ arrives with a test rather than quietly lowering the tree.
