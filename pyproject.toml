@@ -124,6 +124,13 @@ ignore_missing_imports = true
 [tool.coverage.run]
 source = ["src"]
 branch = false
+# SQLAlchemy's async API runs every awaited database call through a greenlet,
+# and the default thread tracer does not follow execution into one. Without
+# "greenlet" here, any route line after its first `await session...` counted
+# as uncovered even while a passing test ran it: on 2026-10-15 that hid 90
+# executed lines in api.py alone (33.9% reported, 49.6% real). "thread" keeps
+# the default tracing for everything else.
+concurrency = ["greenlet", "thread"]
 
 [tool.coverage.report]
 show_missing = true
