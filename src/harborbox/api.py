@@ -21,7 +21,11 @@ from harborbox.admission import can_admit
 from harborbox.build_contexts import BuildContextError, BuildContextStore
 from harborbox.config import Settings, get_settings
 from harborbox.db import create_schema, get_session, session_factory
-from harborbox.errors import SandboxStartTimeoutError, SandboxUnavailableError
+from harborbox.errors import (
+    SandboxFileNotFoundError,
+    SandboxStartTimeoutError,
+    SandboxUnavailableError,
+)
 from harborbox.execution_secrets import scrub_environment, seal_environment
 from harborbox.models import Execution, Sandbox, SandboxTemplate, utc_now
 from harborbox.notify import ExecutionNotifier
@@ -1412,8 +1416,8 @@ async def read_file(
     sandbox = await ensure_ready(sandbox, request, session)
     try:
         return await runtime_from(request).read_file(sandbox, path)
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(exc.response.status_code, detail=exc.response.text) from exc
+    except SandboxFileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.put(
@@ -1477,8 +1481,8 @@ async def list_files(
     sandbox = await ensure_ready(sandbox, request, session)
     try:
         return await runtime_from(request).list_files(sandbox, path)
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(exc.response.status_code, detail=exc.response.text) from exc
+    except SandboxFileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.delete(
@@ -1496,8 +1500,8 @@ async def remove_file(
     sandbox = await ensure_ready(sandbox, request, session)
     try:
         await runtime_from(request).remove_file(sandbox, path)
-    except httpx.HTTPStatusError as exc:
-        raise HTTPException(exc.response.status_code, detail=exc.response.text) from exc
+    except SandboxFileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
