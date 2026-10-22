@@ -17,6 +17,7 @@ from harborbox.opensandbox_runtime import (
     OpenSandboxRuntime,
     _BoundedOutput,
 )
+from harborbox.schemas import RuntimeProcessRequest
 
 
 # `overrides` can set any Sandbox column, whose types are heterogeneous
@@ -464,3 +465,67 @@ async def test_raise_runtime_error_ignores_oom_text_in_the_exception_itself() ->
         await runtime._raise_runtime_error(
             SandboxException("ran out of memory: oom"), sandbox
         )
+
+
+class RecordingCommandHandle(FakeHandle):
+    """A handle that records what `commands.run` was asked to run."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ran: list[str | list[str]] = []
+
+    @property
+    def commands(self) -> SimpleNamespace:
+        async def run(command: str | list[str], **_: object) -> SimpleNamespace:
+            self.ran.append(command)
+            return SimpleNamespace(error=None, exit_code=0)
+
+        return SimpleNamespace(run=run)
+
+
+def process_request(stdin: str | None) -> RuntimeProcessRequest:
+    return RuntimeProcessRequest(
+        executable="python3",
+        args=["-c", "print('a b')"],
+        stdin=stdin,
+        timeout_seconds=10,
+        max_output_bytes=1024,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_process_without_stdin_runs_as_argv_with_no_shell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handle = RecordingCommandHandle()
+    runtime = OpenSandboxRuntime(Settings())
+
+    async def get_handle(*_: object, **__: object) -> RecordingCommandHandle:
+        return handle
+
+    monkeypatch.setattr(runtime, "_get_handle", get_handle)
+
+    await runtime.execute_process(sandbox_record(), process_request(stdin=None))
+
+    assert handle.ran == [["python3", "-c", "print('a b')"]]
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_process_with_stdin_still_goes_through_a_shell_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handle = RecordingCommandHandle()
+    runtime = OpenSandboxRuntime(Settings())
+
+    async def get_handle(*_: object, **__: object) -> RecordingCommandHandle:
+        return handle
+
+    monkeypatch.setattr(runtime, "_get_handle", get_handle)
+
+    await runtime.execute_process(sandbox_record(), process_request(stdin="hi"))
+
+    (command,) = handle.ran
+    assert isinstance(command, str)
+    assert command.endswith("| base64 -d | python3 -c 'print('\"'\"'a b'\"'\"')'")
+    await runtime.close()

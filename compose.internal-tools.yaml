@@ -123,7 +123,7 @@ configs:
 
       [runtime]
       type = "docker"
-      execd_image = "opensandbox/execd:v1.0.21"
+      execd_image = "opensandbox/execd:release-1.1.1"
 
       [store]
       type = "sqlite"
@@ -132,6 +132,14 @@ configs:
       [docker]
       network_mode = "bridge"
       host_ip = "host.docker.internal"
+      # Where Docker publishes each sandbox's ports, execd's included. execd's
+      # port takes no token, so the 0.0.0.0 default would put every sandbox's
+      # command endpoint on every interface the host has, public ones too.
+      # The bridge gateway is the address `host.docker.internal` resolves to
+      # through `host-gateway`, so it is the one address OpenSandbox needs.
+      # A host whose docker0 is elsewhere must set this, and finds out at the
+      # first sandbox create: Docker cannot bind an address the host lacks.
+      publish_host = "${OPENSANDBOX_PUBLISH_HOST:-172.17.0.1}"
       # Below 32768, and that is the whole point: the kernel's ephemeral range
       # on both harborbox hosts is 32768-60999, and it draws from that range
       # for every outbound connection and every bind to port 0.
@@ -295,7 +303,7 @@ services:
           - buildkit-gateway
 
   opensandbox:
-    image: opensandbox/server:v0.2.2
+    image: opensandbox/server:release-1.1.1
     environment:
       SANDBOX_CONFIG_PATH: /etc/opensandbox/config.toml
       OPENSANDBOX_SERVER_API_KEY: ${SERVICE_PASSWORD_64_OPENSANDBOXAPI:?see the API service below - the same key must reach both sides.}

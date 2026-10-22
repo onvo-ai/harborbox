@@ -114,8 +114,9 @@ def test_a_build_step_reaches_the_registry_and_nothing_else(
         probe = sandbox.commands.run("cat /probe.txt", wait_timeout=120)
         assert probe.exit_code == 0, probe.error
         # `logs.stdout`, not `.text`: `.text` is for rich results from Python
-        # execution, and a shell command leaves nothing there.
-        stdout = "\n".join(probe.logs.stdout)
+        # execution, and a shell command leaves nothing there. Each chunk keeps
+        # its own line ending (execd 1.1+), so they join with nothing between.
+        stdout = "".join(probe.logs.stdout)
         results = dict(line.rsplit(" ", 1) for line in stdout.strip().splitlines())
         print("\nreachable from inside a build step:")  # noqa: T201 - the measurement
         for target, outcome in results.items():

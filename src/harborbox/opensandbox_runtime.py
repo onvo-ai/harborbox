@@ -20,6 +20,7 @@ from opensandbox.exceptions import (
     SandboxApiException,
     SandboxException,
     SandboxReadyTimeoutException,
+    SandboxTimeoutException,
 )
 from opensandbox.models.execd import Execution, ExecutionHandlers, RunCommandOpts
 from opensandbox.models.filesystem import DirectoryListEntry
@@ -74,9 +75,12 @@ _OOM_SIGNAL_TOKENS = (
 
 @dataclass(frozen=True)
 class _CommandSpec:
-    """What to run and how; bundled to keep `_run_command`'s signature small."""
+    """What to run and how; bundled to keep `_run_command`'s signature small.
 
-    command: str
+    `command` is shell text, or an argv list execd runs with no shell at all.
+    """
+
+    command: str | list[str]
     timeout_seconds: int
     max_output_bytes: int
     environment: dict[str, str]
@@ -317,10 +321,14 @@ class OpenSandboxRuntime:
     async def execute_process(
         self, sandbox: Sandbox, request: RuntimeProcessRequest
     ) -> RuntimeExecutionResult:
-        command = shlex.join([request.executable, *request.args])
+        # execd 1.1+ runs an argv list natively, resolving the executable on
+        # PATH with no shell in between. Its argv mode has no stdin, though,
+        # so a process that needs one still goes through a shell pipe.
+        command: str | list[str] = [request.executable, *request.args]
         if request.stdin is not None:
             encoded = base64.b64encode(request.stdin.encode("utf-8")).decode("ascii")
-            command = f"printf %s {shlex.quote(encoded)} | base64 -d | {command}"
+            argv = shlex.join([request.executable, *request.args])
+            command = f"printf %s {shlex.quote(encoded)} | base64 -d | {argv}"
         return await self._run_command(
             sandbox,
             _CommandSpec(
@@ -711,16 +719,16 @@ class OpenSandboxRuntime:
     def _is_start_timeout(exc: SandboxException) -> bool:
         """Whether a failed start ran out of time rather than went wrong.
 
-        The SDK expresses one of these two ways and only names one of them.
+        `SandboxReadyTimeoutException` is the readiness poll giving up.
+        `SandboxTimeoutException` (SDK 1.1+) is the create POST itself
+        exceeding `ConnectionConfig.request_timeout` -- a read, write or pool
+        timeout. Both are upstream's own names, so they are checked first.
 
-        `SandboxReadyTimeoutException` is the readiness poll giving up, which
-        is explicit. The other is the create POST itself exceeding
-        `ConnectionConfig.request_timeout`: httpx raises `ReadTimeout`, and the
-        SDK's own converter rewraps it as a generic `SandboxInternalException`
-        whose class says nothing. Only the cause chain still carries the fact,
-        so that is what this walks -- matching on the message text instead
-        would be the same dead substring match `_detect_memory_exceeded`'s
-        docstring already rejects.
+        The SDK does not name the third: a connect timeout becomes
+        `SandboxConnectionException`, the same class as a refused connection.
+        Only the cause chain still says it was a timeout, so that is what this
+        walks -- matching on the message text instead would be the same dead
+        substring match `_detect_memory_exceeded`'s docstring already rejects.
 
         A timeout is safe to call retryable because the SDK cleans up after
         itself: `Sandbox.create` kills the half-built sandbox before raising,
@@ -731,7 +739,7 @@ class OpenSandboxRuntime:
         caller to retry that would spin them against an error that never
         clears.
         """
-        if isinstance(exc, SandboxReadyTimeoutException):
+        if isinstance(exc, SandboxReadyTimeoutException | SandboxTimeoutException):
             return True
         seen: set[int] = set()
         cause: BaseException | None = exc
