@@ -94,6 +94,37 @@ class _CommandSpec:
     cwd: str | None
 
 
+class _LineShape:
+    r"""Keep `logs.stdout`/`logs.stderr` in the shape our callers parse.
+
+    execd 1.1 changed its output events (upstream 380322ba): each line now
+    arrives with its own `\n`, `\r` or `\r\n`, as a separate event per
+    terminator byte. Until 1.1 a line arrived with its terminator stripped, an
+    empty line arrived as a lone `"\n"`, and the `\n` of a `\r\n` was
+    dropped. Toolspoke joins these chunks with `"\n"`, so passing the new
+    shape through would double every newline it reads -- its CLI
+    introspection stops at the first blank line. Harborbox's API is a
+    contract with the apps that call it, so this turns the new events back
+    into the old ones, one stream at a time.
+    """
+
+    def __init__(self) -> None:
+        self._last_was_cr = False
+
+    def feed(self, text: str) -> str | None:
+        """Return the chunk the old execd would have sent, or None for none."""
+        if not text or text[-1] not in "\r\n":
+            # An unterminated tail, flushed when the command ends.
+            self._last_was_cr = False
+            return text
+        body, terminator = text[:-1], text[-1]
+        swallowed = not body and terminator == "\n" and self._last_was_cr
+        self._last_was_cr = terminator == "\r"
+        if swallowed:
+            return None
+        return body or "\n"
+
+
 class _BoundedOutput:
     def __init__(self, limit: int) -> None:
         self.limit = limit
@@ -103,6 +134,8 @@ class _BoundedOutput:
         self.stderr: list[str] = []
         self.results: list[ExecutionResult] = []
         self.error: ExecutionError | None = None
+        self._stdout_lines = _LineShape()
+        self._stderr_lines = _LineShape()
 
     def _append(self, target: list[str], text: str) -> None:
         encoded = text.encode("utf-8")
@@ -117,10 +150,14 @@ class _BoundedOutput:
             self.truncated = True
 
     async def on_stdout(self, message: OutputMessage) -> None:
-        self._append(self.stdout, str(message.text))
+        line = self._stdout_lines.feed(str(message.text))
+        if line is not None:
+            self._append(self.stdout, line)
 
     async def on_stderr(self, message: OutputMessage) -> None:
-        self._append(self.stderr, str(message.text))
+        line = self._stderr_lines.feed(str(message.text))
+        if line is not None:
+            self._append(self.stderr, line)
 
     async def on_result(self, result: SdkExecutionResult) -> None:
         text = result.text

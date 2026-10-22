@@ -620,3 +620,44 @@ async def test_a_failed_liveness_lookup_is_not_taken_for_a_dead_sandbox(
         )
     assert asyncio.get_running_loop().time() - started >= 1
     await runtime.close()
+
+
+def shaped(*events: str) -> list[str]:
+    """Feed execd 1.1 events through the old-shape filter, as one stream."""
+    from harborbox.opensandbox_runtime import _LineShape  # noqa: PLC0415
+
+    lines = _LineShape()
+    return [line for event in events if (line := lines.feed(event)) is not None]
+
+
+@pytest.mark.parametrize(
+    ("events", "expected"),
+    [
+        # Two plain lines: the terminators go, as before execd 1.1.
+        (["a\n", "b\n"], ["a", "b"]),
+        # A blank line was a lone "\n" before, and stays one.
+        (["a\n", "\n", "b\n"], ["a", "\n", "b"]),
+        # CRLF arrives as "a\r" then "\n"; the "\n" was dropped before.
+        (["a\r", "\n", "b\r", "\n"], ["a", "b"]),
+        # A blank CRLF line still counts once.
+        (["\r", "\n"], ["\n"]),
+        # A bare CR (a progress bar) ends a line on its own.
+        (["10%\r", "20%\r", "done\n"], ["10%", "20%", "done"]),
+        # Output with no final newline is flushed as-is.
+        (["a\n", "tail"], ["a", "tail"]),
+    ],
+)
+def test_stdout_keeps_the_shape_callers_parsed_before_execd_1_1(
+    events: list[str], expected: list[str]
+) -> None:
+    assert shaped(*events) == expected
+
+
+@pytest.mark.asyncio
+async def test_toolspoke_style_newline_join_reads_the_same_as_before() -> None:
+    """Toolspoke joins `logs.stdout` with a newline; it must not see doubled lines."""
+    output = _BoundedOutput(1024)
+    for event in ["Usage: cli [options]\n", "\n", "Commands:\n", "  run\n"]:
+        await output.on_stdout(SimpleNamespace(text=event))  # type: ignore[arg-type]
+
+    assert "\n".join(output.stdout) == "Usage: cli [options]\n\n\nCommands:\n  run"
