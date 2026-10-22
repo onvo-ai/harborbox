@@ -75,9 +75,6 @@ class OpenSandboxWarmPools:
                     warmup_concurrency=min(
                         target, self.settings.warm_pool_warmup_concurrency
                     ),
-                    reconcile_interval=timedelta(
-                        seconds=self.settings.warm_pool_reconcile_seconds
-                    ),
                     acquire_ready_timeout=timedelta(
                         seconds=self.settings.opensandbox_ready_timeout_seconds
                     ),

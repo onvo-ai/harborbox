@@ -24,13 +24,21 @@ SANDBOX_USER = "10001:10001"
 CONTEXT_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 # Appended to every caller-supplied Dockerfile. See render_raw_dockerfile.
+# gVisor mounts its own in-memory tmpfs over /tmp when the image's /tmp is
+# empty, invisibly to Docker. Writes there then use the sandbox's memory and
+# vanish on cold pause, whose snapshot is a `docker commit`. Any file in /tmp
+# stops it. Root-owned in a sticky /tmp, so the sandbox user cannot delete it,
+# and a dotfile, so a Dockerfile's `rm -rf /tmp/*` leaves it alone.
+TMP_KEEP_FILE = "/tmp/.harborbox-keep"  # noqa: S108 - a path inside the image
+
 CONFORMANCE_LAYER = f"""
 # ---- harborbox runtime contract (appended; overrides any trailing USER) ----
 USER root
 RUN (getent group 10001 || groupadd --gid 10001 sandbox) \\
  && (getent passwd 10001 || useradd --uid 10001 --gid 10001 \\
        --home-dir /workspace --no-create-home sandbox) \\
- && mkdir -p /workspace && chown 10001:10001 /workspace
+ && mkdir -p /workspace && chown 10001:10001 /workspace \\
+ && mkdir -p /tmp && chmod 1777 /tmp && touch {TMP_KEEP_FILE}
 WORKDIR /workspace
 USER {SANDBOX_USER}"""
 

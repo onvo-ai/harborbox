@@ -120,6 +120,16 @@ class Settings(BaseSettings):
     # degraded control plane add up to another 30s on top of every error --
     # worst exactly when callers can least afford to wait longer.
     oom_diagnostic_timeout_seconds: float = Field(default=3.0, gt=0)
+    # While a command runs, how often to ask OpenSandbox whether its sandbox
+    # is still alive. Under gVisor an OOM kills the whole sandbox, network
+    # stack included, so the command's output stream is never closed and the
+    # SDK, which reads it with no timeout, would wait forever. This is how a
+    # dead sandbox is noticed in seconds rather than never.
+    execution_liveness_poll_seconds: float = Field(default=2.0, gt=0)
+    # The backstop behind that check: no command is waited on for longer than
+    # its own timeout plus this. execd enforces the timeout inside the
+    # sandbox, which is no help once execd is gone.
+    execution_deadline_grace_seconds: float = Field(default=15.0, ge=0)
     opensandbox_snapshot_timeout_seconds: float = Field(default=300.0, gt=0)
     docker_base_url: str | None = None
     # The one image Harborbox ships. Products no longer get a template each:

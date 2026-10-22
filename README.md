@@ -7,8 +7,9 @@ commands, files, networking, snapshots, and isolation runtimes.
 
 The bundled Compose deployment is a single-host Docker configuration intended
 for internal and trusted workloads. Ordinary Docker containers share the host
-kernel. Use OpenSandbox's Kubernetes runtime with gVisor, Kata, or Firecracker
-before treating it as an isolation boundary for hostile public workloads.
+kernel. Turn on gVisor (see "Stronger isolation with gVisor" below), or use OpenSandbox's
+Kubernetes runtime with Kata or Firecracker, before treating it as an
+isolation boundary for hostile public workloads.
 
 ```text
 client -> Harborbox API -> PostgreSQL queue -> scheduler -> OpenSandbox -> runtime
@@ -511,9 +512,34 @@ reserves an additional 25% of the VM, with a 1 GiB minimum by default.
 
 Important settings are documented in `.env.example`.
 
-For a stronger isolation boundary, configure OpenSandbox's `[secure_runtime]`
-block for gVisor or Kata on Linux, or deploy its Kubernetes backend with an
-appropriate RuntimeClass.
+### Stronger isolation with gVisor
+
+For a stronger isolation boundary, run sandboxes under gVisor. Each sandbox
+then talks to gVisor's user-space kernel instead of the host's, so escaping a
+container means breaking gVisor first. It needs no KVM, so it works on
+ordinary cloud VMs. On each Docker host:
+
+```bash
+sudo ./scripts/install-gvisor.sh
+```
+
+Then set `OPENSANDBOX_GVISOR=1` and restart the stack. Three things differ
+from plain Docker, and each is handled:
+
+- **runsc must run with `--overlay2=none`.** Its default keeps a sandbox's
+  writes where `docker commit` cannot see them, so cold pause would snapshot
+  nothing. The install script sets the flag.
+- **An empty `/tmp` gets an in-memory tmpfs** that cold pause cannot
+  snapshot. Every template ends with a layer that puts a file in `/tmp`, which
+  stops it. Templates built before that layer existed keep their old image
+  until rebuilt: rebuild them before turning gVisor on.
+- **An OOM kills the whole sandbox, not just the process.** Harborbox watches
+  the sandbox while a command runs and fails the execution with
+  `MemoryLimitExceeded` within seconds.
+
+Many-small-files workloads run about 1.7x slower under gVisor; CPU-bound and
+large-file work is unchanged. Kata, Firecracker, or OpenSandbox's Kubernetes
+backend with an appropriate RuntimeClass are the alternatives that need KVM.
 
 ## Running on more than one machine
 

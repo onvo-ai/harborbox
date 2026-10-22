@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from harborbox.config import Settings
 from harborbox.schemas import SandboxCreate
 from harborbox.templates import (
+    TMP_KEEP_FILE,
     TemplateSpec,
     TemplateSpecError,
     render_dockerfile,
@@ -343,3 +344,14 @@ def test_a_from_carrying_only_flags_names_no_image() -> None:
         validate_template_spec(
             raw_settings(), dockerfile="FROM --platform=linux/amd64\nRUN true\n"
         )
+
+
+def test_every_template_keeps_tmp_non_empty_so_gvisor_leaves_it_on_disk() -> None:
+    """An empty /tmp gets gVisor's in-memory tmpfs, which cold pause loses.
+
+    The marker goes in the appended layer, after the caller's own steps, so a
+    caller that wipes /tmp or starts from a foreign base still gets it.
+    """
+    rendered = render_dockerfile("FROM debian:12\nRUN rm -rf /tmp && mkdir /tmp\n")
+
+    assert rendered.index("rm -rf /tmp") < rendered.index(f"touch {TMP_KEEP_FILE}")

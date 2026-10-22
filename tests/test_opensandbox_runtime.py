@@ -17,6 +17,7 @@ from harborbox.opensandbox_runtime import (
     OpenSandboxRuntime,
     _BoundedOutput,
 )
+from harborbox.schemas import RuntimeProcessRequest
 
 
 # `overrides` can set any Sandbox column, whose types are heterogeneous
@@ -464,3 +465,199 @@ async def test_raise_runtime_error_ignores_oom_text_in_the_exception_itself() ->
         await runtime._raise_runtime_error(
             SandboxException("ran out of memory: oom"), sandbox
         )
+
+
+class RecordingCommandHandle(FakeHandle):
+    """A handle that records what `commands.run` was asked to run."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ran: list[str | list[str]] = []
+
+    @property
+    def commands(self) -> SimpleNamespace:
+        async def run(command: str | list[str], **_: object) -> SimpleNamespace:
+            self.ran.append(command)
+            return SimpleNamespace(error=None, exit_code=0)
+
+        return SimpleNamespace(run=run)
+
+
+def process_request(stdin: str | None) -> RuntimeProcessRequest:
+    return RuntimeProcessRequest(
+        executable="python3",
+        args=["-c", "print('a b')"],
+        stdin=stdin,
+        timeout_seconds=10,
+        max_output_bytes=1024,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_process_without_stdin_runs_as_argv_with_no_shell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handle = RecordingCommandHandle()
+    runtime = OpenSandboxRuntime(Settings())
+
+    async def get_handle(*_: object, **__: object) -> RecordingCommandHandle:
+        return handle
+
+    monkeypatch.setattr(runtime, "_get_handle", get_handle)
+
+    await runtime.execute_process(sandbox_record(), process_request(stdin=None))
+
+    assert handle.ran == [["python3", "-c", "print('a b')"]]
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_process_with_stdin_still_goes_through_a_shell_pipe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handle = RecordingCommandHandle()
+    runtime = OpenSandboxRuntime(Settings())
+
+    async def get_handle(*_: object, **__: object) -> RecordingCommandHandle:
+        return handle
+
+    monkeypatch.setattr(runtime, "_get_handle", get_handle)
+
+    await runtime.execute_process(sandbox_record(), process_request(stdin="hi"))
+
+    (command,) = handle.ran
+    assert isinstance(command, str)
+    assert command.endswith("| base64 -d | python3 -c 'print('\"'\"'a b'\"'\"')'")
+    await runtime.close()
+
+
+class SilentCommandHandle(FakeHandle):
+    """A handle whose command stream never ends, as when gVisor's sandbox dies.
+
+    Under gVisor an OOM kills the whole sandbox, network stack included, so
+    nothing closes the stream the SDK is reading with no timeout.
+    """
+
+    @property
+    def commands(self) -> SimpleNamespace:
+        async def run(*_: object, **__: object) -> None:
+            await asyncio.Event().wait()
+
+        return SimpleNamespace(run=run)
+
+
+def silent_runtime(
+    monkeypatch: pytest.MonkeyPatch, manager: FakeManager, **settings: Any  # noqa: ANN401
+) -> OpenSandboxRuntime:
+    runtime = OpenSandboxRuntime(
+        Settings(execution_liveness_poll_seconds=0.01, **settings)
+    )
+    runtime._manager = manager  # type: ignore[assignment]
+
+    async def get_handle(*_: object, **__: object) -> SilentCommandHandle:
+        return SilentCommandHandle()
+
+    monkeypatch.setattr(runtime, "_get_handle", get_handle)
+    return runtime
+
+
+@pytest.mark.asyncio
+async def test_a_sandbox_oom_killed_mid_command_is_reported_as_memory_exceeded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What OpenSandbox 1.1.1 reported for a gVisor sandbox's OOM, verbatim."""
+    manager = FakeManager()
+    manager.sandbox_info = sandbox_info(
+        state="Failed",
+        reason="CONTAINER_EXITED_ERROR",
+        message="Sandbox container exited with code 137.",
+    )
+    runtime = silent_runtime(monkeypatch, manager)
+
+    with pytest.raises(SandboxMemoryExceededError):
+        await asyncio.wait_for(
+            runtime.execute_process(
+                sandbox_record(container_id="osb-1"), process_request(stdin=None)
+            ),
+            timeout=5,
+        )
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_command_is_never_waited_on_past_its_timeout_plus_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The backstop: a sandbox that says it is running but never answers."""
+    manager = FakeManager()
+    manager.sandbox_info = sandbox_info(state="Running", reason="CONTAINER_RUNNING")
+    runtime = silent_runtime(monkeypatch, manager, execution_deadline_grace_seconds=0)
+    request = process_request(stdin=None).model_copy(update={"timeout_seconds": 1})
+
+    with pytest.raises(SandboxUnavailableError, match="did not answer within 1s"):
+        await asyncio.wait_for(
+            runtime.execute_process(sandbox_record(container_id="osb-1"), request),
+            timeout=5,
+        )
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_liveness_lookup_is_not_taken_for_a_dead_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a state OpenSandbox reported ends the wait early; an error does not."""
+    manager = FakeManager()
+    manager.sandbox_info_error = SandboxException("control plane hiccup")
+    runtime = silent_runtime(monkeypatch, manager, execution_deadline_grace_seconds=0)
+    request = process_request(stdin=None).model_copy(update={"timeout_seconds": 1})
+    started = asyncio.get_running_loop().time()
+
+    with pytest.raises(SandboxUnavailableError, match="did not answer"):
+        await asyncio.wait_for(
+            runtime.execute_process(sandbox_record(container_id="osb-1"), request),
+            timeout=5,
+        )
+    assert asyncio.get_running_loop().time() - started >= 1
+    await runtime.close()
+
+
+def shaped(*events: str) -> list[str]:
+    """Feed execd 1.1 events through the old-shape filter, as one stream."""
+    from harborbox.opensandbox_runtime import _LineShape  # noqa: PLC0415
+
+    lines = _LineShape()
+    return [line for event in events if (line := lines.feed(event)) is not None]
+
+
+@pytest.mark.parametrize(
+    ("events", "expected"),
+    [
+        # Two plain lines: the terminators go, as before execd 1.1.
+        (["a\n", "b\n"], ["a", "b"]),
+        # A blank line was a lone "\n" before, and stays one.
+        (["a\n", "\n", "b\n"], ["a", "\n", "b"]),
+        # CRLF arrives as "a\r" then "\n"; the "\n" was dropped before.
+        (["a\r", "\n", "b\r", "\n"], ["a", "b"]),
+        # A blank CRLF line still counts once.
+        (["\r", "\n"], ["\n"]),
+        # A bare CR (a progress bar) ends a line on its own.
+        (["10%\r", "20%\r", "done\n"], ["10%", "20%", "done"]),
+        # Output with no final newline is flushed as-is.
+        (["a\n", "tail"], ["a", "tail"]),
+    ],
+)
+def test_stdout_keeps_the_shape_callers_parsed_before_execd_1_1(
+    events: list[str], expected: list[str]
+) -> None:
+    assert shaped(*events) == expected
+
+
+@pytest.mark.asyncio
+async def test_toolspoke_style_newline_join_reads_the_same_as_before() -> None:
+    """Toolspoke joins `logs.stdout` with a newline; it must not see doubled lines."""
+    output = _BoundedOutput(1024)
+    for event in ["Usage: cli [options]\n", "\n", "Commands:\n", "  run\n"]:
+        await output.on_stdout(SimpleNamespace(text=event))  # type: ignore[arg-type]
+
+    assert "\n".join(output.stdout) == "Usage: cli [options]\n\n\nCommands:\n  run"
