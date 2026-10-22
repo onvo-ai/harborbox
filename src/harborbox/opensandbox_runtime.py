@@ -70,7 +70,14 @@ _OOM_SIGNAL_TOKENS = (
     "out-of-memory",
     "exit code 137",
     "code: 137",
+    # OpenSandbox's own wording for a container, not a process, that exited on
+    # SIGKILL. Under gVisor that is what an OOM looks like: the kernel's OOM
+    # killer takes the whole sandbox, and the container exits 137.
+    "exited with code 137",
 )
+
+# Sandbox states after which nothing inside can still be producing output.
+_DEAD_STATES = frozenset({"failed", "terminated", "stopping"})
 
 
 @dataclass(frozen=True)
@@ -343,10 +350,21 @@ class OpenSandboxRuntime:
     async def _run_command(
         self, sandbox: Sandbox, spec: _CommandSpec
     ) -> RuntimeExecutionResult:
+        """Run one command, and never wait on a sandbox that is gone.
+
+        The SDK reads a command's output stream with no read timeout and
+        relies on execd to close it. Under plain Docker an OOM kills only the
+        command, execd closes the stream, and that surfaces at once. Under
+        gVisor an OOM kills the whole sandbox, network stack included, so the
+        stream is never closed and the read never returns -- measured on the
+        gVisor trial as an execution still `running` 78s into a 30s timeout.
+        So the run races a watcher that polls the sandbox's state, and both
+        race a deadline of the command's own timeout plus a grace period.
+        """
         handle = await self._get_handle(sandbox, check_ready=True)
         output = _BoundedOutput(spec.max_output_bytes)
-        try:
-            execution = await handle.commands.run(
+        run = asyncio.ensure_future(
+            handle.commands.run(
                 spec.command,
                 opts=RunCommandOpts(
                     working_directory=spec.cwd,
@@ -355,9 +373,52 @@ class OpenSandboxRuntime:
                 ),
                 handlers=output.handlers(),
             )
-            return output.response(execution)
-        except SandboxException as exc:
-            await self._raise_runtime_error(exc, sandbox)
+        )
+        watch = asyncio.ensure_future(self._wait_until_dead(sandbox))
+        deadline = spec.timeout_seconds + self.settings.execution_deadline_grace_seconds
+        try:
+            await asyncio.wait(
+                {run, watch}, timeout=deadline, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            for task in (run, watch):
+                task.cancel()
+            await asyncio.gather(run, watch, return_exceptions=True)
+        if run.done() and not run.cancelled():
+            try:
+                return output.response(run.result())
+            except SandboxException as exc:
+                await self._raise_runtime_error(exc, sandbox)
+        if await self._detect_memory_exceeded(sandbox):
+            raise SandboxMemoryExceededError(sandbox.memory_mb)
+        if watch.done() and not watch.cancelled():
+            message = "the sandbox died while the command was running"
+        else:
+            message = f"the sandbox did not answer within {deadline:g}s"
+        raise SandboxUnavailableError(message)
+
+    async def _wait_until_dead(self, sandbox: Sandbox) -> None:
+        """Return once OpenSandbox reports `sandbox` in a dead state.
+
+        A failed or slow lookup is not evidence of death, so it is skipped
+        rather than returned on: only a state OpenSandbox actually reported
+        ends the wait.
+        """
+        container_id = sandbox.container_id
+        if not container_id:
+            await asyncio.Event().wait()
+            return
+        while True:
+            await asyncio.sleep(self.settings.execution_liveness_poll_seconds)
+            try:
+                async with asyncio.timeout(self.settings.oom_diagnostic_timeout_seconds):
+                    info = await (await self._get_manager()).get_sandbox_info(
+                        container_id
+                    )
+            except Exception:  # noqa: BLE001, S112 - a missed poll is not a death
+                continue
+            if str(info.status.state).lower() in _DEAD_STATES:
+                return
 
     async def read_file(self, sandbox: Sandbox, path: str) -> FileReadResponse:
         handle = await self._get_handle(sandbox, check_ready=True)

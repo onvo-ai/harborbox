@@ -529,3 +529,94 @@ async def test_a_process_with_stdin_still_goes_through_a_shell_pipe(
     assert isinstance(command, str)
     assert command.endswith("| base64 -d | python3 -c 'print('\"'\"'a b'\"'\"')'")
     await runtime.close()
+
+
+class SilentCommandHandle(FakeHandle):
+    """A handle whose command stream never ends, as when gVisor's sandbox dies.
+
+    Under gVisor an OOM kills the whole sandbox, network stack included, so
+    nothing closes the stream the SDK is reading with no timeout.
+    """
+
+    @property
+    def commands(self) -> SimpleNamespace:
+        async def run(*_: object, **__: object) -> None:
+            await asyncio.Event().wait()
+
+        return SimpleNamespace(run=run)
+
+
+def silent_runtime(
+    monkeypatch: pytest.MonkeyPatch, manager: FakeManager, **settings: Any  # noqa: ANN401
+) -> OpenSandboxRuntime:
+    runtime = OpenSandboxRuntime(
+        Settings(execution_liveness_poll_seconds=0.01, **settings)
+    )
+    runtime._manager = manager  # type: ignore[assignment]
+
+    async def get_handle(*_: object, **__: object) -> SilentCommandHandle:
+        return SilentCommandHandle()
+
+    monkeypatch.setattr(runtime, "_get_handle", get_handle)
+    return runtime
+
+
+@pytest.mark.asyncio
+async def test_a_sandbox_oom_killed_mid_command_is_reported_as_memory_exceeded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What OpenSandbox 1.1.1 reported for a gVisor sandbox's OOM, verbatim."""
+    manager = FakeManager()
+    manager.sandbox_info = sandbox_info(
+        state="Failed",
+        reason="CONTAINER_EXITED_ERROR",
+        message="Sandbox container exited with code 137.",
+    )
+    runtime = silent_runtime(monkeypatch, manager)
+
+    with pytest.raises(SandboxMemoryExceededError):
+        await asyncio.wait_for(
+            runtime.execute_process(
+                sandbox_record(container_id="osb-1"), process_request(stdin=None)
+            ),
+            timeout=5,
+        )
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_command_is_never_waited_on_past_its_timeout_plus_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The backstop: a sandbox that says it is running but never answers."""
+    manager = FakeManager()
+    manager.sandbox_info = sandbox_info(state="Running", reason="CONTAINER_RUNNING")
+    runtime = silent_runtime(monkeypatch, manager, execution_deadline_grace_seconds=0)
+    request = process_request(stdin=None).model_copy(update={"timeout_seconds": 1})
+
+    with pytest.raises(SandboxUnavailableError, match="did not answer within 1s"):
+        await asyncio.wait_for(
+            runtime.execute_process(sandbox_record(container_id="osb-1"), request),
+            timeout=5,
+        )
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_liveness_lookup_is_not_taken_for_a_dead_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a state OpenSandbox reported ends the wait early; an error does not."""
+    manager = FakeManager()
+    manager.sandbox_info_error = SandboxException("control plane hiccup")
+    runtime = silent_runtime(monkeypatch, manager, execution_deadline_grace_seconds=0)
+    request = process_request(stdin=None).model_copy(update={"timeout_seconds": 1})
+    started = asyncio.get_running_loop().time()
+
+    with pytest.raises(SandboxUnavailableError, match="did not answer"):
+        await asyncio.wait_for(
+            runtime.execute_process(sandbox_record(container_id="osb-1"), request),
+            timeout=5,
+        )
+    assert asyncio.get_running_loop().time() - started >= 1
+    await runtime.close()

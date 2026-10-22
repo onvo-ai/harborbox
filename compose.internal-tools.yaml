@@ -125,6 +125,18 @@ configs:
       type = "docker"
       execd_image = "opensandbox/execd:release-1.1.1"
 
+      # gVisor: each sandbox talks to a user-space kernel (runsc) instead of
+      # the host's, so escaping a container means breaking gVisor first. No
+      # KVM needed, so it runs on ordinary cloud VMs. Off unless
+      # OPENSANDBOX_GVISOR is set -- to anything, "0" included, because
+      # Compose's `:+` only asks whether it is non-empty. The host must have
+      # runsc registered with Docker first (scripts/install-gvisor.sh), or
+      # OpenSandbox refuses to start. OpenSandbox rejects docker_runtime even
+      # when empty while gVisor is off, so the whole line comes and goes.
+      [secure_runtime]
+      type = "${OPENSANDBOX_GVISOR:+gvisor}"
+      ${OPENSANDBOX_GVISOR:+docker_runtime = "runsc"}
+
       [store]
       type = "sqlite"
       path = "/var/lib/opensandbox/opensandbox.db"
