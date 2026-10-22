@@ -25,6 +25,7 @@ from opensandbox.models.execd import Execution, ExecutionHandlers, RunCommandOpt
 from opensandbox.models.filesystem import DirectoryListEntry
 
 from harborbox.errors import (
+    SandboxFileNotFoundError,
     SandboxMemoryExceededError,
     SandboxStartTimeoutError,
     SandboxUnavailableError,
@@ -56,6 +57,8 @@ if TYPE_CHECKING:
     from harborbox.models import Sandbox
 
 SNAPSHOT_METADATA_KEY = "harborbox.runtime.snapshot_id"
+# execd's error code for a path that does not exist (`model.ErrorCodeFileNotFound`).
+FILE_NOT_FOUND_CODE = "FILE_NOT_FOUND"
 logger = logging.getLogger(__name__)
 
 # Tokens checked (case-insensitively) against a dead sandbox's live
@@ -356,7 +359,7 @@ class OpenSandboxRuntime:
         try:
             content = await handle.files.read_bytes(path)
         except SandboxException as exc:
-            await self._raise_runtime_error(exc, sandbox)
+            await self._raise_file_error(exc, sandbox, path)
         try:
             return FileReadResponse(
                 path=path, content=content.decode("utf-8"), encoding="utf-8"
@@ -416,7 +419,7 @@ class OpenSandboxRuntime:
                 DirectoryListEntry(path=path, depth=1)
             )
         except SandboxException as exc:
-            await self._raise_runtime_error(exc, sandbox)
+            await self._raise_file_error(exc, sandbox, path)
         return FileListResponse(
             path=path,
             entries=[
@@ -443,7 +446,7 @@ class OpenSandboxRuntime:
             else:
                 await handle.files.delete_files([path])
         except SandboxException as exc:
-            await self._raise_runtime_error(exc, sandbox)
+            await self._raise_file_error(exc, sandbox, path)
 
     async def pause(self, sandbox: Sandbox, *, memory: bool) -> None:
         if not sandbox.container_id:
@@ -699,6 +702,19 @@ class OpenSandboxRuntime:
         # inside it died -- see the docstring above.
         haystack = f"{info.status.reason or ''} {info.status.message or ''}".lower()
         return any(token in haystack for token in _OOM_SIGNAL_TOKENS)
+
+    async def _raise_file_error(
+        self, exc: SandboxException, sandbox: Sandbox, path: str
+    ) -> NoReturn:
+        """`_raise_runtime_error`, except that a missing path is the caller's.
+
+        Matched on execd's own `FILE_NOT_FOUND` code, not on HTTP 404: through
+        OpenSandbox's server proxy, a sandbox that no longer exists is a 404
+        too, and that one really is the sandbox being gone.
+        """
+        if exc.error.code == FILE_NOT_FOUND_CODE:
+            raise SandboxFileNotFoundError(path) from exc
+        await self._raise_runtime_error(exc, sandbox)
 
     async def _raise_runtime_error(
         self, exc: SandboxException, sandbox: Sandbox
