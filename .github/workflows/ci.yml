@@ -329,8 +329,8 @@ jobs:
       # -f compose.builder.local.yaml for the same reason: the deployed
       # builder bind-mounts /data/harborbox/buildkit-tls/server, and the local
       # override points it at the checkout instead. -f compose.builder.ci.yaml
-      # fits the builder to the Coolify runners' Docker sidecar (no /dev/fuse,
-      # a smaller user-ID range); the file says why.
+      # swaps in a rootful BuildKit, because rootless BuildKit cannot run
+      # inside the Coolify runners' Sysbox sidecar; the file says why.
       - name: Start the builder
         run: docker compose -f compose.builder.yaml -f compose.builder.local.yaml -f compose.builder.ci.yaml up -d --wait
 

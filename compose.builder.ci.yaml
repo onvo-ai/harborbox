@@ -1,45 +1,28 @@
 # CI-only override for compose.builder.yaml, layered after compose.builder.local.yaml.
 # Do not use this file for a deploy.
 #
-# The Coolify CI runners run Docker inside a Sysbox sidecar. Three of the
-# builder's settings do not fit there:
+# The Coolify CI runners run Docker inside a Sysbox sidecar, and rootless
+# BuildKit does not run there. It starts its own user namespace, and Sysbox
+# only handles /proc mounts for processes in the sidecar's own namespace, so
+# every build step failed on its /proc mount ("operation not permitted", and
+# "invalid argument" with --oci-worker-no-process-sandbox). The rootless
+# image's sub-ID range (100000+) and its /dev/fuse device do not exist in the
+# sidecar either.
 #
-# 1. The sidecar has no /dev/fuse, so `devices: [/dev/fuse]` stops the builder
-#    from starting:
-#      error gathering device information while adding custom device "/dev/fuse"
-#    Without it, rootless BuildKit uses kernel overlayfs in its user namespace,
-#    or the native snapshotter. Builds are the same; only storage differs.
-#
-# 2. The sidecar is itself a user namespace with IDs 0-65535 only. The image's
-#    /etc/subuid gives `user` 100000-165535, which does not exist there, so
-#    rootlesskit fails with
-#      newuidmap: write to uid_map failed: Operation not permitted
-#    The two ranges below use 1-999 and 1001-65535, which do exist (1000 is
-#    `user` itself). In order they give the build container IDs 1-65534,
-#    so the sandbox user (10001) and nobody/nogroup (65534) both map.
-#
-# 3. A build step cannot mount its own /proc under Sysbox, so every RUN failed:
-#      error mounting "proc" to rootfs at "/proc": ... operation not permitted
-#    `--oci-worker-no-process-sandbox` runs steps in buildkitd's PID namespace
-#    instead of a new one. compose.builder.yaml avoids that flag on purpose
-#    (it keeps the per-step process sandbox), so it stays CI-only. The e2e
-#    isolation test measures the build network, which this does not change.
+# So CI runs rootful BuildKit, privileged, the way Docker itself runs inside
+# the sidecar. "Privileged" here means inside the sidecar's user namespace, not
+# root on build-server. It keeps compose.builder.yaml's config, certificates,
+# network and state volume, so the API drives it exactly as it drives the
+# deployed builder. What CI no longer covers is the rootless hardening itself;
+# that stays verified on the deploy, per docs/arbitrary-dockerfile-templates.md
+# section 10.
 services:
   builder:
+    image: moby/buildkit:latest
+    privileged: true
     devices: !reset []
-    command: ["--oci-worker-no-process-sandbox"]
-    configs:
-      - source: ci-subuid
-        target: /etc/subuid
-      - source: ci-subgid
-        target: /etc/subgid
-
-configs:
-  ci-subuid:
-    content: |
-      user:1:999
-      user:1001:64535
-  ci-subgid:
-    content: |
-      user:1:999
-      user:1001:64535
+    command:
+      - --config=/home/user/.config/buildkit/buildkitd.toml
+      - --root=/home/user/.local/share/buildkit
+    healthcheck:
+      test: ["CMD", "buildctl", "--addr", "unix:///run/user/1000/buildkit/buildkitd.sock", "debug", "workers"]
