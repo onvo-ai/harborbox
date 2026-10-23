@@ -630,12 +630,19 @@ services:
       sandboxes:
         aliases:
           - harborbox-sandboxes
-      # The Trigger stack's network. `harborbox` is the name task code uses;
-      # a parallel deploy takes a different alias so Docker DNS does not
-      # round-robin between two stacks.
+      # The Trigger stack's network. `harborbox` is the name task code uses
+      # by default; production also answers to `harborbox-next`, which is what
+      # Onvo's TRIGGER_HARBORBOX_URL points at today. Two variables, so this
+      # stack can answer to both names while it is the only one. Docker
+      # collapses a repeated alias, so the defaults give plain `harborbox`.
+      # A second stack on this network (a future staging deploy) must set
+      # BOTH to its own name, or Docker DNS round-robins `harborbox` between
+      # the two stacks. Production sets HARBORBOX_NETWORK_ALIAS=harborbox-next
+      # and leaves the secondary at its default. See DEV-2609.
       trigger:
         aliases:
           - ${HARBORBOX_NETWORK_ALIAS:-harborbox}
+          - ${HARBORBOX_NETWORK_ALIAS_SECONDARY:-harborbox}
 
 volumes:
   harborbox-postgres:
