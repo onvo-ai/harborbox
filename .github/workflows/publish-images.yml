@@ -88,9 +88,9 @@ jobs:
             runner: [self-hosted, coolify-ci]
           - platform: linux/arm64
             # A native arm64 runner. This is the whole point of the split:
-            # no QEMU anywhere in this workflow. It stays GitHub-hosted
-            # because we have no arm64 self-hosted runner.
-            runner: ubuntu-24.04-arm
+            # no QEMU anywhere in this workflow. Our Coolify runners on
+            # build-server-arm (the former fleevo server).
+            runner: [self-hosted, coolify-ci-arm]
           - image: harborbox-api
             dockerfile: Dockerfile.api
           - image: harborbox-sandbox-base
