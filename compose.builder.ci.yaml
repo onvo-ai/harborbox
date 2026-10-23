@@ -1,13 +1,34 @@
 # CI-only override for compose.builder.yaml, layered after compose.builder.local.yaml.
+# Do not use this file for a deploy.
 #
-# The Coolify CI runners run Docker inside a Sysbox sidecar, which has no
-# /dev/fuse, so `devices: [/dev/fuse]` stops the builder from starting:
+# The Coolify CI runners run Docker inside a Sysbox sidecar. Two of the
+# builder's settings do not fit there:
 #
-#   error gathering device information while adding custom device "/dev/fuse"
+# 1. The sidecar has no /dev/fuse, so `devices: [/dev/fuse]` stops the builder
+#    from starting:
+#      error gathering device information while adding custom device "/dev/fuse"
+#    Without it, rootless BuildKit uses kernel overlayfs in its user namespace,
+#    or the native snapshotter. Builds are the same; only storage differs.
 #
-# Without the device, rootless BuildKit uses kernel overlayfs in its user
-# namespace if it can, and the native snapshotter if not. Builds are the same;
-# only the storage driver differs. Do not use this file for a deploy.
+# 2. The sidecar is itself a user namespace with IDs 0-65535 only. The image's
+#    /etc/subuid gives `user` 100000-165535, which does not exist there, so
+#    rootlesskit fails with
+#      newuidmap: write to uid_map failed: Operation not permitted
+#    The range below (1001-65535) does exist. It still covers uid/gid 10001,
+#    the sandbox user, but not 65534-65535 (nobody/nogroup).
 services:
   builder:
     devices: !reset []
+    configs:
+      - source: ci-subuid
+        target: /etc/subuid
+      - source: ci-subgid
+        target: /etc/subgid
+
+configs:
+  ci-subuid:
+    content: |
+      user:1001:64535
+  ci-subgid:
+    content: |
+      user:1001:64535
