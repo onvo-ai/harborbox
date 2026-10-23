@@ -57,7 +57,12 @@ export interface CommandOptions {
 }
 
 export interface CommandResult {
+  /**
+   * The command's standard output, one line per `"\n"`. Every line ends with
+   * `"\n"`, including the last one; no output is `""`. See `joinOutputLines`.
+   */
   stdout: string;
+  /** The command's standard error, in the same shape as `stdout`. */
   stderr: string;
   exitCode: number;
   error?: {
@@ -84,6 +89,29 @@ function sleep(milliseconds: number): Promise<void> {
 /** Bounds for the fallback poll loop; see HarborboxConnection.waitForExecution. */
 const MIN_POLL_MS = 20;
 const MAX_POLL_MS = 1_000;
+
+/**
+ * Rebuild a command's output text from the chunks the API returns.
+ *
+ * `logs.stdout` and `logs.stderr` hold one element per line, with the line's
+ * terminator removed. A blank line is the element `"\n"`. An unterminated last
+ * line arrives as it is. So the lines `alpha`, (blank), `beta`, `gamma` arrive
+ * as `["alpha", "\n", "beta", "gamma"]`. Joining them with `""` welded that
+ * into `"alpha\nbetagamma"` (DEV-2613).
+ *
+ * Each element becomes one line, and every line ends with `"\n"`. That
+ * matches E2B, whose `CommandResult.stdout` is the raw output stream, for the
+ * usual case of output that ends in a newline: `echo hi` gives `"hi\n"` in
+ * both. The API cannot tell a terminated last line from an unterminated one,
+ * so `printf hi` also gives `"hi\n"` here, where E2B gives `"hi"`. No output
+ * gives `""`.
+ */
+function joinOutputLines(chunks: readonly string[]): string {
+  if (chunks.length === 0) {
+    return "";
+  }
+  return chunks.map((chunk) => (chunk === "\n" ? "" : chunk)).join("\n") + "\n";
+}
 
 function isTerminal(execution: ExecutionPayload): boolean {
   return (
@@ -199,8 +227,8 @@ class Commands {
         );
     this.sandbox.status = "running";
     const result: CommandResult = {
-      stdout: (completed.logs?.stdout ?? []).join(""),
-      stderr: (completed.logs?.stderr ?? []).join(""),
+      stdout: joinOutputLines(completed.logs?.stdout ?? []),
+      stderr: joinOutputLines(completed.logs?.stderr ?? []),
       exitCode: completed.exit_code ?? (completed.status === "succeeded" ? 0 : 1),
     };
     if (completed.error) {
