@@ -452,7 +452,10 @@ services:
       # its contexts on a container filesystem that a restart discarded.
       - harborbox-contexts:/var/lib/harborbox/build-contexts
     ports:
-      - "127.0.0.1:${HARBORBOX_PORT:-8000}:8000"
+      # HARBORBOX_PUBLISH_IP exists for CI only: on a Coolify runner Docker
+      # runs in a sidecar, so the job reaches this port over the sidecar's
+      # network rather than its own loopback. Leave it unset everywhere else.
+      - "${HARBORBOX_PUBLISH_IP:-127.0.0.1}:${HARBORBOX_PORT:-8000}:8000"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:

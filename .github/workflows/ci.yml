@@ -6,8 +6,12 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# All three jobs run on the shared, fixed-name `onvo-ci` self-hosted runners
-# (build-server, three runner instances, one host). Two overlapping E2E
+# All three jobs run on the Coolify-managed `coolify-ci` runners (build-server,
+# 3 at a time, shared with Toolspoke and Fleevo). Each is an ephemeral
+# container with its own Docker daemon in a sidecar, so the contention below is
+# gone on them; the concurrency group stays because a superseded run is still
+# wasted capacity. History: until 2026-10 these jobs ran on the shared,
+# fixed-name `onvo-ci` self-hosted runners (one host, one Docker daemon). Two overlapping E2E
 # (Compose) jobs there fight over the same container and network names --
 # `docker compose up` for one run sees the other's `harborbox-opensandbox-1`
 # still starting and its dependency check fails, or the shared
@@ -34,7 +38,7 @@ jobs:
     # it gets free standard runners that no spending limit touches. Measured
     # 2026-08-25, a `ubuntu-latest` job here starts and succeeds in ~20s.
     # ci-freshness.yml depends on that, deliberately - see DEV-1971.
-    runs-on: [self-hosted, onvo-ci]
+    runs-on: [self-hosted, coolify-ci]
     permissions:
       contents: read
 
@@ -62,10 +66,19 @@ jobs:
           --health-interval 5s --health-timeout 5s --health-retries 20
         ports: ["5432:5432"]
 
-    env:
-      HARBORBOX_TEST_DATABASE_URL: postgresql+asyncpg://harborbox:harborbox@127.0.0.1:5432/harborbox_test
-
     steps:
+      # On a Coolify runner Docker runs in a sidecar, so the postgres service's
+      # published port is on `${RUNNER_NAME}-dind`, not on this job's
+      # 127.0.0.1. The URL is written here rather than in a job-level `env:`
+      # because a job-level value would win over $GITHUB_ENV.
+      - name: Find the Docker host
+        run: |
+          case "$RUNNER_NAME" in
+            coolify-runner-*) db_host="${RUNNER_NAME}-dind" ;;
+            *) db_host=127.0.0.1 ;;
+          esac
+          echo "HARBORBOX_TEST_DATABASE_URL=postgresql+asyncpg://harborbox:harborbox@${db_host}:5432/harborbox_test" >> "$GITHUB_ENV"
+
       # BEFORE checkout, and it has to be: these runners are persistent, and the
       # buildkit certificates are written by a container running as root.
       # Docker also creates a missing bind-mount source as root, so
@@ -187,7 +200,7 @@ jobs:
 
   e2e:
     name: E2E (Compose)
-    runs-on: [self-hosted, onvo-ci]
+    runs-on: [self-hosted, coolify-ci]
     timeout-minutes: 40
     permissions:
       contents: read
@@ -232,6 +245,22 @@ jobs:
       HARBORBOX_REGISTRY_PASSWORD: local-e2e-only-not-a-real-credential
 
     steps:
+      # On a Coolify runner Docker runs in a sidecar, so a port compose
+      # publishes opens there, reachable as `${RUNNER_NAME}-dind`, and only if
+      # it is published on 0.0.0.0. compose.yaml reads HARBORBOX_PUBLISH_IP for
+      # the API's port; the e2e client and e2e_oom read HARBORBOX_BASE_URL.
+      - name: Find the Docker host
+        run: |
+          case "$RUNNER_NAME" in
+            coolify-runner-*) { echo "CI_PUBLISH_IP=0.0.0.0"; echo "CI_DOCKER_HOST=${RUNNER_NAME}-dind"; } >> "$GITHUB_ENV" ;;
+            *) { echo "CI_PUBLISH_IP=127.0.0.1"; echo "CI_DOCKER_HOST=127.0.0.1"; } >> "$GITHUB_ENV" ;;
+          esac
+
+      - name: Point the stack and the tests at the Docker host
+        run: |
+          echo "HARBORBOX_PUBLISH_IP=${CI_PUBLISH_IP}" >> "$GITHUB_ENV"
+          echo "HARBORBOX_BASE_URL=http://${CI_DOCKER_HOST}:8000" >> "$GITHUB_ENV"
+
       # BEFORE checkout, and it has to be: these runners are persistent, and the
       # buildkit certificates are written by a container running as root.
       # Docker also creates a missing bind-mount source as root, so
@@ -299,9 +328,11 @@ jobs:
       # a real build step, which is the only place it can be measured.
       # -f compose.builder.local.yaml for the same reason: the deployed
       # builder bind-mounts /data/harborbox/buildkit-tls/server, and the local
-      # override points it at the checkout instead.
+      # override points it at the checkout instead. -f compose.builder.ci.yaml
+      # swaps in a rootful BuildKit, because rootless BuildKit cannot run
+      # inside the Coolify runners' Sysbox sidecar; the file says why.
       - name: Start the builder
-        run: docker compose -f compose.builder.yaml -f compose.builder.local.yaml up -d --wait
+        run: docker compose -f compose.builder.yaml -f compose.builder.local.yaml -f compose.builder.ci.yaml up -d --wait
 
       - name: Start the stack
         run: docker compose up -d --wait
@@ -321,7 +352,7 @@ jobs:
         if: failure()
         run: |
           docker compose logs --no-color --tail 300
-          docker compose -f compose.builder.yaml -f compose.builder.local.yaml logs --no-color --tail 100
+          docker compose -f compose.builder.yaml -f compose.builder.local.yaml -f compose.builder.ci.yaml logs --no-color --tail 100
 
       # `docker compose logs` above only covers this compose project's own
       # services (postgres, opensandbox, api). The actual sandbox containers
@@ -428,7 +459,7 @@ jobs:
           docker ps -aq --filter label=harborbox.sandbox_id \
             | xargs -r docker rm -f
           docker compose down -v
-          docker compose -f compose.builder.yaml -f compose.builder.local.yaml down -v
+          docker compose -f compose.builder.yaml -f compose.builder.local.yaml -f compose.builder.ci.yaml down -v
           # Same reason as the reclaim step: leave the workspace in a state the
           # next checkout can actually delete.
           docker run --rm -v "${{ github.workspace }}:/w" alpine:3 \
@@ -447,7 +478,7 @@ jobs:
     name: Results report
     if: always()
     needs: [test, e2e]
-    runs-on: [self-hosted, onvo-ci]
+    runs-on: [self-hosted, coolify-ci]
     # pull-requests: write is only for the sticky comment. The default token is
     # read-only here, so without it the comment step 403s while every other step
     # passes — which reads as "the comment is broken" rather than "missing scope".

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import httpx
@@ -122,7 +123,10 @@ def test_api_stays_healthy_after_oom(
         )
         execution.wait(timeout=60)
 
-        health = httpx.get("http://localhost:8000/health", timeout=5)
+        health = httpx.get(
+            os.environ.get("HARBORBOX_BASE_URL", "http://localhost:8000") + "/health",
+            timeout=5,
+        )
         health.raise_for_status()
         assert health.json() == {"status": "ok"}
     finally:
