@@ -1,7 +1,7 @@
 # CI-only override for compose.builder.yaml, layered after compose.builder.local.yaml.
 # Do not use this file for a deploy.
 #
-# The Coolify CI runners run Docker inside a Sysbox sidecar. Two of the
+# The Coolify CI runners run Docker inside a Sysbox sidecar. Three of the
 # builder's settings do not fit there:
 #
 # 1. The sidecar has no /dev/fuse, so `devices: [/dev/fuse]` stops the builder
@@ -14,11 +14,20 @@
 #    /etc/subuid gives `user` 100000-165535, which does not exist there, so
 #    rootlesskit fails with
 #      newuidmap: write to uid_map failed: Operation not permitted
-#    The range below (1001-65535) does exist. It still covers uid/gid 10001,
-#    the sandbox user, but not 65534-65535 (nobody/nogroup).
+#    The two ranges below use 1-999 and 1001-65535, which do exist (1000 is
+#    `user` itself). In order they give the build container IDs 1-65534,
+#    so the sandbox user (10001) and nobody/nogroup (65534) both map.
+#
+# 3. A build step cannot mount its own /proc under Sysbox, so every RUN failed:
+#      error mounting "proc" to rootfs at "/proc": ... operation not permitted
+#    `--oci-worker-no-process-sandbox` runs steps in buildkitd's PID namespace
+#    instead of a new one. compose.builder.yaml avoids that flag on purpose
+#    (it keeps the per-step process sandbox), so it stays CI-only. The e2e
+#    isolation test measures the build network, which this does not change.
 services:
   builder:
     devices: !reset []
+    command: ["--oci-worker-no-process-sandbox"]
     configs:
       - source: ci-subuid
         target: /etc/subuid
@@ -28,7 +37,9 @@ services:
 configs:
   ci-subuid:
     content: |
+      user:1:999
       user:1001:64535
   ci-subgid:
     content: |
+      user:1:999
       user:1001:64535
