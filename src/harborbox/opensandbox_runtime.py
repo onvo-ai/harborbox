@@ -79,8 +79,15 @@ _OOM_SIGNAL_TOKENS = (
     "exited with code 137",
 )
 
+# Sandbox states that mean a delete has already happened or is under way.
+# OpenSandbox 1.1 drops a deleted sandbox at once, so a lookup is a 404. From
+# 1.2 a deleted sandbox reports `Stopping` until its cleanup finishes, then
+# `Terminated` (DEV-2614). Either one means "already killed": `kill` must not
+# fail on it or delete it a second time.
+_GONE_STATES = frozenset({"stopping", "terminated"})
+
 # Sandbox states after which nothing inside can still be producing output.
-_DEAD_STATES = frozenset({"failed", "terminated", "stopping"})
+_DEAD_STATES = _GONE_STATES | {"failed"}
 
 
 @dataclass(frozen=True)
@@ -614,15 +621,13 @@ class OpenSandboxRuntime:
                     connection_config=self._connection,
                     skip_health_check=True,
                 )
-            except SandboxApiException as exc:
-                if exc.status_code != HTTPStatus.NOT_FOUND:
-                    await self._raise_runtime_error(exc, sandbox)
+            except SandboxException as exc:
+                await self._raise_unless_gone(exc, sandbox)
         if handle is not None:
             try:
                 await handle.kill()
-            except SandboxApiException as exc:
-                if exc.status_code != HTTPStatus.NOT_FOUND:
-                    await self._raise_runtime_error(exc, sandbox)
+            except SandboxException as exc:
+                await self._raise_unless_gone(exc, sandbox)
             finally:
                 await handle.close()
 
@@ -821,6 +826,55 @@ class OpenSandboxRuntime:
         if exc.error.code == FILE_NOT_FOUND_CODE:
             raise SandboxFileNotFoundError(path) from exc
         await self._raise_runtime_error(exc, sandbox)
+
+    async def _raise_unless_gone(
+        self, exc: SandboxException, sandbox: Sandbox
+    ) -> None:
+        """Return if a failed kill step failed because the sandbox is gone.
+
+        A 404 means gone, as before. Any other failure is checked against the
+        sandbox's live state: on OpenSandbox 1.2 a deleted sandbox reports
+        `Stopping` and then `Terminated` instead of a 404, and connecting to
+        or deleting it again may fail. Either state counts as gone. Otherwise
+        the failure is raised as it was before: API errors through
+        `_raise_runtime_error`, anything else unchanged.
+
+        On 1.1 the state check only runs after a failure, so a kill that works
+        makes no extra call.
+        """
+        if (
+            isinstance(exc, SandboxApiException)
+            and exc.status_code == HTTPStatus.NOT_FOUND
+        ):
+            return
+        if await self._is_gone(sandbox):
+            logger.info(
+                "Sandbox %s is already stopping or gone; treating it as killed",
+                sandbox.id,
+            )
+            return
+        if isinstance(exc, SandboxApiException):
+            await self._raise_runtime_error(exc, sandbox)
+        raise exc
+
+    async def _is_gone(self, sandbox: Sandbox) -> bool:
+        """Whether OpenSandbox reports `sandbox` deleted or being deleted.
+
+        Best effort and bounded: a failed or slow lookup is not evidence, so it
+        answers False and the caller keeps its original error.
+        """
+        if not sandbox.container_id:
+            return False
+        try:
+            async with asyncio.timeout(self.settings.oom_diagnostic_timeout_seconds):
+                info = await (await self._get_manager()).get_sandbox_info(
+                    sandbox.container_id
+                )
+        except SandboxApiException as exc:
+            return exc.status_code == HTTPStatus.NOT_FOUND
+        except Exception:  # noqa: BLE001 - a failed lookup is not evidence
+            return False
+        return str(info.status.state).lower() in _GONE_STATES
 
     async def _raise_runtime_error(
         self, exc: SandboxException, sandbox: Sandbox
