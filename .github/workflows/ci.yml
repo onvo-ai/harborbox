@@ -328,9 +328,10 @@ jobs:
       # a real build step, which is the only place it can be measured.
       # -f compose.builder.local.yaml for the same reason: the deployed
       # builder bind-mounts /data/harborbox/buildkit-tls/server, and the local
-      # override points it at the checkout instead.
+      # override points it at the checkout instead. -f compose.builder.ci.yaml
+      # drops /dev/fuse, which the Coolify runners' Docker sidecar does not have.
       - name: Start the builder
-        run: docker compose -f compose.builder.yaml -f compose.builder.local.yaml up -d --wait
+        run: docker compose -f compose.builder.yaml -f compose.builder.local.yaml -f compose.builder.ci.yaml up -d --wait
 
       - name: Start the stack
         run: docker compose up -d --wait
@@ -350,7 +351,7 @@ jobs:
         if: failure()
         run: |
           docker compose logs --no-color --tail 300
-          docker compose -f compose.builder.yaml -f compose.builder.local.yaml logs --no-color --tail 100
+          docker compose -f compose.builder.yaml -f compose.builder.local.yaml -f compose.builder.ci.yaml logs --no-color --tail 100
 
       # `docker compose logs` above only covers this compose project's own
       # services (postgres, opensandbox, api). The actual sandbox containers
@@ -457,7 +458,7 @@ jobs:
           docker ps -aq --filter label=harborbox.sandbox_id \
             | xargs -r docker rm -f
           docker compose down -v
-          docker compose -f compose.builder.yaml -f compose.builder.local.yaml down -v
+          docker compose -f compose.builder.yaml -f compose.builder.local.yaml -f compose.builder.ci.yaml down -v
           # Same reason as the reclaim step: leave the workspace in a state the
           # next checkout can actually delete.
           docker run --rm -v "${{ github.workspace }}:/w" alpine:3 \

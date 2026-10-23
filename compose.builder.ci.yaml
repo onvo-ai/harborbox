@@ -1,0 +1,13 @@
+# CI-only override for compose.builder.yaml, layered after compose.builder.local.yaml.
+#
+# The Coolify CI runners run Docker inside a Sysbox sidecar, which has no
+# /dev/fuse, so `devices: [/dev/fuse]` stops the builder from starting:
+#
+#   error gathering device information while adding custom device "/dev/fuse"
+#
+# Without the device, rootless BuildKit uses kernel overlayfs in its user
+# namespace if it can, and the native snapshotter if not. Builds are the same;
+# only the storage driver differs. Do not use this file for a deploy.
+services:
+  builder:
+    devices: !reset []
