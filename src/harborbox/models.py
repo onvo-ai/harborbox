@@ -43,6 +43,12 @@ class Sandbox(Base):
         Boolean, nullable=False, default=False, server_default=text("false")
     )
     idle_timeout_seconds: Mapped[int] = mapped_column(Integer)
+    # For a derived template: the conformance layer version of the image this
+    # sandbox was created against, pinned so a template rebuilt in the meantime
+    # cannot swap the image under a sandbox that has not started yet. A column
+    # rather than metadata because callers can write metadata, and this picks
+    # the image tag. None means the legacy, unversioned tag.
+    conformance_version: Mapped[str | None] = mapped_column(String(16), nullable=True)
     metadata_: Mapped[dict[str, str]] = mapped_column("metadata", JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
@@ -72,6 +78,10 @@ class SandboxTemplate(Base):
     spec_hash: Mapped[str] = mapped_column(String(12), unique=True, index=True)
     spec: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     image: Mapped[str] = mapped_column(String(255))
+    # The conformance layer version `image` was built with
+    # (`templates.CONFORMANCE_VERSION`). None for rows built before it was
+    # recorded, which therefore read as stale and rebuild on the next POST.
+    conformance_version: Mapped[str | None] = mapped_column(String(16), nullable=True)
     status: Mapped[str] = mapped_column(String(16), index=True, default="building")
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     memory_mb: Mapped[int] = mapped_column(Integer)

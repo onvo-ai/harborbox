@@ -43,6 +43,26 @@ WORKDIR /workspace
 USER {SANDBOX_USER}"""
 
 
+def conformance_version(layer: str = CONFORMANCE_LAYER) -> str:
+    """Name the appended layer by its content, so editing it is the version bump.
+
+    A template's name covers only what the caller sent, so a change to the
+    layer we append cannot rename anything -- products pin template names.
+    Instead every row records the version its image was built with, and a
+    `POST /v1/templates` that finds a ready row on another version rebuilds it
+    under the same name (DEV-2611). Hashing the text means nobody has to
+    remember to bump a constant: `SANDBOX_USER` and `TMP_KEEP_FILE` are
+    interpolated into it, so changing either changes this too.
+
+    The caller's own base image is not part of it: their `FROM` is inside their
+    Dockerfile, which `spec_hash` already covers.
+    """
+    return hashlib.sha256(layer.encode("utf-8")).hexdigest()[:8]
+
+
+CONFORMANCE_VERSION = conformance_version()
+
+
 class TemplateSpecError(ValueError):
     """A caller-supplied template spec that must never reach a Dockerfile."""
 
@@ -123,6 +143,10 @@ class ResolvedTemplate:
     status: TemplateStatus
     derived: bool
     spec_hash: str | None = None
+    # Which conformance layer the image this resolves to was built with. None
+    # for static templates, and for derived images built before versions were
+    # recorded; see `Settings.derived_template_image` for how it picks the tag.
+    conformance_version: str | None = None
 
 
 
@@ -287,6 +311,20 @@ def derived_template(template: SandboxTemplate) -> ResolvedTemplate:
         status=template.status,
         derived=True,
         spec_hash=template.spec_hash,
+        conformance_version=template.conformance_version,
+    )
+
+
+def needs_rebuild(template: SandboxTemplate) -> bool:
+    """Whether a ready image predates the conformance layer this code appends.
+
+    Only `ready` rows: a `building` one is already on its way to the current
+    layer, and a `failed` one is rebuilt by `POST /v1/templates` regardless.
+    Rows built before versions were recorded read as None, so they are stale.
+    """
+    return (
+        template.status == "ready"
+        and template.conformance_version != CONFORMANCE_VERSION
     )
 
 

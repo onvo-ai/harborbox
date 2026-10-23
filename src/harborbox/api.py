@@ -77,11 +77,13 @@ from harborbox.schemas import (
 from harborbox.security import require_api_key
 from harborbox.template_builder import TemplateBuilder
 from harborbox.templates import (
+    CONFORMANCE_VERSION,
     TemplateNotReadyError,
     TemplateSpecError,
     UnknownTemplateError,
     list_derived_templates,
     mark_template_used,
+    needs_rebuild,
     resolve_template,
     static_template,
     validate_template_spec,
@@ -380,6 +382,7 @@ def derived_template_response(
         # operator checks to confirm the pool they configured took effect.
         warm_pool=settings.warm_pool_sizes.get(template.name, 0),
         error=template.error,
+        conformance_version=template.conformance_version,
         created_at=template.created_at,
         updated_at=template.updated_at,
     )
@@ -491,6 +494,14 @@ async def create_template(
         template.last_used_at = utc_now()
         await session.commit()
         await session.refresh(template)
+        if needs_rebuild(template):
+            # Its image predates the conformance layer this code appends
+            # (DEV-2611). Rebuild under the same name -- products pin names --
+            # but leave the row `ready` on its current image: sandboxes keep
+            # being created from that until the builder swaps the new one in.
+            # The builder ignores a name it is already building, so a product
+            # that POSTs on every boot does not queue the same rebuild twice.
+            template_builder_from(request).schedule_build(template.name)
         response.status_code = status.HTTP_200_OK
         return derived_template_response(settings, template)
 
@@ -500,7 +511,7 @@ async def create_template(
             base="",
             spec_hash=spec.spec_hash,
             spec=spec.as_json(),
-            image=settings.derived_template_image(spec.name),
+            image=settings.derived_template_image(spec.name, CONFORMANCE_VERSION),
             status="building",
             memory_mb=memory_mb,
             cpu=cpu,
@@ -508,7 +519,9 @@ async def create_template(
         session.add(template)
     else:
         template.spec = spec.as_json()
-        template.image = settings.derived_template_image(spec.name)
+        template.image = settings.derived_template_image(
+            spec.name, CONFORMANCE_VERSION
+        )
         template.status = "building"
         template.error = None
         template.memory_mb = memory_mb
@@ -634,6 +647,7 @@ async def create_sandbox(
             if body.idle_timeout_seconds is not None
             else settings.default_idle_timeout_seconds
         ),
+        conformance_version=resolved.conformance_version,
         metadata_=metadata,
     )
     session.add(sandbox)

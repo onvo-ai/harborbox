@@ -321,13 +321,16 @@ class OpenSandboxRuntime:
                     template=sandbox.metadata_.get("template"),
                     memory_mb=sandbox.memory_mb,
                     cpu=sandbox.cpu,
+                    conformance_version=sandbox.conformance_version,
                 )
             if snapshot_id:
                 handle = await OpenSandbox.create(snapshot_id=snapshot_id, **kwargs)
             elif handle is None:
                 template = sandbox.metadata_.get("template")
                 handle = await OpenSandbox.create(
-                    self.settings.image_spec_for_template(template),
+                    self.settings.image_spec_for_template(
+                        template, sandbox.conformance_version
+                    ),
                     entrypoint=self.settings.entrypoint_for_template(template),
                     **kwargs,
                 )

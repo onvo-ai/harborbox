@@ -206,6 +206,38 @@ async def test_start_sends_a_bare_image_when_no_registry_is_configured(
 
 
 @pytest.mark.asyncio
+async def test_start_uses_the_image_tag_the_sandbox_was_pinned_to(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A template rebuilt after this sandbox was created must not swap its image.
+
+    The start uses the conformance version recorded on the sandbox row.
+    """
+    captured: dict[str, Any] = {}
+
+    class FakeOpenSandbox:
+        @classmethod
+        async def create(cls, *args: Any, **_kwargs: Any) -> FakeHandle:  # noqa: ANN401
+            captured["args"] = args
+            return FakeHandle()
+
+    monkeypatch.setattr(runtime_module, "OpenSandbox", FakeOpenSandbox)
+    runtime = OpenSandboxRuntime(Settings())
+    template = "custom-a1b2c3d4e5f6"
+
+    await runtime.start_sandbox(
+        sandbox_record(metadata_={"template": template}, conformance_version="0ld0ld0l")
+    )
+    pinned = captured["args"]
+    await runtime.start_sandbox(sandbox_record(metadata_={"template": template}))
+    legacy = captured["args"]
+
+    assert pinned == (f"harborbox-sandbox-{template}:local-0ld0ld0l",)
+    assert legacy == (f"harborbox-sandbox-{template}:local",)
+    await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_start_claims_matching_warm_template(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -218,6 +250,7 @@ async def test_start_claims_matching_warm_template(
             "template": "relaydeck",
             "memory_mb": 256,
             "cpu": 0.5,
+            "conformance_version": None,
         }
         return handle
 

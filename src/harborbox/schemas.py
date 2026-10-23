@@ -104,6 +104,10 @@ class TemplateResponse(BaseModel):
     cpu: float
     warm_pool: int = 0
     error: str | None = None
+    # The conformance layer version this template's image was built with. None
+    # for static templates and for derived images that predate the field; a
+    # value other than the current one means the next POST rebuilds it.
+    conformance_version: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
 

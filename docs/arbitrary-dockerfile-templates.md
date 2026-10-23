@@ -199,6 +199,19 @@ shell means no commands).
 
 A caller's own trailing `USER`/`WORKDIR` is overridden by design; document it.
 
+**Changing the layer (DEV-2611).** `spec_hash` covers only what the caller
+sent, so editing this layer cannot rename a template, and products pin names.
+Instead the layer is versioned by its own text (`CONFORMANCE_VERSION`, a short
+hash of `CONFORMANCE_LAYER`). Each template row records the version its image
+was built with, and the image tag carries it (`<prefix>-<name>:<version>-<layer>`).
+A `POST /v1/templates` that finds a `ready` row on another version, or on none,
+rebuilds it under the same name. The row stays `ready` on its old image while
+the new one builds; the builder swaps the row over only when the build
+succeeds. Each sandbox records the version it was created against, so the swap
+never changes the image under a sandbox that has not started yet. A failed
+rebuild leaves the old image serving and puts the reason in `error`; the next
+POST tries again.
+
 ## 5. Phase 2 — typed steps (optional)
 
 E2B moved *away* from Dockerfiles for good reasons: typed steps give
