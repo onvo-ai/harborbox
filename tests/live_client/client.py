@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from http import HTTPStatus
 from typing import Any, Self
@@ -147,12 +148,16 @@ class Sandboxes:
 class SandboxClient:
     def __init__(
         self,
-        base_url: str = "http://localhost:8000",
+        base_url: str | None = None,
         *,
         api_key: str,
         request_timeout: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         retry_budget_seconds: float = DEFAULT_RETRY_BUDGET_SECONDS,
     ) -> None:
+        # HARBORBOX_BASE_URL lets CI reach a stack whose published ports are
+        # not on this machine's loopback (a Coolify runner's Docker sidecar).
+        if base_url is None:
+            base_url = os.environ.get("HARBORBOX_BASE_URL", "http://localhost:8000")
         self._http = httpx.Client(
             base_url=base_url.rstrip("/"),
             headers={"X-API-Key": api_key},
