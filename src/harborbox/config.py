@@ -317,8 +317,22 @@ class Settings(BaseSettings):
     def template_images(self) -> dict[str, str]:
         return {BASE_TEMPLATE: self.base_image}
 
-    def derived_template_image(self, template: str) -> str:
-        return f"{self.template_image_prefix}-{template}:{self.template_version}"
+    def derived_template_image(
+        self, template: str, conformance_version: str | None = None
+    ) -> str:
+        """Return a derived template's unqualified image reference.
+
+        The tag carries the conformance layer version, so rebuilding a template
+        for a new layer writes a new tag instead of overwriting the old one.
+        That matters twice over: sandboxes keep using the old image until the
+        new one is ready, and opensandbox only pulls on a cache miss, so a
+        rewritten tag would never reach a host that had already pulled it.
+        None is the unversioned tag every image built before DEV-2611 has.
+        """
+        tag = self.template_version
+        if conformance_version is not None:
+            tag = f"{tag}-{conformance_version}"
+        return f"{self.template_image_prefix}-{template}:{tag}"
 
     def _qualify(self, endpoint: str | None, reference: str) -> str:
         """Address `reference` through `endpoint`, leaving the repository path alone.
@@ -330,7 +344,9 @@ class Settings(BaseSettings):
         """
         return f"{endpoint}/{reference}" if endpoint else reference
 
-    def push_image_for_template(self, template: str) -> str:
+    def push_image_for_template(
+        self, template: str, conformance_version: str | None = None
+    ) -> str:
         """Return the reference BuildKit pushes to, dialled from its own network.
 
         Differs from `image_for_template` only in the host part. The Docker
@@ -338,7 +354,10 @@ class Settings(BaseSettings):
         different address, and a mismatch below the host would only surface at
         sandbox create, long after the build reported success.
         """
-        return self._qualify(self.registry_push_endpoint, self._unqualified_image(template))
+        return self._qualify(
+            self.registry_push_endpoint,
+            self._unqualified_image(template, conformance_version),
+        )
 
     def entrypoint_for_template(self, template: str | None) -> list[str]:  # noqa: ARG002 - see docstring
         """Return what opensandbox runs as the sandbox's bootstrap command.
@@ -374,7 +393,9 @@ class Settings(BaseSettings):
             template in self.template_images or self.is_custom_template(template)
         )
 
-    def _unqualified_image(self, template: str | None) -> str:
+    def _unqualified_image(
+        self, template: str | None, conformance_version: str | None = None
+    ) -> str:
         if template is None:
             message = "a registered sandbox template is required"
             raise KeyError(message)
@@ -382,17 +403,22 @@ class Settings(BaseSettings):
         if image is not None:
             return image
         if self.is_custom_template(template):
-            return self.derived_template_image(template)
+            return self.derived_template_image(template, conformance_version)
         raise KeyError(template)
 
-    def image_for_template(self, template: str | None) -> str:
+    def image_for_template(
+        self, template: str | None, conformance_version: str | None = None
+    ) -> str:
         """Return the reference stored on the template row and sent to opensandbox.
 
         This is the pull side: opensandbox passes it straight through to the
         Docker daemon, which resolves it from the host rather than from any
         container network.
         """
-        return self._qualify(self.registry_pull_endpoint, self._unqualified_image(template))
+        return self._qualify(
+            self.registry_pull_endpoint,
+            self._unqualified_image(template, conformance_version),
+        )
 
     @property
     def effective_from_allowlist(self) -> frozenset[str]:
@@ -413,7 +439,9 @@ class Settings(BaseSettings):
         }
         return self.template_from_allowlist | ours
 
-    def image_spec_for_template(self, template: str | None) -> SandboxImageSpec | str:
+    def image_spec_for_template(
+        self, template: str | None, conformance_version: str | None = None
+    ) -> SandboxImageSpec | str:
         """Return what to hand opensandbox as the image for a create call.
 
         opensandbox accepts registry credentials only per request -- it has no
@@ -422,7 +450,7 @@ class Settings(BaseSettings):
         no registry keeps passing the bare name, which is what the local daemon
         wants.
         """
-        image = self.image_for_template(template)
+        image = self.image_for_template(template, conformance_version)
         if not (self.registry_username and self.registry_password):
             return image
         return SandboxImageSpec(

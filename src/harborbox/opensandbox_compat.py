@@ -244,7 +244,7 @@ def response_for(sandbox: Sandbox, settings: Settings) -> OpenSandboxResponse:
     template = sandbox.metadata_.get("template")
     image_uri = sandbox.metadata_.get(f"{INTERNAL_PREFIX}image")
     if not image_uri:
-        image_uri = settings.image_for_template(template)
+        image_uri = settings.image_for_template(template, sandbox.conformance_version)
     return OpenSandboxResponse(
         id=sandbox.id,
         status=lifecycle_status(sandbox),

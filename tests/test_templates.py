@@ -4,11 +4,16 @@ import pytest
 from pydantic import ValidationError
 
 from harborbox.config import Settings
+from harborbox.models import SandboxTemplate
 from harborbox.schemas import SandboxCreate
 from harborbox.templates import (
+    CONFORMANCE_LAYER,
+    CONFORMANCE_VERSION,
     TMP_KEEP_FILE,
     TemplateSpec,
     TemplateSpecError,
+    conformance_version,
+    needs_rebuild,
     render_dockerfile,
     validate_template_spec,
 )
@@ -355,3 +360,60 @@ def test_every_template_keeps_tmp_non_empty_so_gvisor_leaves_it_on_disk() -> Non
     rendered = render_dockerfile("FROM debian:12\nRUN rm -rf /tmp && mkdir /tmp\n")
 
     assert rendered.index("rm -rf /tmp") < rendered.index(f"touch {TMP_KEEP_FILE}")
+
+
+def test_the_conformance_version_is_derived_from_the_layer_text() -> None:
+    """Editing the appended layer is the version bump; nobody has to remember one."""
+    assert conformance_version() == CONFORMANCE_VERSION
+    assert conformance_version(CONFORMANCE_LAYER) == CONFORMANCE_VERSION
+    assert len(CONFORMANCE_VERSION) == 8  # noqa: PLR2004 - short, but a hash
+    int(CONFORMANCE_VERSION, 16)
+
+
+def test_any_change_to_the_layer_changes_the_conformance_version() -> None:
+    without_keep_file = CONFORMANCE_LAYER.replace(f" && touch {TMP_KEEP_FILE}", "")
+
+    assert without_keep_file != CONFORMANCE_LAYER
+    assert conformance_version(without_keep_file) != CONFORMANCE_VERSION
+    assert conformance_version(CONFORMANCE_LAYER + "\n") != CONFORMANCE_VERSION
+
+
+def stored_template(**overrides: object) -> SandboxTemplate:
+    values: dict[str, object] = {"status": "ready", "conformance_version": None}
+    values.update(overrides)
+    return SandboxTemplate(**values)
+
+
+def test_a_ready_template_built_before_versions_were_recorded_is_stale() -> None:
+    assert needs_rebuild(stored_template()) is True
+
+
+def test_a_ready_template_on_an_older_layer_is_stale() -> None:
+    assert needs_rebuild(stored_template(conformance_version="00000000")) is True
+
+
+def test_a_ready_template_on_the_current_layer_is_not_stale() -> None:
+    template = stored_template(conformance_version=CONFORMANCE_VERSION)
+
+    assert needs_rebuild(template) is False
+
+
+@pytest.mark.parametrize("status", ["building", "failed"])
+def test_only_ready_templates_are_rebuilt_for_a_new_layer(status: str) -> None:
+    # `building` is already heading for the current layer; `failed` is rebuilt
+    # by POST /v1/templates on its own terms.
+    assert needs_rebuild(stored_template(status=status)) is False
+
+
+def test_a_derived_image_tag_carries_its_conformance_version() -> None:
+    settings = Settings(template_version="2026.08.03")
+    name = "custom-a1b2c3d4e5f6"
+
+    assert settings.derived_template_image(name) == (
+        f"harborbox-sandbox-{name}:2026.08.03"
+    )
+    assert settings.derived_template_image(name, "0f99898f") == (
+        f"harborbox-sandbox-{name}:2026.08.03-0f99898f"
+    )
+    # A static template's image is configuration; the layer version is moot.
+    assert settings.image_for_template("base", "0f99898f") == settings.base_image

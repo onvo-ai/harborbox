@@ -40,6 +40,20 @@ async def create_schema() -> None:
                 "ADD COLUMN IF NOT EXISTS egress BOOLEAN NOT NULL DEFAULT FALSE"
             )
         )
+        # Nullable with no default on purpose: an existing row has no recorded
+        # conformance version, and NULL is what marks it stale (DEV-2611).
+        await connection.execute(
+            text(
+                "ALTER TABLE sandbox_templates "
+                "ADD COLUMN IF NOT EXISTS conformance_version VARCHAR(16)"
+            )
+        )
+        await connection.execute(
+            text(
+                "ALTER TABLE sandboxes "
+                "ADD COLUMN IF NOT EXISTS conformance_version VARCHAR(16)"
+            )
+        )
 
 
 async def get_session() -> AsyncIterator[AsyncSession]:
