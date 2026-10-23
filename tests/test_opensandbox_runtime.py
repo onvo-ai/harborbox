@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from opensandbox.exceptions import SandboxException
+from opensandbox.exceptions import SandboxApiException, SandboxException
 
 import harborbox.opensandbox_runtime as runtime_module
 from harborbox.config import Settings
@@ -661,3 +661,180 @@ async def test_toolspoke_style_newline_join_reads_the_same_as_before() -> None:
         await output.on_stdout(SimpleNamespace(text=event))  # type: ignore[arg-type]
 
     assert "\n".join(output.stdout) == "Usage: cli [options]\n\n\nCommands:\n  run"
+
+
+# --- Deleted sandboxes that linger in `Stopping` (DEV-2614) ------------------
+#
+# OpenSandbox 1.1 drops a deleted sandbox at once, so every later lookup is a
+# 404. From 1.2 a deleted sandbox reports `Stopping` until its cleanup
+# finishes, then `Terminated`. `kill` must treat both as already killed rather
+# than fail, so a second kill of the same sandbox is a no-op.
+
+
+def api_error(status: int) -> SandboxApiException:
+    return SandboxApiException(f"API error: HTTP {status}", status_code=status)
+
+
+class RefusingKillHandle(FakeHandle):
+    """A handle whose kill (the DELETE) fails with `error`."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.error = error
+        self.kill_calls = 0
+
+    async def kill(self) -> None:
+        self.kill_calls += 1
+        raise self.error
+
+
+def connect_returning(
+    monkeypatch: pytest.MonkeyPatch, outcome: FakeHandle | Exception
+) -> None:
+    """Make `OpenSandbox.connect` return `outcome`, or raise it."""
+
+    class FakeOpenSandbox:
+        @classmethod
+        async def connect(cls, *_: object, **__: object) -> FakeHandle:
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    monkeypatch.setattr(runtime_module, "OpenSandbox", FakeOpenSandbox)
+
+
+def runtime_reporting(manager: FakeManager) -> OpenSandboxRuntime:
+    runtime = OpenSandboxRuntime(Settings())
+    runtime._manager = manager  # type: ignore[assignment]
+    return runtime
+
+
+def live_sandbox() -> Sandbox:
+    return sandbox_record(
+        status="running", container_id="osb-runtime-1", container_name="osb-runtime-1"
+    )
+
+
+@pytest.mark.parametrize("state", ["Stopping", "Terminated"])
+async def test_killing_a_sandbox_already_being_deleted_is_a_no_op(
+    monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    # The first kill went through; on 1.2 the sandbox now reports `Stopping`
+    # and a second DELETE is refused. That second kill must not raise.
+    handle = RefusingKillHandle(api_error(409))
+    connect_returning(monkeypatch, handle)
+    manager = FakeManager()
+    manager.sandbox_info = sandbox_info(state=state)
+    runtime = runtime_reporting(manager)
+
+    await runtime.kill(live_sandbox())
+
+    assert handle.kill_calls == 1
+    assert handle.closed is True
+
+
+@pytest.mark.parametrize("state", ["Stopping", "Terminated"])
+async def test_kill_tolerates_a_failed_connect_to_a_stopping_sandbox(
+    monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    # `connect` waits for the sandbox's endpoint, which a sandbox on its way
+    # out may never publish.
+    connect_returning(monkeypatch, SandboxException("endpoint never published"))
+    manager = FakeManager()
+    manager.sandbox_info = sandbox_info(state=state)
+    runtime = runtime_reporting(manager)
+    sandbox = live_sandbox()
+    sandbox.metadata_ = {**sandbox.metadata_, SNAPSHOT_METADATA_KEY: "snap-test"}
+
+    await runtime.kill(sandbox)
+
+    # The rest of kill still runs: the snapshot is cleaned up.
+    assert manager.deleted == ["snap-test"]
+    assert SNAPSHOT_METADATA_KEY not in sandbox.metadata_
+
+
+async def test_kill_treats_a_404_on_the_state_lookup_as_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handle = RefusingKillHandle(api_error(500))
+    connect_returning(monkeypatch, handle)
+    manager = FakeManager()
+    manager.sandbox_info_error = api_error(404)
+    runtime = runtime_reporting(manager)
+
+    await runtime.kill(live_sandbox())
+
+    assert handle.closed is True
+
+
+async def test_kill_still_treats_a_404_as_gone_without_a_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The 1.1 path. FakeManager.sandbox_info is unset, so a lookup would fail.
+    connect_returning(monkeypatch, api_error(404))
+    runtime = runtime_reporting(FakeManager())
+
+    await runtime.kill(live_sandbox())
+
+
+async def test_a_successful_kill_makes_no_state_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FakeManager.sandbox_info is unset, so a lookup would fail the test.
+    handle = FakeHandle()
+    connect_returning(monkeypatch, handle)
+    runtime = runtime_reporting(FakeManager())
+
+    await runtime.kill(live_sandbox())
+
+    assert handle.killed is True
+
+
+async def test_a_kill_refused_by_a_running_sandbox_still_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handle = RefusingKillHandle(api_error(500))
+    connect_returning(monkeypatch, handle)
+    manager = FakeManager()
+    manager.sandbox_info = sandbox_info(state="Running")
+    runtime = runtime_reporting(manager)
+
+    with pytest.raises(SandboxUnavailableError):
+        await runtime.kill(live_sandbox())
+    assert handle.closed is True
+
+
+async def test_a_failed_state_lookup_keeps_the_original_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = SandboxException("connect blew up")
+    connect_returning(monkeypatch, error)
+    manager = FakeManager()
+    manager.sandbox_info_error = RuntimeError("lookup blew up")
+    runtime = runtime_reporting(manager)
+
+    with pytest.raises(SandboxException) as raised:
+        await runtime.kill(live_sandbox())
+    assert raised.value is error
+
+
+async def test_a_failed_kill_without_a_container_id_still_raises() -> None:
+    # A cached handle with no recorded container id: nothing to look up.
+    handle = RefusingKillHandle(SandboxException("delete blew up"))
+    runtime = runtime_reporting(FakeManager())
+    runtime._sandboxes["sbx-test"] = handle  # type: ignore[assignment]
+
+    with pytest.raises(SandboxException, match="delete blew up"):
+        await runtime.kill(sandbox_record(status="running"))
+    assert handle.closed is True
+
+
+@pytest.mark.parametrize("state", ["Stopping", "Terminated"])
+async def test_a_stopping_sandbox_reads_as_exited(state: str) -> None:
+    # The scheduler fails a sandbox whose container is `exited`, so a 1.2
+    # sandbox still in `Stopping` is not mistaken for a live one.
+    manager = FakeManager()
+    manager.sandbox_info = sandbox_info(state=state)
+    runtime = runtime_reporting(manager)
+
+    assert await runtime.container_status(live_sandbox()) == "exited"
