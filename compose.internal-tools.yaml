@@ -575,49 +575,34 @@ services:
     memswap_limit: 768m
     pids_limit: 256
     restart: unless-stopped
-    labels:
-      # Publishes exactly one path — GET /health — at harborbox.onvo.ai, so
-      # Uptime Kuma can probe it from another host. Everything else stays
-      # unroutable from the internet: the rule uses `Path`, which is an exact
-      # match, not `PathPrefix`. Do not relax it to PathPrefix(`/`) — this API
-      # holds the docker socket, and /v1/sandboxes would then be one guessed
-      # HARBORBOX_API_KEY away from arbitrary code execution on this host.
-      #
-      # Router names are explicit and unique (`harborbox-health`) because
-      # Coolify generates its own `http-0-<uuid>` / `https-0-<uuid>` routers
-      # and will clobber same-named ones on redeploy.
-      #
-      # traefik.docker.network is required: this container sits on four
-      # networks and Traefik picks one arbitrarily without it. It must name the
-      # network coolify-proxy actually shares with the API.
-      - traefik.enable=true
-      - traefik.docker.network=u95r9dynmb7i2kn945n61qiq
-      - traefik.http.routers.harborbox-health.rule=Host(`harborbox.onvo.ai`) && Path(`/health`)
-      - traefik.http.routers.harborbox-health.entryPoints=https
-      - traefik.http.routers.harborbox-health.tls=true
-      - traefik.http.routers.harborbox-health.tls.certresolver=letsencrypt
-      - traefik.http.routers.harborbox-health.service=harborbox-health
-      - traefik.http.services.harborbox-health.loadbalancer.server.port=8000
-      #
-      # There is deliberately no second router here. A `harborbox-api` router
-      # once published /v1 at harborbox-api.onvo.ai for Onvo Lite, back when
-      # Lite ran its Python from onvo-production and could not reach the
-      # internal http://harborbox:8000. Lite's sandbox calls now run as
-      # Trigger.dev tasks on this host, where apps/lite/trigger.config.ts sets
-      # HARBORBOX_URL=http://harborbox-next:8000 -- a Docker alias on the
-      # Trigger stack's private network. Nothing has needed the public route
-      # since, and its DNS record no longer exists (harborbox-api.onvo.ai is
-      # NXDOMAIN), so the router was matching a hostname that cannot arrive.
-      #
-      # Do not re-add it to give something off-host access to /v1 without
-      # reading the warning above first. This API holds the docker socket, so
-      # a reachable /v1 is an arbitrary-code-execution surface. The removed
-      # router only survived review because it carried three separate
-      # controls: a DNS-only (grey-cloud) hostname, so Traefik saw real
-      # source addresses rather than Cloudflare's; an ipAllowList pinned to
-      # the Lite hosts; and PathPrefix(`/v1`), keeping /openapi.json and
-      # /docs unroutable. Joining the caller to a Docker network is cheaper
-      # and safer than reproducing all three.
+    # Coolify publishes GET /health at harborbox.onvo.ai, so Uptime Kuma can
+    # probe it from another host. It is the Coolify domain
+    # `https://harborbox.onvo.ai:8000/health` on this service, with strip
+    # prefix off. Coolify makes a PathPrefix(`/health`) router and sets
+    # traefik.docker.network itself. The API has no other route under /health,
+    # so nothing else is reachable. Do not give that domain a shorter path:
+    # this API holds the docker socket, and /v1/sandboxes would then be one
+    # guessed HARBORBOX_API_KEY away from arbitrary code execution on this host.
+    #
+    # There is deliberately no second router here. A `harborbox-api` router
+    # once published /v1 at harborbox-api.onvo.ai for Onvo Lite, back when
+    # Lite ran its Python from onvo-production and could not reach the
+    # internal http://harborbox:8000. Lite's sandbox calls now run as
+    # Trigger.dev tasks on this host, where apps/lite/trigger.config.ts sets
+    # HARBORBOX_URL=http://harborbox-next:8000 -- a Docker alias on the
+    # Trigger stack's private network. Nothing has needed the public route
+    # since, and its DNS record no longer exists (harborbox-api.onvo.ai is
+    # NXDOMAIN), so the router was matching a hostname that cannot arrive.
+    #
+    # Do not re-add it to give something off-host access to /v1 without
+    # reading the warning above first. This API holds the docker socket, so
+    # a reachable /v1 is an arbitrary-code-execution surface. The removed
+    # router only survived review because it carried three separate
+    # controls: a DNS-only (grey-cloud) hostname, so Traefik saw real
+    # source addresses rather than Cloudflare's; an ipAllowList pinned to
+    # the Lite hosts; and PathPrefix(`/v1`), keeping /openapi.json and
+    # /docs unroutable. Joining the caller to a Docker network is cheaper
+    # and safer than reproducing all three.
     networks:
       # Each entry carries an alias deliberately. Coolify's compose rewriter
       # drops service network entries whose value is null, which silently left

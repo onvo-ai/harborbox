@@ -802,11 +802,9 @@ DNS round-robins between them.
 A second copy of `compose.internal-tools.yaml` on the same host is not a
 settings change today. These are the collisions to solve first:
 
-- **Traefik.** The `harborbox-health` router and
-  `traefik.docker.network=u95r9dynmb7i2kn945n61qiq` are literal labels, and
-  Coolify passes label values through without substituting variables. A second
-  application from this file would register the same router for
-  `harborbox.onvo.ai/health`.
+- **Traefik.** None. The `/health` route is a Coolify domain on the
+  application, not a label in this file, so a second application gets its own
+  router only if it is given a domain.
 - **The build network.** `harborbox-build` is spelled literally, and each
   stack's registry joins it as `registry`. Docker DNS would then split
   `registry:5000` between the two stacks, so BuildKit could push a staging
