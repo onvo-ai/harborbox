@@ -706,6 +706,131 @@ Harborbox no longer ships it: a product that wants the fast Python path
 installs it in its own Dockerfile, which is the same move as owning the rest
 of the image.
 
+## How changes reach staging and production
+
+> **Target process, pending a Coolify change (DEV-2609).** Until someone makes
+> the Coolify change below, every push to `main` still deploys production
+> directly, with no staging step. That includes docs-only merges.
+
+### Today
+
+Two Coolify applications on the infrastructure host (`91.99.169.190`) run
+Harborbox. Both build from `main` and redeploy on every push to it:
+
+| Application | UUID | Compose file |
+|---|---|---|
+| `harborbox` | `u95r9dynmb7i2kn945n61qiq` | `/compose.internal-tools.yaml` |
+| `harborbox-builder` | `l4fzsorn4q21t6qsqs3hpw3q` | `/compose.builder.yaml` |
+
+There is no staging Harborbox. `harborbox-next` is not a separate application:
+it is the alias the `harborbox` application's API takes on the Trigger stack's
+network, set through `HARBORBOX_NETWORK_ALIAS`. It dates from the parallel
+deploy that ran beside the original hand-run stack in `/opt/onvo/harborbox`.
+Onvo's `services/trigger/trigger.config.ts` sends Trigger staging to
+`http://harborbox-next:8000` and Trigger production to `http://harborbox:8000`,
+unless `TRIGGER_HARBORBOX_URL` overrides both. So Onvo staging already runs
+against this application, which runs with `HARBORBOX_ENVIRONMENT=production`
+and serves the public `/health` route. Before changing any alias, check which
+container answers to `harborbox` on the Trigger network:
+
+```bash
+docker network inspect nj9nsajrgcu76alcj6c1sq87 \
+  --format '{{range .Containers}}{{.Name}} {{end}}'
+docker inspect <container> \
+  --format '{{json .NetworkSettings.Networks.nj9nsajrgcu76alcj6c1sq87.Aliases}}'
+```
+
+### Target: promote by moving a `production` branch
+
+`main` is where work lands. `production` is what runs. Both applications track
+`production`, so a merge deploys nothing, and promoting is one git push.
+
+1. **Merge to `main`.** CI must be green: `Unit tests` and `E2E (Compose)` in
+   `.github/workflows/ci.yml`. The E2E job brings the real stack up on the CI
+   host. Until a staging stack exists (below), it is the only check that runs
+   before production.
+2. **Promote a specific commit.** Fast-forward `production` to the commit you
+   checked, not to whatever `main` is by then:
+
+   ```bash
+   git fetch origin
+   git log --oneline origin/production..<sha>   # exactly what will ship
+   git push origin <sha>:refs/heads/production
+   ```
+
+   A plain push refuses anything that is not a fast-forward. Never add
+   `--force`: `production` only moves forward, so its history is the deploy
+   log. Coolify's push webhook then deploys both applications from that commit.
+3. **Verify production.** `curl -sS https://harborbox.onvo.ai/health` must
+   return 200, and a real sandbox must run code. The `harborbox-checkup` probe
+   does both. A healthy `/health` alone has been wrong before.
+4. **Roll back by going forward.** Revert the change on `main`, wait for green
+   CI, and promote the revert. In an emergency, redeploy an earlier deployment
+   from the Coolify UI, then make `production` match it the same way.
+
+The API and the builder share a protocol: the buildkitd config, the
+mutual-TLS certificates and the `harborbox-build` network. Keep both
+applications on the same branch so one promotion moves both.
+
+### The Coolify change (for a human, once)
+
+1. Create `production` at the commit production runs now, and protect it in
+   GitHub: block force pushes and deletion, and restrict who can push.
+
+   ```bash
+   git push origin <sha-currently-deployed>:refs/heads/production
+   ```
+
+2. In Coolify, for **both** `harborbox` and `harborbox-builder`, change the
+   application's Git **Branch** from `main` to `production`, and leave
+   automatic deploys on. Over the API this is the `git_branch` field on
+   `PATCH /api/v1/applications/{uuid}`. The code is unchanged, so there is no
+   need to redeploy.
+3. Update the `harborbox` application's description. It still says
+   "Parallel deploy alongside the hand-rolled stack… routing disabled until
+   cutover", which is no longer true.
+4. Confirm the gate: merge a docs-only change to `main` and check that neither
+   application starts a deployment.
+
+### Later: a real staging stack
+
+Onvo staging already expects `http://harborbox-next:8000`, so the natural next
+step is a third application, `harborbox-staging`, tracking `main` and taking
+the `harborbox-next` alias. Production would then take the `harborbox` alias.
+Do not swap the aliases while two containers could hold the same one: Docker
+DNS round-robins between them.
+
+A second copy of `compose.internal-tools.yaml` on the same host is not a
+settings change today. These are the collisions to solve first:
+
+- **Traefik.** The `harborbox-health` router and
+  `traefik.docker.network=u95r9dynmb7i2kn945n61qiq` are literal labels, and
+  Coolify passes label values through without substituting variables. A second
+  application from this file would register the same router for
+  `harborbox.onvo.ai/health`.
+- **The build network.** `harborbox-build` is spelled literally, and each
+  stack's registry joins it as `registry`. Docker DNS would then split
+  `registry:5000` between the two stacks, so BuildKit could push a staging
+  template into the production registry. Staging needs its own build network
+  and builder, or a distinct registry name with its own entry in the buildkitd
+  config.
+- **Host ports.** `HARBORBOX_REGISTRY_PORT` (default `5050`) must differ. The
+  OpenSandbox port range `20000`–`25000` is literal in `opensandbox-config`,
+  so two OpenSandbox servers would allocate host ports from the same range.
+- **The sandbox network.** `HARBORBOX_SANDBOX_NETWORK` must name a separate
+  network, created once with `docker network create --internal <name>`.
+- **The docker socket.** Both OpenSandbox servers would hold it. Staging can
+  then see and stop production's sandbox containers. Whether either server
+  cleans up containers it does not recognise has not been checked.
+- **Memory.** This host has about 6 GB to share, and production's budget is
+  about 3.6 GB. Each API measures capacity from `/proc/meminfo` and knows
+  nothing about the other's reservations. Staging would need a small, fixed
+  budget: no warm pool, one execution at a time, and `HARBORBOX_TOTAL_MEMORY_MB`
+  set.
+- **Monitoring.** Onvo's staging heartbeat skips its sandbox run because staging
+  has no `KUMA_PUSH_URL_HARBORBOX`, so it reports success without testing
+  anything. A staging stack needs its own push monitor.
+
 ## Development
 
 ```bash
