@@ -708,30 +708,40 @@ of the image.
 
 ## How changes reach staging and production
 
-> **Target process, pending a Coolify change (DEV-2609).** Until someone makes
-> the Coolify change below, every push to `main` still deploys production
-> directly, with no staging step. That includes docs-only merges.
+`main` is where work lands. `production` is what runs. Merging to `main`
+deploys nothing; promoting is one git push. This has been in effect since
+2026-10-23 (DEV-2609). Before that, every push to `main` deployed production
+at once, which is how the OpenSandbox 1.1.1 upgrade (#46) reached production
+with no staging step.
 
-### Today
+### What runs where
 
 Two Coolify applications on the infrastructure host (`91.99.169.190`) run
-Harborbox. Both build from `main` and redeploy on every push to it:
+Harborbox. Both build from the protected `production` branch and redeploy
+whenever it moves:
 
 | Application | UUID | Compose file |
 |---|---|---|
 | `harborbox` | `u95r9dynmb7i2kn945n61qiq` | `/compose.internal-tools.yaml` |
 | `harborbox-builder` | `l4fzsorn4q21t6qsqs3hpw3q` | `/compose.builder.yaml` |
 
+`production` blocks force pushes and deletion, for admins too, so it only
+moves forward and its history is the deploy log.
+
 There is no staging Harborbox. `harborbox-next` is not a separate application:
 it is the alias the `harborbox` application's API takes on the Trigger stack's
 network, set through `HARBORBOX_NETWORK_ALIAS`. It dates from the parallel
-deploy that ran beside the original hand-run stack in `/opt/onvo/harborbox`.
+deploy that ran beside the original hand-run stack, which no longer exists.
 Onvo's `services/trigger/trigger.config.ts` sends Trigger staging to
 `http://harborbox-next:8000` and Trigger production to `http://harborbox:8000`,
-unless `TRIGGER_HARBORBOX_URL` overrides both. So Onvo staging already runs
-against this application, which runs with `HARBORBOX_ENVIRONMENT=production`
-and serves the public `/health` route. Before changing any alias, check which
-container answers to `harborbox` on the Trigger network:
+unless `TRIGGER_HARBORBOX_URL` overrides both. Infisical prod sets
+`TRIGGER_HARBORBOX_URL=http://harborbox-next:8000`, so Onvo staging **and**
+production both run against this one application.
+
+Nothing answers to plain `harborbox` on that network. Onvo production works
+only because of that override. Do not remove `TRIGGER_HARBORBOX_URL` without
+first giving this application the `harborbox` alias. To check which container
+holds an alias:
 
 ```bash
 docker network inspect nj9nsajrgcu76alcj6c1sq87 \
@@ -740,10 +750,7 @@ docker inspect <container> \
   --format '{{json .NetworkSettings.Networks.nj9nsajrgcu76alcj6c1sq87.Aliases}}'
 ```
 
-### Target: promote by moving a `production` branch
-
-`main` is where work lands. `production` is what runs. Both applications track
-`production`, so a merge deploys nothing, and promoting is one git push.
+### Promoting a change
 
 1. **Merge to `main`.** CI must be green: `Unit tests` and `E2E (Compose)` in
    `.github/workflows/ci.yml`. The E2E job brings the real stack up on the CI
@@ -758,12 +765,13 @@ docker inspect <container> \
    git push origin <sha>:refs/heads/production
    ```
 
-   A plain push refuses anything that is not a fast-forward. Never add
-   `--force`: `production` only moves forward, so its history is the deploy
-   log. Coolify's push webhook then deploys both applications from that commit.
+   A plain push refuses anything that is not a fast-forward, and the branch
+   protection refuses `--force`. Coolify's push webhook then deploys both
+   applications from that commit.
 3. **Verify production.** `curl -sS https://harborbox.onvo.ai/health` must
    return 200, and a real sandbox must run code. The `harborbox-checkup` probe
-   does both. A healthy `/health` alone has been wrong before.
+   does both, and so does the `Harborbox sandbox execution` Uptime Kuma push
+   monitor. A healthy `/health` alone has been wrong before.
 4. **Roll back by going forward.** Revert the change on `main`, wait for green
    CI, and promote the revert. In an emergency, redeploy an earlier deployment
    from the Coolify UI, then make `production` match it the same way.
@@ -772,25 +780,16 @@ The API and the builder share a protocol: the buildkitd config, the
 mutual-TLS certificates and the `harborbox-build` network. Keep both
 applications on the same branch so one promotion moves both.
 
-### The Coolify change (for a human, once)
+### How the gate was set up (2026-10-23)
 
-1. Create `production` at the commit production runs now, and protect it in
-   GitHub: block force pushes and deletion, and restrict who can push.
-
-   ```bash
-   git push origin <sha-currently-deployed>:refs/heads/production
-   ```
-
-2. In Coolify, for **both** `harborbox` and `harborbox-builder`, change the
-   application's Git **Branch** from `main` to `production`, and leave
-   automatic deploys on. Over the API this is the `git_branch` field on
-   `PATCH /api/v1/applications/{uuid}`. The code is unchanged, so there is no
-   need to redeploy.
-3. Update the `harborbox` application's description. It still says
-   "Parallel deploy alongside the hand-rolled stack… routing disabled until
-   cutover", which is no longer true.
-4. Confirm the gate: merge a docs-only change to `main` and check that neither
-   application starts a deployment.
+1. `production` was created at `67a866b`, the commit production was running,
+   and protected against force pushes and deletion.
+2. Both applications' Git branch was changed from `main` to `production`
+   (`git_branch` on `PATCH /api/v1/applications/{uuid}`), with automatic
+   deploys left on and no redeploy.
+3. The `harborbox` application's stale description was replaced.
+4. The gate was confirmed by merging a docs-only change to `main` and checking
+   that neither application started a deployment.
 
 ### Later: a real staging stack
 
