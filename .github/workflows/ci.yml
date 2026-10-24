@@ -162,10 +162,15 @@ jobs:
       # 70 is `achieved - 1` against 71.30%. What is left there is the
       # execution routes and the lifespan, which is the next climb. Raise this
       # line, or turn it into a 100 pin, whenever a climb lifts it.
+      #
+      # 85 is `achieved - 1` against 86.07% (2812/3267), measured 2026-10-24
+      # against a local PostgreSQL with 594 passed and no skips (14 e2e
+      # deselected), when opensandbox_runtime.py was pinned at 100% on top of
+      # the 79 above.
       - name: Coverage floors
         if: always()
         run: |
-          uv run coverage report --fail-under=79
+          uv run coverage report --fail-under=85
           uv run coverage report --fail-under=70 \
             --include='src/harborbox/api.py'
           uv run coverage report --fail-under=100 \
@@ -186,6 +191,8 @@ jobs:
             --include='src/harborbox/warm_pool.py'
           uv run coverage report --fail-under=100 \
             --include='src/harborbox/config.py'
+          uv run coverage report --fail-under=100 \
+            --include='src/harborbox/opensandbox_runtime.py'
           # Already at 100% and holding nothing but a docstring and __version__.
           # Pinned so that the first piece of logic anyone puts in the package
           # __init__ arrives with a test rather than quietly lowering the tree.

@@ -457,7 +457,7 @@ class OpenSandboxRuntime:
         container_id = sandbox.container_id
         if not container_id:
             await asyncio.Event().wait()
-            return
+            return  # pragma: no cover - the wait never ends; the caller cancels it
         while True:
             await asyncio.sleep(self.settings.execution_liveness_poll_seconds)
             try:
