@@ -1,0 +1,136 @@
+# Builds the images production runs, on the build server, and deploys them.
+#
+# Production servers do not build images (rule since 2026-10-23). The
+# `harborbox` Coolify application only pulls. This workflow builds both images
+# on the x86 Coolify runners (`coolify-ci`, on build-server), pushes them to
+# GHCR, and then asks Coolify to deploy.
+#
+#   push to `production`   build, push `:sha-<commit>` and `:production`, deploy
+#   pull request           build, push `:sha-<commit>` only, no deploy
+#   manual run             as a push to the branch it runs on
+#
+# Coolify's git auto-deploy is off for `harborbox`, so this deploy is the only
+# one. A push therefore deploys only after its images exist. The builder
+# application (`harborbox-builder`) builds nothing and still deploys from
+# Coolify's push webhook.
+#
+# This is not publish-images.yml. That one publishes multi-architecture release
+# images and moves `latest`. This one ships one architecture to one host. They
+# share the GHA cache scopes, so a release build warms this one and back.
+name: Build and deploy images
+
+on:
+  push:
+    branches: [production]
+  pull_request:
+    paths:
+      - Dockerfile.api
+      - sandbox/**
+      - src/**
+      - pyproject.toml
+      - README.md
+      - .github/workflows/images.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: ${{ matrix.image }}
+    runs-on: [self-hosted, coolify-ci]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: harborbox-api
+            dockerfile: Dockerfile.api
+          - image: harborbox-sandbox-base
+            dockerfile: sandbox/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/onvo-ai/${{ matrix.image }}:sha-${{ github.event.pull_request.head.sha || github.sha }}
+            ${{ github.ref == 'refs/heads/production' && format('ghcr.io/onvo-ai/{0}:production', matrix.image) || '' }}
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          cache-from: type=gha,scope=${{ matrix.image }}-linux-amd64
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}-linux-amd64
+          provenance: false
+
+  deploy:
+    name: Deploy with Coolify
+    needs: image
+    if: github.ref == 'refs/heads/production' && github.event_name != 'pull_request'
+    runs-on: [self-hosted, coolify-ci]
+    env:
+      API: https://hosting.onvo.ai/api/v1
+      APP_UUID: u95r9dynmb7i2kn945n61qiq
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse to deploy a compose file that builds
+        run: |
+          # A `build:` section would make Coolify build on the production server.
+          # Service keys sit at four spaces; the `build:` network under
+          # buildkit-gateway sits deeper and is not a build.
+          if grep -nE '^    build:' compose.internal-tools.yaml; then
+            echo "::error::compose.internal-tools.yaml builds an image. Production servers must only pull."
+            exit 1
+          fi
+
+      - name: Deploy
+        env:
+          COOLIFY_DEPLOY_TOKEN: ${{ secrets.COOLIFY_DEPLOY_TOKEN }}
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
+          # Coolify deploys only on POST; GET /deploy answers 405.
+          response=$(curl -fsS -X POST -H "Authorization: Bearer ${COOLIFY_DEPLOY_TOKEN}" \
+            "$API/deploy?uuid=${APP_UUID}&force=false")
+          echo "$response"
+          deployment=$(echo "$response" | jq -r '.deployments[0].deployment_uuid // empty')
+          if [ -z "$deployment" ]; then
+            echo "::error::Coolify did not start a deployment."
+            exit 1
+          fi
+          echo "deployment=$deployment" >> "$GITHUB_ENV"
+
+      - name: Wait for the deployment
+        env:
+          COOLIFY_DEPLOY_TOKEN: ${{ secrets.COOLIFY_DEPLOY_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 30 minutes. A deploy recreates the whole stack and waits for
+          # opensandbox and postgres to be healthy before the API starts.
+          for _ in $(seq 1 180); do
+            status=$(curl -fsS -H "Authorization: Bearer ${COOLIFY_DEPLOY_TOKEN}" \
+              "$API/deployments/${deployment}" | jq -r '.status')
+            case "$status" in
+              finished) echo "Deployment $deployment finished."; exit 0 ;;
+              failed|cancelled*) echo "::error::Deployment $deployment ended as $status."; exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "::error::Deployment $deployment did not finish in 30 minutes (last status: $status)."
+          exit 1

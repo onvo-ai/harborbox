@@ -52,6 +52,10 @@
 #
 # This host ships one image, not three. Products own a Dockerfile and POST it
 # to /v1/templates, which is the only way to build.
+#
+# No service here has a `build:` section. The API and base images are built by
+# CI on the build server and pulled from GHCR; see the note above
+# sandbox-base-image. tests/test_compose_deployment.py fails if one comes back.
 
 name: harborbox
 
@@ -177,26 +181,59 @@ configs:
       mode = "direct"
 
 services:
-  # The one image this repository builds. Harborbox used to build a tailored
-  # image per product here, each pinning that product's Python dependencies in
-  # the Harborbox repo; products own a Dockerfile and POST it now.
+  # Nothing in this file is built on the host. Production servers do not build
+  # images (since 2026-10-23). `.github/workflows/images.yml` builds the API and
+  # the sandbox base on the x86 build server, pushes them to GHCR as
+  # `:production` and `:sha-<commit>`, and then asks Coolify to deploy. Coolify
+  # pulls every image-only service before it stops the running containers.
+  # `HARBORBOX_DEPLOY_TAG` pins a deploy to one `sha-<commit>` when you need to
+  # roll back to an exact build.
+  #
+  # The sandbox base. Products own a Dockerfile and POST it; this is the one
+  # image Harborbox itself ships, for the `base` template and its warm pool.
   #
   # It still idles rather than exiting, and that is deliberate. Coolify's
   # forced cleanup on `0 0 * * *` prunes stopped containers and then runs
   # `docker image prune -af`, deleting every image no container refers to.
-  # Nothing refers to this one: sandboxes are created from it by name through
-  # opensandbox, which is a `docker create`, not a standing reference. A
-  # *running* container is the reference prune honours. Less critical than it
-  # was -- the image now comes back from the registry rather than being lost --
-  # but a nightly re-pull is still pointless.
+  # Nothing else refers to this one: sandboxes are created from it by name
+  # through opensandbox, which is a `docker create`, not a standing reference.
+  # A *running* container is the reference prune honours. The local registry
+  # does not hold the base, so a pruned base would not come back on its own.
   sandbox-base-image:
-    image: 127.0.0.1:${HARBORBOX_REGISTRY_PORT:-5050}/harborbox-sandbox-base:${HARBORBOX_IMAGE_TAG:-local}
-    build:
-      context: .
-      dockerfile: sandbox/Dockerfile
+    image: ghcr.io/onvo-ai/harborbox-sandbox-base:${HARBORBOX_DEPLOY_TAG:-production}
     entrypoint: ["tail", "-f", "/dev/null"]
     restart: unless-stopped
     mem_limit: 32m
+
+  # Gives the pulled base the name the API asks opensandbox for:
+  # `HARBORBOX_REGISTRY_PULL_ENDPOINT` + `HARBORBOX_BASE_IMAGE`, which is
+  # `127.0.0.1:5050/harborbox-sandbox-base:<HARBORBOX_IMAGE_TAG>`. The host
+  # build used to produce that name directly. A tag is a second name for the
+  # same image, so the keeper above protects it from prune as well.
+  #
+  # Why a tag and not a new HARBORBOX_BASE_IMAGE: the API puts the pull
+  # endpoint in front of every template image, so a `ghcr.io/...` base would
+  # turn into `127.0.0.1:5050/ghcr.io/...`. OpenSandbox-compatible callers
+  # also match the base by this exact name. Keeping the name keeps both.
+  #
+  # It holds the docker socket for one `docker image tag` and then exits. It
+  # runs with no network. The API still holds no socket.
+  sandbox-base-tag:
+    image: docker:29.2.1-cli
+    entrypoint: ["docker"]
+    command:
+      - image
+      - tag
+      - ghcr.io/onvo-ai/harborbox-sandbox-base:${HARBORBOX_DEPLOY_TAG:-production}
+      - 127.0.0.1:${HARBORBOX_REGISTRY_PORT:-5050}/harborbox-sandbox-base:${HARBORBOX_IMAGE_TAG:-local}
+    depends_on:
+      sandbox-base-image:
+        condition: service_started
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: "no"
+    network_mode: none
+    mem_limit: 64m
 
   postgres:
     image: postgres:17-alpine
@@ -344,18 +381,19 @@ services:
           - opensandbox
 
   api:
-    image: harborbox-api:${HARBORBOX_IMAGE_TAG:-local}
-    build:
-      context: .
-      dockerfile: Dockerfile.api
+    # Built by CI on the build server, never here. See the note above
+    # sandbox-base-image.
+    image: ghcr.io/onvo-ai/harborbox-api:${HARBORBOX_DEPLOY_TAG:-production}
     depends_on:
-      # `service_started`, not `service_completed_successfully`: these three no
-      # longer exit (see the note above them), and waiting for a container that
-      # idles by design to complete would hang every deploy forever. Compose
-      # builds all images before it starts any container, so a started keeper
-      # already proves its image was built.
+      # `service_started`, not `service_completed_successfully`, for the keeper:
+      # it does not exit (see the note above it), and waiting for a container
+      # that idles by design to complete would hang every deploy forever.
       sandbox-base-image:
         condition: service_started
+      # The tag, by contrast, must have finished: until it has, the base name
+      # the API hands opensandbox may not exist on this host.
+      sandbox-base-tag:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       opensandbox:
@@ -420,11 +458,11 @@ services:
       # port opensandbox publishes, which is what extra_hosts below is for.
       HARBORBOX_OPENSANDBOX_USE_SERVER_PROXY: "false"
       HARBORBOX_OPENSANDBOX_API_KEY: ${SERVICE_PASSWORD_64_OPENSANDBOXAPI:?refusing to start with no opensandbox key - the API would fail every sandbox create against the runtime.}
-      # Static template images, built above. These three names are what
-      # `image_for_template` resolves for onvo-pro/onvo-lite/relaydeck.
-      # Derived templates are named `<base>-<12 hex>` and their image name is a
-      # pure function of prefix + version, so these must match the tags built
-      # above or a derived template resolves to an image nobody built.
+      # The `base` template's image, under the name sandbox-base-tag gives it.
+      # HARBORBOX_IMAGE_TAG is also HARBORBOX_TEMPLATE_VERSION below, and every
+      # derived template's image tag starts with it, so changing it orphans
+      # every derived template already built. It is not the GHCR tag; that is
+      # HARBORBOX_DEPLOY_TAG.
       HARBORBOX_BASE_IMAGE: harborbox-sandbox-base:${HARBORBOX_IMAGE_TAG:-local}
       # Pools by template name. A product that wants its own image kept warm
       # adds it here: {"base":1,"custom-abc123def456":2}. Warm starts are worth

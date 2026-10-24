@@ -717,8 +717,7 @@ with no staging step.
 ### What runs where
 
 Two Coolify applications on the infrastructure host (`91.99.169.190`) run
-Harborbox. Both build from the protected `production` branch and redeploy
-whenever it moves:
+Harborbox. Both track the protected `production` branch:
 
 | Application | UUID | Compose file |
 |---|---|---|
@@ -727,6 +726,24 @@ whenever it moves:
 
 `production` blocks force pushes and deletion, for admins too, so it only
 moves forward and its history is the deploy log.
+
+Neither application builds an image on the host. Production servers only pull
+(rule since 2026-10-23):
+
+- `harborbox` pulls `ghcr.io/onvo-ai/harborbox-api:production` and
+  `ghcr.io/onvo-ai/harborbox-sandbox-base:production`. A push to `production`
+  runs `.github/workflows/images.yml`, which builds both images on the x86
+  build server (`coolify-ci` runners), pushes `:production` and
+  `:sha-<commit>`, and then calls Coolify's deploy API. Coolify's own git
+  auto-deploy is **off** for this application, so it never deploys a commit
+  whose images do not exist yet. To pin an exact build, set
+  `HARBORBOX_DEPLOY_TAG=sha-<commit>` on the application and redeploy.
+- `harborbox-builder` runs `moby/buildkit:rootless` and builds nothing.
+  Coolify's push webhook still deploys it.
+
+`HARBORBOX_IMAGE_TAG` (`coolify` in production) is not a GHCR tag. It is the
+template version: every derived template's image tag starts with it, so
+changing it orphans every template already built.
 
 There is no staging Harborbox. `harborbox-next` is not a separate application:
 it is the alias the `harborbox` application's API takes on the Trigger stack's
@@ -766,15 +783,18 @@ docker inspect <container> \
    ```
 
    A plain push refuses anything that is not a fast-forward, and the branch
-   protection refuses `--force`. Coolify's push webhook then deploys both
-   applications from that commit.
+   protection refuses `--force`. `Build and deploy images` then builds the
+   images and deploys `harborbox`; Coolify's push webhook deploys
+   `harborbox-builder`. The workflow fails if the Coolify deployment fails.
 3. **Verify production.** `curl -sS https://harborbox.onvo.ai/health` must
    return 200, and a real sandbox must run code. The `harborbox-checkup` probe
    does both, and so does the `Harborbox sandbox execution` Uptime Kuma push
    monitor. A healthy `/health` alone has been wrong before.
 4. **Roll back by going forward.** Revert the change on `main`, wait for green
-   CI, and promote the revert. In an emergency, redeploy an earlier deployment
-   from the Coolify UI, then make `production` match it the same way.
+   CI, and promote the revert. In an emergency, set `HARBORBOX_DEPLOY_TAG` to
+   the `sha-<commit>` that last worked and redeploy from the Coolify UI (a
+   plain redeploy pulls whatever `:production` is now). Then make `production`
+   match it the same way and clear the variable.
 
 The API and the builder share a protocol: the buildkitd config, the
 mutual-TLS certificates and the `harborbox-build` network. Keep both
