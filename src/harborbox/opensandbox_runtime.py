@@ -20,11 +20,13 @@ from opensandbox.exceptions import (
     SandboxApiException,
     SandboxException,
     SandboxReadyTimeoutException,
+    SandboxTimeoutException,
 )
 from opensandbox.models.execd import Execution, ExecutionHandlers, RunCommandOpts
 from opensandbox.models.filesystem import DirectoryListEntry
 
 from harborbox.errors import (
+    SandboxFileNotFoundError,
     SandboxMemoryExceededError,
     SandboxStartTimeoutError,
     SandboxUnavailableError,
@@ -56,6 +58,8 @@ if TYPE_CHECKING:
     from harborbox.models import Sandbox
 
 SNAPSHOT_METADATA_KEY = "harborbox.runtime.snapshot_id"
+# execd's error code for a path that does not exist (`model.ErrorCodeFileNotFound`).
+FILE_NOT_FOUND_CODE = "FILE_NOT_FOUND"
 logger = logging.getLogger(__name__)
 
 # Tokens checked (case-insensitively) against a dead sandbox's live
@@ -69,18 +73,66 @@ _OOM_SIGNAL_TOKENS = (
     "out-of-memory",
     "exit code 137",
     "code: 137",
+    # OpenSandbox's own wording for a container, not a process, that exited on
+    # SIGKILL. Under gVisor that is what an OOM looks like: the kernel's OOM
+    # killer takes the whole sandbox, and the container exits 137.
+    "exited with code 137",
 )
+
+# Sandbox states that mean a delete has already happened or is under way.
+# OpenSandbox 1.1 drops a deleted sandbox at once, so a lookup is a 404. From
+# 1.2 a deleted sandbox reports `Stopping` until its cleanup finishes, then
+# `Terminated` (DEV-2614). Either one means "already killed": `kill` must not
+# fail on it or delete it a second time.
+_GONE_STATES = frozenset({"stopping", "terminated"})
+
+# Sandbox states after which nothing inside can still be producing output.
+_DEAD_STATES = _GONE_STATES | {"failed"}
 
 
 @dataclass(frozen=True)
 class _CommandSpec:
-    """What to run and how; bundled to keep `_run_command`'s signature small."""
+    """What to run and how; bundled to keep `_run_command`'s signature small.
 
-    command: str
+    `command` is shell text, or an argv list execd runs with no shell at all.
+    """
+
+    command: str | list[str]
     timeout_seconds: int
     max_output_bytes: int
     environment: dict[str, str]
     cwd: str | None
+
+
+class _LineShape:
+    r"""Keep `logs.stdout`/`logs.stderr` in the shape our callers parse.
+
+    execd 1.1 changed its output events (upstream 380322ba): each line now
+    arrives with its own `\n`, `\r` or `\r\n`, as a separate event per
+    terminator byte. Until 1.1 a line arrived with its terminator stripped, an
+    empty line arrived as a lone `"\n"`, and the `\n` of a `\r\n` was
+    dropped. Toolspoke joins these chunks with `"\n"`, so passing the new
+    shape through would double every newline it reads -- its CLI
+    introspection stops at the first blank line. Harborbox's API is a
+    contract with the apps that call it, so this turns the new events back
+    into the old ones, one stream at a time.
+    """
+
+    def __init__(self) -> None:
+        self._last_was_cr = False
+
+    def feed(self, text: str) -> str | None:
+        """Return the chunk the old execd would have sent, or None for none."""
+        if not text or text[-1] not in "\r\n":
+            # An unterminated tail, flushed when the command ends.
+            self._last_was_cr = False
+            return text
+        body, terminator = text[:-1], text[-1]
+        swallowed = not body and terminator == "\n" and self._last_was_cr
+        self._last_was_cr = terminator == "\r"
+        if swallowed:
+            return None
+        return body or "\n"
 
 
 class _BoundedOutput:
@@ -92,6 +144,8 @@ class _BoundedOutput:
         self.stderr: list[str] = []
         self.results: list[ExecutionResult] = []
         self.error: ExecutionError | None = None
+        self._stdout_lines = _LineShape()
+        self._stderr_lines = _LineShape()
 
     def _append(self, target: list[str], text: str) -> None:
         encoded = text.encode("utf-8")
@@ -106,10 +160,14 @@ class _BoundedOutput:
             self.truncated = True
 
     async def on_stdout(self, message: OutputMessage) -> None:
-        self._append(self.stdout, str(message.text))
+        line = self._stdout_lines.feed(str(message.text))
+        if line is not None:
+            self._append(self.stdout, line)
 
     async def on_stderr(self, message: OutputMessage) -> None:
-        self._append(self.stderr, str(message.text))
+        line = self._stderr_lines.feed(str(message.text))
+        if line is not None:
+            self._append(self.stderr, line)
 
     async def on_result(self, result: SdkExecutionResult) -> None:
         text = result.text
@@ -270,13 +328,16 @@ class OpenSandboxRuntime:
                     template=sandbox.metadata_.get("template"),
                     memory_mb=sandbox.memory_mb,
                     cpu=sandbox.cpu,
+                    conformance_version=sandbox.conformance_version,
                 )
             if snapshot_id:
                 handle = await OpenSandbox.create(snapshot_id=snapshot_id, **kwargs)
             elif handle is None:
                 template = sandbox.metadata_.get("template")
                 handle = await OpenSandbox.create(
-                    self.settings.image_spec_for_template(template),
+                    self.settings.image_spec_for_template(
+                        template, sandbox.conformance_version
+                    ),
                     entrypoint=self.settings.entrypoint_for_template(template),
                     **kwargs,
                 )
@@ -317,10 +378,14 @@ class OpenSandboxRuntime:
     async def execute_process(
         self, sandbox: Sandbox, request: RuntimeProcessRequest
     ) -> RuntimeExecutionResult:
-        command = shlex.join([request.executable, *request.args])
+        # execd 1.1+ runs an argv list natively, resolving the executable on
+        # PATH with no shell in between. Its argv mode has no stdin, though,
+        # so a process that needs one still goes through a shell pipe.
+        command: str | list[str] = [request.executable, *request.args]
         if request.stdin is not None:
             encoded = base64.b64encode(request.stdin.encode("utf-8")).decode("ascii")
-            command = f"printf %s {shlex.quote(encoded)} | base64 -d | {command}"
+            argv = shlex.join([request.executable, *request.args])
+            command = f"printf %s {shlex.quote(encoded)} | base64 -d | {argv}"
         return await self._run_command(
             sandbox,
             _CommandSpec(
@@ -335,10 +400,21 @@ class OpenSandboxRuntime:
     async def _run_command(
         self, sandbox: Sandbox, spec: _CommandSpec
     ) -> RuntimeExecutionResult:
+        """Run one command, and never wait on a sandbox that is gone.
+
+        The SDK reads a command's output stream with no read timeout and
+        relies on execd to close it. Under plain Docker an OOM kills only the
+        command, execd closes the stream, and that surfaces at once. Under
+        gVisor an OOM kills the whole sandbox, network stack included, so the
+        stream is never closed and the read never returns -- measured on the
+        gVisor trial as an execution still `running` 78s into a 30s timeout.
+        So the run races a watcher that polls the sandbox's state, and both
+        race a deadline of the command's own timeout plus a grace period.
+        """
         handle = await self._get_handle(sandbox, check_ready=True)
         output = _BoundedOutput(spec.max_output_bytes)
-        try:
-            execution = await handle.commands.run(
+        run = asyncio.ensure_future(
+            handle.commands.run(
                 spec.command,
                 opts=RunCommandOpts(
                     working_directory=spec.cwd,
@@ -347,16 +423,59 @@ class OpenSandboxRuntime:
                 ),
                 handlers=output.handlers(),
             )
-            return output.response(execution)
-        except SandboxException as exc:
-            await self._raise_runtime_error(exc, sandbox)
+        )
+        watch = asyncio.ensure_future(self._wait_until_dead(sandbox))
+        deadline = spec.timeout_seconds + self.settings.execution_deadline_grace_seconds
+        try:
+            await asyncio.wait(
+                {run, watch}, timeout=deadline, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            for task in (run, watch):
+                task.cancel()
+            await asyncio.gather(run, watch, return_exceptions=True)
+        if run.done() and not run.cancelled():
+            try:
+                return output.response(run.result())
+            except SandboxException as exc:
+                await self._raise_runtime_error(exc, sandbox)
+        if await self._detect_memory_exceeded(sandbox):
+            raise SandboxMemoryExceededError(sandbox.memory_mb)
+        if watch.done() and not watch.cancelled():
+            message = "the sandbox died while the command was running"
+        else:
+            message = f"the sandbox did not answer within {deadline:g}s"
+        raise SandboxUnavailableError(message)
+
+    async def _wait_until_dead(self, sandbox: Sandbox) -> None:
+        """Return once OpenSandbox reports `sandbox` in a dead state.
+
+        A failed or slow lookup is not evidence of death, so it is skipped
+        rather than returned on: only a state OpenSandbox actually reported
+        ends the wait.
+        """
+        container_id = sandbox.container_id
+        if not container_id:
+            await asyncio.Event().wait()
+            return  # pragma: no cover - the wait never ends; the caller cancels it
+        while True:
+            await asyncio.sleep(self.settings.execution_liveness_poll_seconds)
+            try:
+                async with asyncio.timeout(self.settings.oom_diagnostic_timeout_seconds):
+                    info = await (await self._get_manager()).get_sandbox_info(
+                        container_id
+                    )
+            except Exception:  # noqa: BLE001, S112 - a missed poll is not a death
+                continue
+            if str(info.status.state).lower() in _DEAD_STATES:
+                return
 
     async def read_file(self, sandbox: Sandbox, path: str) -> FileReadResponse:
         handle = await self._get_handle(sandbox, check_ready=True)
         try:
             content = await handle.files.read_bytes(path)
         except SandboxException as exc:
-            await self._raise_runtime_error(exc, sandbox)
+            await self._raise_file_error(exc, sandbox, path)
         try:
             return FileReadResponse(
                 path=path, content=content.decode("utf-8"), encoding="utf-8"
@@ -416,7 +535,7 @@ class OpenSandboxRuntime:
                 DirectoryListEntry(path=path, depth=1)
             )
         except SandboxException as exc:
-            await self._raise_runtime_error(exc, sandbox)
+            await self._raise_file_error(exc, sandbox, path)
         return FileListResponse(
             path=path,
             entries=[
@@ -443,7 +562,7 @@ class OpenSandboxRuntime:
             else:
                 await handle.files.delete_files([path])
         except SandboxException as exc:
-            await self._raise_runtime_error(exc, sandbox)
+            await self._raise_file_error(exc, sandbox, path)
 
     async def pause(self, sandbox: Sandbox, *, memory: bool) -> None:
         if not sandbox.container_id:
@@ -505,15 +624,13 @@ class OpenSandboxRuntime:
                     connection_config=self._connection,
                     skip_health_check=True,
                 )
-            except SandboxApiException as exc:
-                if exc.status_code != HTTPStatus.NOT_FOUND:
-                    await self._raise_runtime_error(exc, sandbox)
+            except SandboxException as exc:
+                await self._raise_unless_gone(exc, sandbox)
         if handle is not None:
             try:
                 await handle.kill()
-            except SandboxApiException as exc:
-                if exc.status_code != HTTPStatus.NOT_FOUND:
-                    await self._raise_runtime_error(exc, sandbox)
+            except SandboxException as exc:
+                await self._raise_unless_gone(exc, sandbox)
             finally:
                 await handle.close()
 
@@ -700,6 +817,68 @@ class OpenSandboxRuntime:
         haystack = f"{info.status.reason or ''} {info.status.message or ''}".lower()
         return any(token in haystack for token in _OOM_SIGNAL_TOKENS)
 
+    async def _raise_file_error(
+        self, exc: SandboxException, sandbox: Sandbox, path: str
+    ) -> NoReturn:
+        """`_raise_runtime_error`, except that a missing path is the caller's.
+
+        Matched on execd's own `FILE_NOT_FOUND` code, not on HTTP 404: through
+        OpenSandbox's server proxy, a sandbox that no longer exists is a 404
+        too, and that one really is the sandbox being gone.
+        """
+        if exc.error.code == FILE_NOT_FOUND_CODE:
+            raise SandboxFileNotFoundError(path) from exc
+        await self._raise_runtime_error(exc, sandbox)
+
+    async def _raise_unless_gone(
+        self, exc: SandboxException, sandbox: Sandbox
+    ) -> None:
+        """Return if a failed kill step failed because the sandbox is gone.
+
+        A 404 means gone, as before. Any other failure is checked against the
+        sandbox's live state: on OpenSandbox 1.2 a deleted sandbox reports
+        `Stopping` and then `Terminated` instead of a 404, and connecting to
+        or deleting it again may fail. Either state counts as gone. Otherwise
+        the failure is raised as it was before: API errors through
+        `_raise_runtime_error`, anything else unchanged.
+
+        On 1.1 the state check only runs after a failure, so a kill that works
+        makes no extra call.
+        """
+        if (
+            isinstance(exc, SandboxApiException)
+            and exc.status_code == HTTPStatus.NOT_FOUND
+        ):
+            return
+        if await self._is_gone(sandbox):
+            logger.info(
+                "Sandbox %s is already stopping or gone; treating it as killed",
+                sandbox.id,
+            )
+            return
+        if isinstance(exc, SandboxApiException):
+            await self._raise_runtime_error(exc, sandbox)
+        raise exc
+
+    async def _is_gone(self, sandbox: Sandbox) -> bool:
+        """Whether OpenSandbox reports `sandbox` deleted or being deleted.
+
+        Best effort and bounded: a failed or slow lookup is not evidence, so it
+        answers False and the caller keeps its original error.
+        """
+        if not sandbox.container_id:
+            return False
+        try:
+            async with asyncio.timeout(self.settings.oom_diagnostic_timeout_seconds):
+                info = await (await self._get_manager()).get_sandbox_info(
+                    sandbox.container_id
+                )
+        except SandboxApiException as exc:
+            return exc.status_code == HTTPStatus.NOT_FOUND
+        except Exception:  # noqa: BLE001 - a failed lookup is not evidence
+            return False
+        return str(info.status.state).lower() in _GONE_STATES
+
     async def _raise_runtime_error(
         self, exc: SandboxException, sandbox: Sandbox
     ) -> NoReturn:
@@ -711,16 +890,16 @@ class OpenSandboxRuntime:
     def _is_start_timeout(exc: SandboxException) -> bool:
         """Whether a failed start ran out of time rather than went wrong.
 
-        The SDK expresses one of these two ways and only names one of them.
+        `SandboxReadyTimeoutException` is the readiness poll giving up.
+        `SandboxTimeoutException` (SDK 1.1+) is the create POST itself
+        exceeding `ConnectionConfig.request_timeout` -- a read, write or pool
+        timeout. Both are upstream's own names, so they are checked first.
 
-        `SandboxReadyTimeoutException` is the readiness poll giving up, which
-        is explicit. The other is the create POST itself exceeding
-        `ConnectionConfig.request_timeout`: httpx raises `ReadTimeout`, and the
-        SDK's own converter rewraps it as a generic `SandboxInternalException`
-        whose class says nothing. Only the cause chain still carries the fact,
-        so that is what this walks -- matching on the message text instead
-        would be the same dead substring match `_detect_memory_exceeded`'s
-        docstring already rejects.
+        The SDK does not name the third: a connect timeout becomes
+        `SandboxConnectionException`, the same class as a refused connection.
+        Only the cause chain still says it was a timeout, so that is what this
+        walks -- matching on the message text instead would be the same dead
+        substring match `_detect_memory_exceeded`'s docstring already rejects.
 
         A timeout is safe to call retryable because the SDK cleans up after
         itself: `Sandbox.create` kills the half-built sandbox before raising,
@@ -731,7 +910,7 @@ class OpenSandboxRuntime:
         caller to retry that would spin them against an error that never
         clears.
         """
-        if isinstance(exc, SandboxReadyTimeoutException):
+        if isinstance(exc, SandboxReadyTimeoutException | SandboxTimeoutException):
             return True
         seen: set[int] = set()
         cause: BaseException | None = exc

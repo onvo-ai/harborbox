@@ -26,6 +26,7 @@ from harborbox.db import Base, get_session
 from harborbox.models import Sandbox, SandboxTemplate, utc_now
 from harborbox.security import require_api_key
 from harborbox.templates import (
+    CONFORMANCE_VERSION,
     ResolvedTemplate,
     TemplateNotReadyError,
     UnknownTemplateError,
@@ -191,7 +192,7 @@ async def test_creating_a_template_is_idempotent(
     assert second.json()["name"] == name
     assert third.json()["name"] != name
     assert name == f"custom-{first.json()['spec_hash']}"
-    assert first.json()["image"] == f"harborbox-sandbox-{name}:local"
+    assert first.json()["image"] == f"harborbox-sandbox-{name}:local-{CONFORMANCE_VERSION}"
     assert first.json()["status"] == "building"
     assert first.json()["error"] is None
     assert builder.scheduled == [name, third.json()["name"]]
@@ -555,14 +556,21 @@ async def test_a_build_targets_the_push_reference_not_the_stored_pull_one(
     await builder._build("custom-a1b2c3d4e5f6")
 
     joined = " ".join(calls[0])
-    assert "name=registry:5000/harborbox-sandbox-custom-a1b2c3d4e5f6:local" in joined
+    assert (
+        "name=registry:5000/harborbox-sandbox-custom-a1b2c3d4e5f6:"
+        f"local-{CONFORMANCE_VERSION}"
+    ) in joined
     assert "127.0.0.1:5050" not in joined
     async with sessions() as session:
         rebuilt = await session.get(SandboxTemplate, "custom-a1b2c3d4e5f6")
         assert rebuilt is not None
         assert rebuilt.status == "ready"
-        # The row keeps the pull reference: it is what reaches opensandbox.
-        assert rebuilt.image.startswith("127.0.0.1:5050/")
+        # The row ends on the unqualified reference POST /v1/templates writes;
+        # the pull endpoint is added when a sandbox is started from it.
+        assert rebuilt.image == (
+            f"harborbox-sandbox-custom-a1b2c3d4e5f6:local-{CONFORMANCE_VERSION}"
+        )
+        assert rebuilt.conformance_version == CONFORMANCE_VERSION
 
 
 
@@ -1224,3 +1232,193 @@ async def test_marking_a_vanished_derived_template_used_does_not_raise(
     await mark_template_used(session, vanished)
 
     assert await session.get(SandboxTemplate, vanished.name) is None
+
+
+# ---- DEV-2611: rebuilding templates whose image predates the conformance layer
+
+
+async def test_posting_a_stale_ready_template_rebuilds_it_under_the_same_name(
+    client: httpx.AsyncClient, session: AsyncSession, builder: FakeTemplateBuilder
+) -> None:
+    """A row built before the layer was versioned is stale, and a POST fixes it.
+
+    The name stays put -- products pin it -- and so does the row's status and
+    image: the rebuild happens beside the live image, not in place of it.
+    """
+    legacy = derived_row()
+    session.add(legacy)
+    await session.commit()
+
+    response = await client.post("/v1/templates", json={"dockerfile": RAW_DOCKERFILE})
+
+    assert response.status_code == HTTPStatus.OK
+    body = response.json()
+    assert body["name"] == legacy.name
+    assert body["status"] == "ready"
+    assert body["image"] == f"harborbox-sandbox-{legacy.name}:local"
+    assert body["conformance_version"] is None
+    assert builder.scheduled == [legacy.name]
+
+
+async def test_posting_a_template_on_an_older_layer_rebuilds_it(
+    client: httpx.AsyncClient, session: AsyncSession, builder: FakeTemplateBuilder
+) -> None:
+    older = derived_row(conformance_version="00000000")
+    session.add(older)
+    await session.commit()
+
+    await client.post("/v1/templates", json={"dockerfile": RAW_DOCKERFILE})
+
+    assert builder.scheduled == [older.name]
+
+
+async def test_posting_a_template_on_the_current_layer_does_not_rebuild(
+    client: httpx.AsyncClient, session: AsyncSession, builder: FakeTemplateBuilder
+) -> None:
+    session.add(derived_row(conformance_version=CONFORMANCE_VERSION))
+    await session.commit()
+
+    response = await client.post("/v1/templates", json={"dockerfile": RAW_DOCKERFILE})
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json()["conformance_version"] == CONFORMANCE_VERSION
+    assert builder.scheduled == []
+
+
+async def test_posting_a_template_that_is_still_building_does_not_rebuild(
+    client: httpx.AsyncClient, session: AsyncSession, builder: FakeTemplateBuilder
+) -> None:
+    session.add(derived_row(status="building"))
+    await session.commit()
+
+    await client.post("/v1/templates", json={"dockerfile": RAW_DOCKERFILE})
+
+    assert builder.scheduled == []
+
+
+async def test_a_template_being_rebuilt_keeps_creating_sandboxes(
+    client: httpx.AsyncClient, sessions: Sessions
+) -> None:
+    """No outage: until the new image is in, sandboxes get the one that works.
+
+    And each sandbox is pinned to the build it was created against, so the
+    swap cannot change the image under one that has not started yet.
+    """
+    legacy = derived_row()
+    async with sessions() as session:
+        session.add(legacy)
+        await session.commit()
+    await client.post("/v1/templates", json={"dockerfile": RAW_DOCKERFILE})
+
+    during = await client.post("/v1/sandboxes", json={"template": legacy.name})
+    async with sessions() as session:
+        swapped = await session.get(SandboxTemplate, legacy.name)
+        assert swapped is not None
+        swapped.conformance_version = CONFORMANCE_VERSION
+        await session.commit()
+    after = await client.post("/v1/sandboxes", json={"template": legacy.name})
+
+    assert during.status_code == HTTPStatus.CREATED
+    assert after.status_code == HTTPStatus.CREATED
+    async with sessions() as session:
+        pinned_during = await session.get(Sandbox, during.json()["id"])
+        pinned_after = await session.get(Sandbox, after.json()["id"])
+        assert pinned_during is not None
+        assert pinned_after is not None
+        assert pinned_during.conformance_version is None
+        assert pinned_after.conformance_version == CONFORMANCE_VERSION
+
+
+async def test_a_sandbox_on_a_static_template_pins_no_layer_version(
+    client: httpx.AsyncClient, sessions: Sessions
+) -> None:
+    created = await client.post("/v1/sandboxes", json={"template": "base"})
+
+    async with sessions() as session:
+        sandbox = await session.get(Sandbox, created.json()["id"])
+        assert sandbox is not None
+        assert sandbox.conformance_version is None
+
+
+async def test_a_successful_rebuild_swaps_in_the_new_image(
+    sessions: Sessions, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings(**BUILDER_SETTINGS)
+    legacy = derived_row(error="an earlier rebuild failed")
+    async with sessions() as session:
+        session.add(legacy)
+        await session.commit()
+    monkeypatch.setattr(builder_module, "session_factory", sessions)
+    calls: list[list[str]] = []
+    record_invocations(monkeypatch, calls)
+
+    await builder_module.TemplateBuilder(settings)._build(legacy.name)
+
+    # Pushed beside the old tag, never over it.
+    assert f"{legacy.name}:local-{CONFORMANCE_VERSION}," in " ".join(calls[0])
+    async with sessions() as session:
+        rebuilt = await session.get(SandboxTemplate, legacy.name)
+        assert rebuilt is not None
+        assert rebuilt.status == "ready"
+        assert rebuilt.error is None
+        assert rebuilt.conformance_version == CONFORMANCE_VERSION
+        assert rebuilt.image == settings.derived_template_image(
+            legacy.name, CONFORMANCE_VERSION
+        )
+
+
+async def test_a_failed_rebuild_keeps_serving_the_previous_image(
+    sessions: Sessions, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Failing the row would turn a missed upgrade into an outage."""
+    settings = Settings(**BUILDER_SETTINGS)
+    legacy = derived_row()
+    async with sessions() as session:
+        session.add(legacy)
+        await session.commit()
+    monkeypatch.setattr(builder_module, "session_factory", sessions)
+
+    def failing_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(argv, 1, "", "E: Unable to locate package")
+
+    monkeypatch.setattr(builder_module.subprocess, "run", failing_run)
+
+    await builder_module.TemplateBuilder(settings)._build(legacy.name)
+
+    async with sessions() as session:
+        kept = await session.get(SandboxTemplate, legacy.name)
+        assert kept is not None
+        assert kept.status == "ready"
+        assert kept.image == legacy.image
+        # Still on the old version, so the next POST tries again.
+        assert kept.conformance_version is None
+        assert (kept.error or "").startswith(
+            "rebuild failed; still serving the previous image:"
+        )
+        assert "Unable to locate package" in (kept.error or "")
+
+
+async def test_a_build_already_under_way_is_not_queued_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A product that POSTs on every boot must not stack identical rebuilds."""
+    builder = builder_module.TemplateBuilder(Settings(**BUILDER_SETTINGS))
+    built: list[str] = []
+    release = asyncio.Event()
+
+    async def fake_build(name: str) -> None:
+        await release.wait()
+        built.append(name)
+
+    monkeypatch.setattr(builder, "_build", fake_build)
+    builder.schedule_build("custom-a1b2c3d4e5f6")
+    builder.schedule_build("custom-a1b2c3d4e5f6")
+    assert len(builder._tasks) == 1
+
+    release.set()
+    await asyncio.gather(*list(builder._tasks))
+    # Finished, so the name is free to build again.
+    builder.schedule_build("custom-a1b2c3d4e5f6")
+    await asyncio.gather(*list(builder._tasks))
+
+    assert built == ["custom-a1b2c3d4e5f6", "custom-a1b2c3d4e5f6"]

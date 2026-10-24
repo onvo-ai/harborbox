@@ -19,6 +19,12 @@ cd "$(dirname "$0")/.."
 # two projects agree on where the certificates are.
 export HARBORBOX_BUILDKIT_TLS_DIR="${HARBORBOX_BUILDKIT_TLS_DIR:-$PWD/.buildkit-tls}"   # read by gen-buildkit-certs.sh only
 
+# OpenSandbox publishes sandbox ports on this address only. compose.yaml's
+# default is Linux's docker0; OrbStack and Docker Desktop put the bridge
+# elsewhere, so ask the daemon rather than assume.
+OPENSANDBOX_PUBLISH_HOST="${OPENSANDBOX_PUBLISH_HOST:-$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')}"
+export OPENSANDBOX_PUBLISH_HOST
+
 REGISTRY_USER="${HARBORBOX_REGISTRY_USERNAME:-harborbox}"
 REGISTRY_PASS="${HARBORBOX_REGISTRY_PASSWORD:-change-me-registry}"
 API_KEY="${HARBORBOX_API_KEY:-change-me}"

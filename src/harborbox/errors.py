@@ -28,3 +28,15 @@ class SandboxStartTimeoutError(SandboxRuntimeError):
 class SandboxMemoryExceededError(SandboxRuntimeError):
     def __init__(self, memory_mb: int) -> None:
         super().__init__(f"sandbox exceeded its {memory_mb} MiB memory limit")
+
+
+class SandboxFileNotFoundError(SandboxRuntimeError):
+    """The sandbox is fine; the path the caller asked about does not exist.
+
+    Not a `SandboxUnavailableError`: that one means the sandbox itself is
+    gone, and treating a typo'd path that way turned a caller's 404 into a 500.
+    """
+
+    def __init__(self, path: str) -> None:
+        super().__init__(f"no such file or directory: {path}")
+        self.path = path

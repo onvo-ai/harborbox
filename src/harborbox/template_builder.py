@@ -18,7 +18,7 @@ from sqlalchemy import select
 from harborbox.build_contexts import BuildContextError, BuildContextStore
 from harborbox.db import session_factory
 from harborbox.models import Sandbox, SandboxTemplate, utc_now
-from harborbox.templates import TemplateSpec, render_dockerfile
+from harborbox.templates import CONFORMANCE_VERSION, TemplateSpec, render_dockerfile
 
 if TYPE_CHECKING:
     from harborbox.config import Settings
@@ -100,12 +100,20 @@ class TemplateBuilder:
         # still construct a builder without one.
         self.context_store = context_store
         self._tasks: set[asyncio.Task[None]] = set()
+        # Names with a build queued or running. A ready template rebuilt for a
+        # new conformance layer stays `ready` while it builds, so the row alone
+        # cannot tell a second POST that a rebuild is already on its way.
+        self._building: set[str] = set()
         # Builds queue rather than all starting at once. This matters more
         # since caller-supplied Dockerfiles: an allowlisted apt install is
         # bounded work, an arbitrary RUN is not.
         self._slots = asyncio.Semaphore(settings.template_max_concurrent_builds)
 
     def schedule_build(self, name: str) -> None:
+        """Start a detached build of `name`, unless one is already under way."""
+        if name in self._building:
+            return
+        self._building.add(name)
         task = asyncio.create_task(
             self._build_when_a_slot_frees(name),
             name=f"harborbox-template-build-{name}",
@@ -120,8 +128,11 @@ class TemplateBuilder:
         queueing costs nothing legible -- whereas starting every requested
         build at once is how one caller starves the host.
         """
-        async with self._slots:
-            await self._build(name)
+        try:
+            async with self._slots:
+                await self._build(name)
+        finally:
+            self._building.discard(name)
 
     async def close(self) -> None:
         for task in list(self._tasks):
@@ -136,8 +147,10 @@ class TemplateBuilder:
                 return
             spec = TemplateSpec.from_json(template.spec)
         # Not `template.image`: the row stores the reference opensandbox pulls,
-        # which the builder cannot reach from its own network.
-        image = self.settings.push_image_for_template(name)
+        # which the builder cannot reach from its own network. And a tag for the
+        # current conformance layer, never the one the row serves today: a
+        # rebuild must not touch the image live sandboxes are created from.
+        image = self.settings.push_image_for_template(name, CONFORMANCE_VERSION)
 
         # The caller wrote the Dockerfile; we only append the runtime contract.
         # Their `FROM` was allowlisted at validation time.
@@ -167,8 +180,14 @@ class TemplateBuilder:
         async with session_factory() as session:
             template = await session.get(SandboxTemplate, name)
             if template is not None:
+                # The swap. Sandboxes created from here on get the new image;
+                # ones created earlier keep the version they were pinned to.
                 template.status = "ready"
                 template.error = None
+                template.image = self.settings.derived_template_image(
+                    name, CONFORMANCE_VERSION
+                )
+                template.conformance_version = CONFORMANCE_VERSION
                 template.updated_at = utc_now()
                 await session.commit()
         logger.info("Template %s built as %s", name, image)
@@ -178,8 +197,17 @@ class TemplateBuilder:
             template = await session.get(SandboxTemplate, name)
             if template is None:
                 return
-            template.status = "failed"
-            template.error = error[:MAX_ERROR_LENGTH]
+            if template.status == "ready":
+                # A rebuild for a new conformance layer. The previous image is
+                # still there and still works, so keep serving it: failing the
+                # row would turn a missed upgrade into an outage. The next POST
+                # retries, because the row is still on the old version.
+                template.error = (
+                    f"rebuild failed; still serving the previous image: {error}"
+                )[:MAX_ERROR_LENGTH]
+            else:
+                template.status = "failed"
+                template.error = error[:MAX_ERROR_LENGTH]
             template.updated_at = utc_now()
             await session.commit()
 

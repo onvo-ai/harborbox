@@ -16,6 +16,13 @@ try {
   assert.equal(read.exitCode, 0);
   assert.match(read.stdout, /typescript-binary-upload/);
 
+  // DEV-2613: lines and blank lines survive the API's per-line log shape.
+  const multiline = await sandbox.commands.run(
+    "printf 'alpha\\n\\nbeta\\ngamma\\n'",
+  );
+  assert.equal(multiline.exitCode, 0);
+  assert.equal(multiline.stdout, "alpha\n\nbeta\ngamma\n");
+
   await sandbox.setTimeout(180_000);
   assert.equal(await sandbox.isRunning(), true);
 

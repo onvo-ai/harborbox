@@ -24,7 +24,7 @@ jobs:
   freshness:
     name: Is CI still reporting?
     # GITHUB-HOSTED, AND THAT IS THE ENTIRE POINT. ci.yml runs on
-    # `[self-hosted, onvo-ci]`; those runners going unreachable is the exact
+    # `[self-hosted, coolify-ci]`; those runners going unreachable is the exact
     # fault this job exists to catch, so it must not depend on them. A
     # watchdog sharing its subject's single point of failure reports nothing
     # at the only moment it matters.
@@ -35,6 +35,7 @@ jobs:
     # "recent account payments have failed" is true of the private `onvo`
     # repository and was carried over here; measured 2026-08-25, a
     # `ubuntu-latest` job on this repo starts and succeeds in about 20s.
+    # Stays on GitHub's runners: this checks that our self-hosted CI is alive, so it cannot run on it.
     runs-on: ubuntu-latest
     permissions:
       # actions:read for the workflow-run history, contents:read for the head

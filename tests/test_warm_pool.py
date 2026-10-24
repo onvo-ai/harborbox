@@ -10,6 +10,7 @@ from opensandbox.exceptions import SandboxException
 
 from harborbox.config import Settings
 from harborbox.runtime_protocol import WarmPoolReservation
+from harborbox.templates import CONFORMANCE_VERSION
 from harborbox.warm_pool import OpenSandboxWarmPools
 
 if TYPE_CHECKING:
@@ -435,3 +436,58 @@ async def test_scale_down_leaves_a_recently_used_pool_alone() -> None:
 
     assert fake.resized == []
     assert pools._active_targets["base"] == 1
+
+
+_CUSTOM = "custom-a1b2c3d4e5f6"
+
+
+@pytest.mark.asyncio
+async def test_a_custom_pool_only_serves_sandboxes_on_the_current_layer() -> None:
+    """A pooled sandbox runs the current layer's image.
+
+    Handing one to a sandbox pinned to an older build would swap its image.
+    """
+    settings = Settings(warm_pool={_CUSTOM: 1})
+    pools = OpenSandboxWarmPools(settings, ConnectionConfig())
+    handle = FakeWarmHandle()
+    fake = FakePool(handle)
+    pools._pools[_CUSTOM] = fake  # type: ignore[assignment]
+    pools._active_targets[_CUSTOM] = 1
+    pools._last_demand[_CUSTOM] = asyncio.get_running_loop().time()
+    pools._started = True
+    memory_mb, cpu = settings.resources_for_template(_CUSTOM)
+
+    legacy = await pools.acquire(template=_CUSTOM, memory_mb=memory_mb, cpu=cpu)
+    older = await pools.acquire(
+        template=_CUSTOM, memory_mb=memory_mb, cpu=cpu, conformance_version="00000000"
+    )
+    current = await pools.acquire(
+        template=_CUSTOM,
+        memory_mb=memory_mb,
+        cpu=cpu,
+        conformance_version=CONFORMANCE_VERSION,
+    )
+
+    assert legacy is None
+    assert older is None
+    assert current is handle
+    assert fake.acquired == 1
+
+
+@pytest.mark.asyncio
+async def test_a_custom_pool_warms_the_current_layers_image_in_its_own_generation(
+    recording_pools: type[RecordingPool],
+) -> None:
+    settings = Settings(warm_pool={_CUSTOM: 1}, template_version="v9")
+    pools = OpenSandboxWarmPools(settings, ConnectionConfig())
+
+    await pools.start()
+
+    try:
+        pool = recording_pools.instances[0]
+        assert pool.kwargs["pool_name"] == f"harborbox-{_CUSTOM}-v9-{CONFORMANCE_VERSION}"
+        assert pool.kwargs["creation_spec"].image == (
+            f"harborbox-sandbox-{_CUSTOM}:v9-{CONFORMANCE_VERSION}"
+        )
+    finally:
+        await pools.close()

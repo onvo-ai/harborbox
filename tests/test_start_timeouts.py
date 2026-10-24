@@ -35,9 +35,10 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import pytest
 from opensandbox.exceptions import (
+    SandboxConnectionException,
     SandboxException,
-    SandboxInternalException,
     SandboxReadyTimeoutException,
+    SandboxTimeoutException,
 )
 from pydantic import ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -180,21 +181,56 @@ async def test_a_create_that_times_out_waiting_for_ready_is_not_an_unavailable_s
 async def test_a_read_timeout_against_the_control_plane_is_also_a_start_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The other half of a slow create, and the one the SDK does not name.
+    """The other half of a slow create: the create POST itself running long.
 
-    `ConnectionConfig.request_timeout` bounds the create POST itself. When it
-    trips, httpx raises `ReadTimeout` and the SDK's converter wraps it as a
-    generic `SandboxInternalException` -- indistinguishable from a real
-    failure by class alone. The cause chain is what tells them apart.
+    `ConnectionConfig.request_timeout` bounds that POST. When it trips, httpx
+    raises `ReadTimeout` and SDK 1.1+ names it `SandboxTimeoutException`.
     """
-    wrapped = SandboxInternalException(
+    timed_out = SandboxTimeoutException(
+        "Request timed out: timed out", cause=httpx.ReadTimeout("timed out")
+    )
+    monkeypatch.setattr(runtime_module, "OpenSandbox", fake_opensandbox_raising(timed_out))
+    runtime = OpenSandboxRuntime(Settings())
+
+    with pytest.raises(SandboxStartTimeoutError):
+        await runtime.start_sandbox(sandbox_row())
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_connect_timeout_is_a_start_timeout_though_the_sdk_does_not_say_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDK 1.1+ files a connect timeout under `SandboxConnectionException`.
+
+    That is the same class as a refused connection, so only the cause chain
+    tells a slow control plane from an absent one.
+    """
+    wrapped = SandboxConnectionException(
         "Network connectivity error: timed out",
-        cause=httpx.ReadTimeout("timed out"),
+        cause=httpx.ConnectTimeout("timed out"),
     )
     monkeypatch.setattr(runtime_module, "OpenSandbox", fake_opensandbox_raising(wrapped))
     runtime = OpenSandboxRuntime(Settings())
 
     with pytest.raises(SandboxStartTimeoutError):
+        await runtime.start_sandbox(sandbox_row())
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_a_refused_connection_is_not_a_start_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same SDK class without a timeout behind it stays a dead sandbox."""
+    wrapped = SandboxConnectionException(
+        "Network connectivity error: refused",
+        cause=httpx.ConnectError("connection refused"),
+    )
+    monkeypatch.setattr(runtime_module, "OpenSandbox", fake_opensandbox_raising(wrapped))
+    runtime = OpenSandboxRuntime(Settings())
+
+    with pytest.raises(SandboxUnavailableError):
         await runtime.start_sandbox(sandbox_row())
     await runtime.close()
 

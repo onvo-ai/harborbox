@@ -12,6 +12,7 @@ from opensandbox.pool_types import AcquirePolicy, PoolCreationSpec
 from harborbox.db import session_factory
 from harborbox.postgres_pool_store import AsyncPostgresPoolStateStore
 from harborbox.runtime_protocol import WarmPoolReservation
+from harborbox.templates import CONFORMANCE_VERSION
 
 if TYPE_CHECKING:
     from opensandbox import Sandbox as OpenSandbox
@@ -61,7 +62,14 @@ class OpenSandboxWarmPools:
                     state_store=store,
                     connection_config=self.connection,
                     creation_spec=PoolCreationSpec(
-                        image=self.settings.image_spec_for_template(template),
+                        # A pooled custom template is pooled on the current
+                        # conformance layer's tag. Until the template is
+                        # rebuilt onto it the pool simply does not fill, and
+                        # `acquire` cold starts in the meantime. Static
+                        # templates ignore the version.
+                        image=self.settings.image_spec_for_template(
+                            template, CONFORMANCE_VERSION
+                        ),
                         entrypoint=self.settings.entrypoint_for_template(template),
                         resource={"cpu": str(cpu), "memory": f"{memory_mb}Mi"},
                         metadata={
@@ -74,9 +82,6 @@ class OpenSandboxWarmPools:
                     ),
                     warmup_concurrency=min(
                         target, self.settings.warm_pool_warmup_concurrency
-                    ),
-                    reconcile_interval=timedelta(
-                        seconds=self.settings.warm_pool_reconcile_seconds
                     ),
                     acquire_ready_timeout=timedelta(
                         seconds=self.settings.opensandbox_ready_timeout_seconds
@@ -130,9 +135,22 @@ class OpenSandboxWarmPools:
         self._started = False
 
     async def acquire(
-        self, *, template: str | None, memory_mb: int, cpu: float
+        self,
+        *,
+        template: str | None,
+        memory_mb: int,
+        cpu: float,
+        conformance_version: str | None = None,
     ) -> OpenSandbox | None:
         if template is None:
+            return None
+        if (
+            self.settings.is_custom_template(template)
+            and conformance_version != CONFORMANCE_VERSION
+        ):
+            # The sandbox is pinned to an older build of this template than
+            # the one the pool holds; handing it a pooled one would swap its
+            # image. Cold start it on the image it was created against.
             return None
         if template not in self._pools:
             # Not an error: a template is pooled only when it is named in
@@ -238,4 +256,10 @@ class OpenSandboxWarmPools:
             logger.info("Scaled inactive warm pool %s to zero", template)
 
     def _pool_name(self, template: str) -> str:
-        return f"harborbox-{template}-{self.settings.template_version}"
+        name = f"harborbox-{template}-{self.settings.template_version}"
+        if self.settings.is_custom_template(template):
+            # A new generation per conformance layer too, for the same reason
+            # as the template version: idle sandboxes warmed from the previous
+            # image must expire, not be handed to a sandbox pinned to the new.
+            name = f"{name}-{CONFORMANCE_VERSION}"
+        return name
