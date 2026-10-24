@@ -151,10 +151,23 @@ jobs:
       # (2313/3156) against a local PostgreSQL with the full 441-test suite and
       # no skips (14 e2e deselected, as in this job). The floor stays at 71
       # here; lifting it to 72 is the next climb's change, not a merge's.
+      #
+      # 79 is `achieved - 1` against 80.20% (2531/3156), measured 2026-10-15
+      # against a local PostgreSQL with 481 passed and no skips. Two things
+      # moved it: `concurrency = ["greenlet", "thread"]` in pyproject.toml,
+      # which stopped coverage losing lines SQLAlchemy runs inside a greenlet
+      # (73.29% -> 76.24% on the same tests), and test_sandbox_routes.py.
+      #
+      # api.py is not at 100%, so its line is a floor rather than a pin:
+      # 70 is `achieved - 1` against 71.30%. What is left there is the
+      # execution routes and the lifespan, which is the next climb. Raise this
+      # line, or turn it into a 100 pin, whenever a climb lifts it.
       - name: Coverage floors
         if: always()
         run: |
-          uv run coverage report --fail-under=71
+          uv run coverage report --fail-under=79
+          uv run coverage report --fail-under=70 \
+            --include='src/harborbox/api.py'
           uv run coverage report --fail-under=100 \
             --include='src/harborbox/postgres_pool_store.py'
           uv run coverage report --fail-under=100 \
