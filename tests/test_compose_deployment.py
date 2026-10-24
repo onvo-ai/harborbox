@@ -30,6 +30,11 @@ from harborbox.schemas import SandboxCreate
 from harborbox.telemetry import SERVICE_NAME, export_is_configured, service_name_for
 
 COMPOSE = Path(__file__).resolve().parent.parent / "compose.internal-tools.yaml"
+# The workflow that builds what COMPOSE pulls. Production servers do not build
+# images, so the images the deployed file needs come from here.
+IMAGES_WORKFLOW = (
+    Path(__file__).resolve().parent.parent / ".github" / "workflows" / "images.yml"
+)
 # The builder is a *second* Compose project, deployed as a second Coolify
 # application. That separation is load-bearing rather than tidiness, and the
 # tests below are written against both files together because the property
@@ -143,13 +148,34 @@ def _decode(value: str) -> object:
     return value
 
 
+def tag_services(compose: dict) -> dict[str, tuple[str, str]]:
+    """Services that only run `docker image tag SOURCE TARGET`, by name."""
+    tags = {}
+    for name, svc in compose["services"].items():
+        command = [resolve(part) for part in svc.get("command") or []]
+        if svc.get("entrypoint") == ["docker"] and command[:2] == ["image", "tag"]:
+            tags[name] = (command[2], command[3])
+    return tags
+
+
 def built_images(compose: dict) -> set[str]:
-    """Every image this compose file actually builds."""
-    return {
-        resolve(svc["image"])
-        for svc in compose["services"].values()
-        if "build" in svc and "image" in svc
+    """Every image name this compose file puts on the host.
+
+    Nothing is built here any more: an image is either pulled by a service or
+    given a second name by a tag service. Both count, because both are names
+    the Docker daemon can then create a sandbox from.
+    """
+    pulled = {
+        resolve(svc["image"]) for svc in compose["services"].values() if "image" in svc
     }
+    return pulled | {target for _, target in tag_services(compose).values()}
+
+
+def ci_built_images() -> dict[str, str]:
+    """Image name to Dockerfile, for every image images.yml builds."""
+    workflow = yaml.safe_load(IMAGES_WORKFLOW.read_text())
+    matrix = workflow["jobs"]["image"]["strategy"]["matrix"]["include"]
+    return {entry["image"]: entry["dockerfile"] for entry in matrix}
 
 
 def test_the_opensandbox_server_the_api_dials_is_actually_run(
@@ -268,12 +294,18 @@ def test_built_template_images_are_held_open_by_a_running_container(
     A running container is the reference prune honours. Nothing here needs the
     container to *do* anything — only to still exist at 00:00 UTC.
     """
+    tags = tag_services(compose)
     for template in settings.template_images:
         image = settings.image_for_template(template)
+        # The name the API asks for is a tag on a pulled image. A tag is a
+        # second name for the same image, so holding the pulled image holds
+        # the tag too.
+        sources = {source for source, target in tags.values() if target == image}
+        names = {image} | sources
         holders = {
             name: svc
             for name, svc in compose["services"].items()
-            if resolve(svc.get("image", "")) == image
+            if resolve(svc.get("image", "")) in names
         }
         assert holders, f"nothing in {COMPOSE.name} declares {image!r}."
 
@@ -299,7 +331,7 @@ def test_the_api_does_not_wait_for_the_image_holders_to_exit(compose: dict) -> N
     holders = {
         name
         for name, svc in compose["services"].items()
-        if "build" in svc and svc.get("restart") in {"always", "unless-stopped"}
+        if svc.get("restart") in {"always", "unless-stopped"}
     }
     depends_on = compose["services"]["api"]["depends_on"]
 
@@ -323,12 +355,15 @@ def test_built_images_carry_the_label_that_survives_coolify_cleanup(
     """
     root = Path(__file__).resolve().parent.parent
 
+    # The images are built by CI now, but they still land in this host's image
+    # store, so the label matters exactly as it did when they were built here.
+    pulled = {resolve(svc.get("image", "")) for svc in compose["services"].values()}
     dockerfiles = {
-        svc["build"]["dockerfile"]
-        for svc in compose["services"].values()
-        if isinstance(svc.get("build"), dict) and svc["build"].get("dockerfile")
+        dockerfile
+        for image, dockerfile in ci_built_images().items()
+        if any(name.startswith(f"ghcr.io/onvo-ai/{image}:") for name in pulled)
     }
-    assert dockerfiles, "no build targets found; this test would pass vacuously."
+    assert dockerfiles, "no CI-built images found; this test would pass vacuously."
 
     for name in sorted(dockerfiles):
         body = (root / name).read_text()
@@ -806,3 +841,62 @@ def test_sandbox_ports_do_not_overlap_the_kernel_ephemeral_range(path: Path) -> 
         f"{path.name} publishes sandboxes from {low}, inside the privileged "
         f"port range."
     )
+
+
+def test_production_builds_nothing(compose: dict, builder_compose: dict) -> None:
+    """Production servers only pull (rule since 2026-10-23).
+
+    A `build:` section makes Coolify run `docker compose build` on the host
+    that serves traffic. images.yml builds on the build server instead, and its
+    deploy job refuses a file that builds.
+    """
+    for path, document in ((COMPOSE, compose), (BUILDER_COMPOSE, builder_compose)):
+        building = sorted(
+            name for name, svc in document["services"].items() if "build" in svc
+        )
+        assert not building, f"{path.name} builds {building} on the host."
+
+
+def test_every_harborbox_image_pulled_is_one_ci_builds(compose: dict) -> None:
+    """A pulled image nobody pushes fails the deploy at `docker compose pull`."""
+    ours = {
+        resolve(svc["image"]).split("/")[-1].split(":")[0]
+        for svc in compose["services"].values()
+        if resolve(svc.get("image", "")).startswith("ghcr.io/onvo-ai/")
+    }
+    assert ours, "nothing is pulled from ghcr.io/onvo-ai; this test is vacuous."
+    assert ours <= set(ci_built_images()), (
+        f"{COMPOSE.name} pulls {sorted(ours)}, but images.yml builds only "
+        f"{sorted(ci_built_images())}."
+    )
+
+
+def test_the_base_name_exists_before_the_api_starts(
+    compose: dict, settings: Settings
+) -> None:
+    """The base the API resolves is a tag; the API must wait for it.
+
+    The tag service gives the pulled base the name opensandbox is asked for.
+    If the API started first, the first `base` sandbox could ask for a name
+    that is not on the host yet.
+    """
+    image = settings.image_for_template("base")
+    tags = {
+        name: (source, target)
+        for name, (source, target) in tag_services(compose).items()
+        if target == image
+    }
+    assert tags, f"nothing in {COMPOSE.name} tags an image as {image!r}."
+
+    depends_on = compose["services"]["api"]["depends_on"]
+    for name, (source, _) in tags.items():
+        assert depends_on[name]["condition"] == "service_completed_successfully"
+        keepers = {
+            keeper
+            for keeper, svc in compose["services"].items()
+            if resolve(svc.get("image", "")) == source
+        }
+        assert keepers, f"{name} tags {source!r}, which no service pulls."
+        assert keepers <= set(compose["services"][name]["depends_on"]), (
+            f"{name} can run before {sorted(keepers)} has pulled {source!r}."
+        )
