@@ -684,7 +684,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.116.0" },
     { name = "httpx", specifier = ">=0.28.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.17.0" },
-    { name = "opensandbox", specifier = ">=0.1.15,<0.2.0" },
+    { name = "opensandbox", specifier = ">=1.1.1,<1.2.0" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.30.0" },
     { name = "opentelemetry-instrumentation-asyncpg", specifier = ">=0.51b0" },
     { name = "opentelemetry-instrumentation-fastapi", specifier = ">=0.51b0" },
@@ -764,6 +764,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/b1/df/48c586a5fe32a0f01324ee087459e112ebb7224f646c0b5023f5e79e9956/httpx-0.28.1.tar.gz", hash = "sha256:75e98c5f16b0f35b567856f597f06ff2270a374470a5c2392242528e3e3e42fc", size = 141406, upload-time = "2024-12-06T15:37:23.222Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/2a/39/e50c7c3a983047577ee07d2a9e53faf5a69493943ec3f6a384bdc792deb2/httpx-0.28.1-py3-none-any.whl", hash = "sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad", size = 73517, upload-time = "2024-12-06T15:37:21.509Z" },
+]
+
+[[package]]
+name = "httpx-sse"
+version = "0.4.3"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0f/4c/751061ffa58615a32c31b2d82e8482be8dd4a89154f003147acee90f2be9/httpx_sse-0.4.3.tar.gz", hash = "sha256:9b1ed0127459a66014aec3c56bebd93da3c1bc8bb6618c8082039a44889a755d", size = 15943, upload-time = "2025-10-10T21:48:22.271Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d2/fd/6668e5aec43ab844de6fc74927e155a3b37bf40d7c3790e49fc0406b6578/httpx_sse-0.4.3-py3-none-any.whl", hash = "sha256:0ac1c9fe3c0afad2e0ebb25a934a59f4c7823b60792691f779fad2c5568830fc", size = 8960, upload-time = "2025-10-10T21:48:21.158Z" },
 ]
 
 [[package]]
@@ -902,17 +911,20 @@ wheels = [
 
 [[package]]
 name = "opensandbox"
-version = "0.1.15"
+version = "1.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "attrs" },
+    { name = "httpcore" },
     { name = "httpx" },
+    { name = "httpx-sse" },
+    { name = "opentelemetry-api" },
     { name = "pydantic" },
     { name = "python-dateutil" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/43/21/654a3d69815b09690e926d553f3f4a178640d1206000a1b49f5e22c8eb68/opensandbox-0.1.15.tar.gz", hash = "sha256:017abc9b399b88da51bf077d6fb94ee89b1783e601495e85ba85fed478fed1b0", size = 228729, upload-time = "2026-07-24T09:36:29.988Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/77/36/79ff65e79725e10dd540af000e9148bc26428d0494bb954f406e5da79c74/opensandbox-1.1.1.tar.gz", hash = "sha256:2c62b338ed30c99d37fe88116f9e82f08e8e5c9ec8574dfef38d1ea5801f4b5e", size = 299154, upload-time = "2026-10-09T14:34:36.335Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d5/5c/ab87ea696531210790feb8f575471036fccba29dedaff201736f15bbb3a7/opensandbox-0.1.15-py3-none-any.whl", hash = "sha256:992b01490551f4d8e3f99caa25e34cb9d1690f0c5027eeebab912738291957d1", size = 538522, upload-time = "2026-07-24T09:36:28.277Z" },
+    { url = "https://files.pythonhosted.org/packages/48/38/c18410a5466904ff9beef867e51d177e7f9a3240413f4412fb126481aee1/opensandbox-1.1.1-py3-none-any.whl", hash = "sha256:98eb0d7b57fdeabbbb5202d5e3a5261741f68fe47a631f0ec483b1566eb5fef8", size = 668271, upload-time = "2026-10-09T14:34:35.143Z" },
 ]
 
 [[package]]

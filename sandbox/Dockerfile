@@ -20,13 +20,17 @@ FROM debian:bookworm-slim
 
 ENV HOME=/workspace
 
+# /tmp/.harborbox-keep keeps gVisor from mounting an in-memory tmpfs over an
+# empty /tmp, which cold pause cannot snapshot. See TMP_KEEP_FILE in
+# src/harborbox/templates.py.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 sandbox \
     && useradd --uid 10001 --gid 10001 --home-dir /workspace --no-create-home sandbox \
     && mkdir -p /workspace \
-    && chown 10001:10001 /workspace
+    && chown 10001:10001 /workspace \
+    && touch /tmp/.harborbox-keep
 
 WORKDIR /workspace
 USER 10001:10001

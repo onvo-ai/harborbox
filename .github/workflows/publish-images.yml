@@ -84,11 +84,13 @@ jobs:
         platform: [linux/amd64, linux/arm64]
         include:
           - platform: linux/amd64
-            runner: ubuntu-latest
+            # Our Coolify runners on build-server, which is x86_64.
+            runner: [self-hosted, coolify-ci]
           - platform: linux/arm64
             # A native arm64 runner. This is the whole point of the split:
-            # no QEMU anywhere in this workflow.
-            runner: ubuntu-24.04-arm
+            # no QEMU anywhere in this workflow. Our Coolify runners on
+            # build-server-arm (the former fleevo server).
+            runner: [self-hosted, coolify-ci-arm]
           - image: harborbox-api
             dockerfile: Dockerfile.api
           - image: harborbox-sandbox-base
@@ -154,7 +156,7 @@ jobs:
   merge:
     name: Merge and tag ${{ matrix.image }}
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, coolify-ci]
 
     strategy:
       fail-fast: false
@@ -219,6 +221,8 @@ jobs:
       - name: Create the multi-architecture manifest
         working-directory: /tmp/digests
         run: |
+          # The Coolify runner image is not GitHub's full runner image.
+          command -v jq >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq jq; }
           count="$(find . -type f | wc -l | tr -d ' ')"
           if [ "$count" -ne 2 ]; then
             echo "::error::Expected a digest from each of the two build jobs for ${{ matrix.image }}, found $count." \

@@ -7,8 +7,9 @@ commands, files, networking, snapshots, and isolation runtimes.
 
 The bundled Compose deployment is a single-host Docker configuration intended
 for internal and trusted workloads. Ordinary Docker containers share the host
-kernel. Use OpenSandbox's Kubernetes runtime with gVisor, Kata, or Firecracker
-before treating it as an isolation boundary for hostile public workloads.
+kernel. Turn on gVisor (see "Stronger isolation with gVisor" below), or use OpenSandbox's
+Kubernetes runtime with Kata or Firecracker, before treating it as an
+isolation boundary for hostile public workloads.
 
 ```text
 client -> Harborbox API -> PostgreSQL queue -> scheduler -> OpenSandbox -> runtime
@@ -511,9 +512,34 @@ reserves an additional 25% of the VM, with a 1 GiB minimum by default.
 
 Important settings are documented in `.env.example`.
 
-For a stronger isolation boundary, configure OpenSandbox's `[secure_runtime]`
-block for gVisor or Kata on Linux, or deploy its Kubernetes backend with an
-appropriate RuntimeClass.
+### Stronger isolation with gVisor
+
+For a stronger isolation boundary, run sandboxes under gVisor. Each sandbox
+then talks to gVisor's user-space kernel instead of the host's, so escaping a
+container means breaking gVisor first. It needs no KVM, so it works on
+ordinary cloud VMs. On each Docker host:
+
+```bash
+sudo ./scripts/install-gvisor.sh
+```
+
+Then set `OPENSANDBOX_GVISOR=1` and restart the stack. Three things differ
+from plain Docker, and each is handled:
+
+- **runsc must run with `--overlay2=none`.** Its default keeps a sandbox's
+  writes where `docker commit` cannot see them, so cold pause would snapshot
+  nothing. The install script sets the flag.
+- **An empty `/tmp` gets an in-memory tmpfs** that cold pause cannot
+  snapshot. Every template ends with a layer that puts a file in `/tmp`, which
+  stops it. Templates built before that layer existed keep their old image
+  until rebuilt: rebuild them before turning gVisor on.
+- **An OOM kills the whole sandbox, not just the process.** Harborbox watches
+  the sandbox while a command runs and fails the execution with
+  `MemoryLimitExceeded` within seconds.
+
+Many-small-files workloads run about 1.7x slower under gVisor; CPU-bound and
+large-file work is unchanged. Kata, Firecracker, or OpenSandbox's Kubernetes
+backend with an appropriate RuntimeClass are the alternatives that need KVM.
 
 ## Running on more than one machine
 
@@ -679,6 +705,128 @@ environment and exit code — and absent, the script simply runs normally.
 Harborbox no longer ships it: a product that wants the fast Python path
 installs it in its own Dockerfile, which is the same move as owning the rest
 of the image.
+
+## How changes reach staging and production
+
+`main` is where work lands. `production` is what runs. Merging to `main`
+deploys nothing; promoting is one git push. This has been in effect since
+2026-10-23 (DEV-2609). Before that, every push to `main` deployed production
+at once, which is how the OpenSandbox 1.1.1 upgrade (#46) reached production
+with no staging step.
+
+### What runs where
+
+Two Coolify applications on the infrastructure host (`91.99.169.190`) run
+Harborbox. Both build from the protected `production` branch and redeploy
+whenever it moves:
+
+| Application | UUID | Compose file |
+|---|---|---|
+| `harborbox` | `u95r9dynmb7i2kn945n61qiq` | `/compose.internal-tools.yaml` |
+| `harborbox-builder` | `l4fzsorn4q21t6qsqs3hpw3q` | `/compose.builder.yaml` |
+
+`production` blocks force pushes and deletion, for admins too, so it only
+moves forward and its history is the deploy log.
+
+There is no staging Harborbox. `harborbox-next` is not a separate application:
+it is the alias the `harborbox` application's API takes on the Trigger stack's
+network, set through `HARBORBOX_NETWORK_ALIAS`. It dates from the parallel
+deploy that ran beside the original hand-run stack, which no longer exists.
+Onvo's `services/trigger/trigger.config.ts` sends Trigger staging to
+`http://harborbox-next:8000` and Trigger production to `http://harborbox:8000`,
+unless `TRIGGER_HARBORBOX_URL` overrides both. Infisical prod sets
+`TRIGGER_HARBORBOX_URL=http://harborbox-next:8000`, so Onvo staging **and**
+production both run against this one application.
+
+Nothing answers to plain `harborbox` on that network. Onvo production works
+only because of that override. Do not remove `TRIGGER_HARBORBOX_URL` without
+first giving this application the `harborbox` alias. To check which container
+holds an alias:
+
+```bash
+docker network inspect nj9nsajrgcu76alcj6c1sq87 \
+  --format '{{range .Containers}}{{.Name}} {{end}}'
+docker inspect <container> \
+  --format '{{json .NetworkSettings.Networks.nj9nsajrgcu76alcj6c1sq87.Aliases}}'
+```
+
+### Promoting a change
+
+1. **Merge to `main`.** CI must be green: `Unit tests` and `E2E (Compose)` in
+   `.github/workflows/ci.yml`. The E2E job brings the real stack up on the CI
+   host. Until a staging stack exists (below), it is the only check that runs
+   before production.
+2. **Promote a specific commit.** Fast-forward `production` to the commit you
+   checked, not to whatever `main` is by then:
+
+   ```bash
+   git fetch origin
+   git log --oneline origin/production..<sha>   # exactly what will ship
+   git push origin <sha>:refs/heads/production
+   ```
+
+   A plain push refuses anything that is not a fast-forward, and the branch
+   protection refuses `--force`. Coolify's push webhook then deploys both
+   applications from that commit.
+3. **Verify production.** `curl -sS https://harborbox.onvo.ai/health` must
+   return 200, and a real sandbox must run code. The `harborbox-checkup` probe
+   does both, and so does the `Harborbox sandbox execution` Uptime Kuma push
+   monitor. A healthy `/health` alone has been wrong before.
+4. **Roll back by going forward.** Revert the change on `main`, wait for green
+   CI, and promote the revert. In an emergency, redeploy an earlier deployment
+   from the Coolify UI, then make `production` match it the same way.
+
+The API and the builder share a protocol: the buildkitd config, the
+mutual-TLS certificates and the `harborbox-build` network. Keep both
+applications on the same branch so one promotion moves both.
+
+### How the gate was set up (2026-10-23)
+
+1. `production` was created at `67a866b`, the commit production was running,
+   and protected against force pushes and deletion.
+2. Both applications' Git branch was changed from `main` to `production`
+   (`git_branch` on `PATCH /api/v1/applications/{uuid}`), with automatic
+   deploys left on and no redeploy.
+3. The `harborbox` application's stale description was replaced.
+4. The gate was confirmed by merging a docs-only change to `main` and checking
+   that neither application started a deployment.
+
+### Later: a real staging stack
+
+Onvo staging already expects `http://harborbox-next:8000`, so the natural next
+step is a third application, `harborbox-staging`, tracking `main` and taking
+the `harborbox-next` alias. Production would then take the `harborbox` alias.
+Do not swap the aliases while two containers could hold the same one: Docker
+DNS round-robins between them.
+
+A second copy of `compose.internal-tools.yaml` on the same host is not a
+settings change today. These are the collisions to solve first:
+
+- **Traefik.** None. The `/health` route is a Coolify domain on the
+  application, not a label in this file, so a second application gets its own
+  router only if it is given a domain.
+- **The build network.** `harborbox-build` is spelled literally, and each
+  stack's registry joins it as `registry`. Docker DNS would then split
+  `registry:5000` between the two stacks, so BuildKit could push a staging
+  template into the production registry. Staging needs its own build network
+  and builder, or a distinct registry name with its own entry in the buildkitd
+  config.
+- **Host ports.** `HARBORBOX_REGISTRY_PORT` (default `5050`) must differ. The
+  OpenSandbox port range `20000`–`25000` is literal in `opensandbox-config`,
+  so two OpenSandbox servers would allocate host ports from the same range.
+- **The sandbox network.** `HARBORBOX_SANDBOX_NETWORK` must name a separate
+  network, created once with `docker network create --internal <name>`.
+- **The docker socket.** Both OpenSandbox servers would hold it. Staging can
+  then see and stop production's sandbox containers. Whether either server
+  cleans up containers it does not recognise has not been checked.
+- **Memory.** This host has about 6 GB to share, and production's budget is
+  about 3.6 GB. Each API measures capacity from `/proc/meminfo` and knows
+  nothing about the other's reservations. Staging would need a small, fixed
+  budget: no warm pool, one execution at a time, and `HARBORBOX_TOTAL_MEMORY_MB`
+  set.
+- **Monitoring.** Onvo's staging heartbeat skips its sandbox run because staging
+  has no `KUMA_PUSH_URL_HARBORBOX`, so it reports success without testing
+  anything. A staging stack needs its own push monitor.
 
 ## Development
 

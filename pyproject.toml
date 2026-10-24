@@ -10,7 +10,7 @@ dependencies = [
   "cryptography>=45.0.0",
   "fastapi>=0.116.0",
   "httpx>=0.28.0",
-  "opensandbox>=0.1.15,<0.2.0",
+  "opensandbox>=1.1.1,<1.2.0",
   # Telemetry. Not optional extras: an observability stack that a deployment
   # can forget to install is one that reports a clean zero forever, which is
   # exactly the failure DEV-1948 was filed for. The exporter is HTTP/proto to
