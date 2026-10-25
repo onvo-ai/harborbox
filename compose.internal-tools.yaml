@@ -619,28 +619,42 @@ services:
     # prefix off. Coolify makes a PathPrefix(`/health`) router and sets
     # traefik.docker.network itself. The API has no other route under /health,
     # so nothing else is reachable. Do not give that domain a shorter path:
-    # this API holds the docker socket, and /v1/sandboxes would then be one
-    # guessed HARBORBOX_API_KEY away from arbitrary code execution on this host.
+    # /v1/sandboxes runs whatever code it is sent, so a public /v1 is one
+    # guessed HARBORBOX_API_KEY away from arbitrary code execution here.
     #
-    # There is deliberately no second router here. A `harborbox-api` router
-    # once published /v1 at harborbox-api.onvo.ai for Onvo Lite, back when
-    # Lite ran its Python from onvo-production and could not reach the
-    # internal http://harborbox:8000. Lite's sandbox calls now run as
-    # Trigger.dev tasks on this host, where apps/lite/trigger.config.ts sets
+    # The one exception is the `harborbox-toolspoke` router below, for
+    # Toolspoke's sandbox connectors. Toolspoke runs on toolspoke-gakumi, which
+    # is in a different Hetzner project from this host, so it cannot join the
+    # `openclaw` private network the old 10.0.0.4 forwarder listened on. The
+    # route carries three separate controls, and it needs all three:
+    #   - harborbox-toolspoke.onvo.ai is a DNS-only (grey-cloud) record, so
+    #     Traefik sees the caller's real address rather than Cloudflare's.
+    #     Proxying it through Cloudflare would make the allowlist useless.
+    #   - an ipAllowList pinned to toolspoke-gakumi's public IPv4.
+    #   - PathPrefix(`/v1`), so /openapi.json and /docs stay unroutable.
+    # If Toolspoke moves server, change the allowlist in the same change.
+    #
+    # Router, middleware and service names are explicit because Coolify
+    # generates its own `http-0-<uuid>` routers and passes label values through
+    # without substituting variables. A second application deploying this file
+    # on the same host would collide on these names. traefik.enable and
+    # traefik.docker.network come from Coolify, because the /health domain
+    # above is set; remove that domain and this router goes with it.
+    #
+    # Onvo Lite does not use this route. Its sandbox calls run as Trigger.dev
+    # tasks on this host, where apps/lite/trigger.config.ts sets
     # HARBORBOX_URL=http://harborbox-next:8000 -- a Docker alias on the
-    # Trigger stack's private network. Nothing has needed the public route
-    # since, and its DNS record no longer exists (harborbox-api.onvo.ai is
-    # NXDOMAIN), so the router was matching a hostname that cannot arrive.
-    #
-    # Do not re-add it to give something off-host access to /v1 without
-    # reading the warning above first. This API holds the docker socket, so
-    # a reachable /v1 is an arbitrary-code-execution surface. The removed
-    # router only survived review because it carried three separate
-    # controls: a DNS-only (grey-cloud) hostname, so Traefik saw real
-    # source addresses rather than Cloudflare's; an ipAllowList pinned to
-    # the Lite hosts; and PathPrefix(`/v1`), keeping /openapi.json and
-    # /docs unroutable. Joining the caller to a Docker network is cheaper
-    # and safer than reproducing all three.
+    # Trigger stack's private network. Joining a caller to a Docker network is
+    # still cheaper and safer than another route like this one.
+    labels:
+      - traefik.http.routers.harborbox-toolspoke.rule=Host(`harborbox-toolspoke.onvo.ai`) && PathPrefix(`/v1`)
+      - traefik.http.routers.harborbox-toolspoke.entryPoints=https
+      - traefik.http.routers.harborbox-toolspoke.tls=true
+      - traefik.http.routers.harborbox-toolspoke.tls.certresolver=letsencrypt
+      - traefik.http.routers.harborbox-toolspoke.middlewares=harborbox-toolspoke-allow
+      - traefik.http.routers.harborbox-toolspoke.service=harborbox-toolspoke
+      - traefik.http.middlewares.harborbox-toolspoke-allow.ipallowlist.sourcerange=116.203.66.157/32
+      - traefik.http.services.harborbox-toolspoke.loadbalancer.server.port=8000
     networks:
       # Each entry carries an alias deliberately. Coolify's compose rewriter
       # drops service network entries whose value is null, which silently left

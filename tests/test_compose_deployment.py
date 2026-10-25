@@ -388,6 +388,30 @@ def test_the_api_does_not_hold_the_docker_socket(compose: dict) -> None:
     assert not [volume for volume in volumes if "docker.sock" in resolve(volume)]
 
 
+def test_every_public_api_route_keeps_its_controls(compose: dict) -> None:
+    """A router on the API is a route to code execution, so each one is pinned.
+
+    Coolify's /health domain lives in Coolify, not in this file. The only router
+    written here is Toolspoke's, and it is safe only while it keeps all three
+    controls: its own hostname, an allowlist of exact addresses, and /v1 alone.
+    Losing any one of them -- PathPrefix(`/`), a /16 allowlist, a dropped
+    middleware -- would still route, so nothing else would notice.
+    """
+    labels = compose["services"]["api"].get("labels") or []
+    labels = dict(label.split("=", 1) for label in labels)
+    routers = {key.split(".")[3] for key in labels if key.startswith("traefik.http.routers.")}
+
+    assert routers == {"harborbox-toolspoke"}
+    router = "traefik.http.routers.harborbox-toolspoke"
+    assert labels[f"{router}.rule"] == "Host(`harborbox-toolspoke.onvo.ai`) && PathPrefix(`/v1`)"
+    assert labels[f"{router}.entryPoints"] == "https"
+    allow = labels[f"{router}.middlewares"]
+    assert allow == "harborbox-toolspoke-allow"
+    ranges = labels[f"traefik.http.middlewares.{allow}.ipallowlist.sourcerange"].split(",")
+    assert ranges
+    assert all(r.endswith("/32") for r in ranges)
+
+
 def test_the_builder_holds_no_docker_socket_either(builder_compose: dict) -> None:
     """A builder with the socket would be the same hole wearing a different hat."""
     builder = builder_compose["services"]["builder"]
