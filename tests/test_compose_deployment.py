@@ -403,14 +403,13 @@ def test_every_public_api_route_keeps_its_controls(compose: dict) -> None:
 
     assert routers == {"harborbox-toolspoke"}
     router = "traefik.http.routers.harborbox-toolspoke"
-    assert labels[f"{router}.rule"] == (
-        "Host(`harborbox-toolspoke.onvo.ai`) && PathPrefix(`/v1`)"
-    )
+    assert labels[f"{router}.rule"] == "Host(`harborbox-toolspoke.onvo.ai`) && PathPrefix(`/v1`)"
     assert labels[f"{router}.entryPoints"] == "https"
     allow = labels[f"{router}.middlewares"]
     assert allow == "harborbox-toolspoke-allow"
     ranges = labels[f"traefik.http.middlewares.{allow}.ipallowlist.sourcerange"].split(",")
-    assert ranges and all(r.endswith("/32") for r in ranges)
+    assert ranges
+    assert all(r.endswith("/32") for r in ranges)
 
 
 def test_the_builder_holds_no_docker_socket_either(builder_compose: dict) -> None:
