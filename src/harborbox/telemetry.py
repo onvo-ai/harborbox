@@ -38,12 +38,18 @@ appears in `platform.ingestion.data.services` (spans) and that a failed
 sandbox create lands in `errors.data.groups` (logs -- the failures that matter
 most happen in the scheduler's background loop, which no HTTP span covers).
 Metrics buy neither and are left for whoever has a question they answer.
+
+**Flushed by the lifespan, not `atexit`.** See `_flush_on_shutdown`: uvicorn
+kills its own process with the SIGTERM it was stopped by, so the SDK's exit
+hooks never run under `docker stop`. DEV-2618.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import TYPE_CHECKING
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Any
 
 from opentelemetry import trace
 from opentelemetry._logs import set_logger_provider
@@ -62,7 +68,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from harborbox import __version__
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import AsyncIterator, Mapping
 
     from fastapi import FastAPI
 
@@ -96,6 +102,13 @@ ENDPOINT_VARIABLES = (
     "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
     "OTEL_EXPORTER_OTLP_ENDPOINT",
 )
+
+# How long a stopping process waits for its last batches to leave. Docker
+# sends SIGKILL ten seconds after SIGTERM, and the scheduler and runtime shut
+# down inside that window first, so the flush gets what is left of it rather
+# than the SDK's own 30 s. A reachable ingester takes milliseconds; the bound
+# only matters when it is down, and then the batches were never going to land.
+SHUTDOWN_FLUSH_TIMEOUT_SECONDS = 5.0
 
 
 def export_is_configured(env: Mapping[str, str]) -> bool:
@@ -166,6 +179,66 @@ def _bridge_logging(provider: LoggerProvider) -> None:
     root.addHandler(LoggingHandler(level=logging.NOTSET, logger_provider=provider))
 
 
+def _flush_on_shutdown(
+    app: FastAPI, tracer_provider: TracerProvider, logger_provider: LoggerProvider
+) -> None:
+    """Export what is still queued when the app's lifespan ends.
+
+    Both providers register an `atexit` shutdown, and under `docker stop` it
+    never runs. Since 0.29 uvicorn finishes a graceful shutdown and then
+    re-raises the SIGTERM it caught with the default handler restored, so the
+    process dies of the signal and Python skips its exit hooks. Every redeploy
+    was dropping the last few seconds of spans and logs -- including the
+    scheduler's and runtime's own shutdown logs, which are the ones that say
+    why a stop went wrong. DEV-2618 found this by sending SIGTERM to an
+    instrumented uvicorn: exit 143, and nothing reached the collector even
+    with one answering 200.
+
+    The end of the lifespan is the last point uvicorn is guaranteed to reach,
+    and it comes after `api.lifespan`'s own teardown, so that teardown's logs
+    are in the flush. Wrapping the lifespan from here keeps `api.py` free of
+    telemetry, as the unit tests that import the app rely on.
+    """
+    inner = app.router.lifespan_context
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[Mapping[str, Any]]:
+        try:
+            async with inner(app) as state:
+                # `api.lifespan` yields no state; Starlette accepts `None` here
+                # and only the stub insists on a mapping.
+                yield state  # type: ignore[misc]
+        finally:
+            await _shutdown_providers(tracer_provider, logger_provider)
+
+    app.router.lifespan_context = lifespan
+
+
+async def _shutdown_providers(
+    tracer_provider: TracerProvider, logger_provider: LoggerProvider
+) -> None:
+    """Flush and close both providers without stalling the event loop.
+
+    Traces first, so a log about a failed span export is still accepted by the
+    log pipeline. The wait is bounded (`SHUTDOWN_FLUSH_TIMEOUT_SECONDS`); a
+    flush that overruns keeps going on its thread until the process ends.
+    """
+
+    def shutdown() -> None:
+        tracer_provider.shutdown()
+        logger_provider.shutdown()
+
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(shutdown), timeout=SHUTDOWN_FLUSH_TIMEOUT_SECONDS
+        )
+    except TimeoutError:
+        logger.warning(
+            "Telemetry flush did not finish within %.0fs; the last batches may be lost.",
+            SHUTDOWN_FLUSH_TIMEOUT_SECONDS,
+        )
+
+
 def instrument(app: FastAPI, settings: Settings, env: Mapping[str, str]) -> bool:
     """Wire this process up to the collector. Returns whether it did.
 
@@ -190,6 +263,7 @@ def instrument(app: FastAPI, settings: Settings, env: Mapping[str, str]) -> bool
     logger_provider.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter()))
     set_logger_provider(logger_provider)
     _bridge_logging(logger_provider)
+    _flush_on_shutdown(app, tracer_provider, logger_provider)
 
     # `/health` is deliberately *not* excluded, and it is the cheapest half of
     # the fix. Harborbox serves widget Python on demand; between one execution
