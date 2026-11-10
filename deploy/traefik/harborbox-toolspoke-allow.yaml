@@ -1,0 +1,23 @@
+# Traefik dynamic configuration: the IP allowlist for the `harborbox-toolspoke`
+# router in compose.internal-tools.yaml, which refers to it as
+# `harborbox-toolspoke-allow@file`.
+#
+# Install on the harborbox host (91.99.169.190), where coolify-proxy watches
+# this directory and loads changes without a restart:
+#
+#   scp deploy/traefik/harborbox-toolspoke-allow.yaml \
+#     root@91.99.169.190:/data/coolify/proxy/dynamic/
+#
+# Why it is here and not in the compose labels: Coolify attaches every
+# middleware defined in a service's labels to the routers it generates for that
+# service, which put this allowlist on the public /health route. See the comment
+# above the api service's labels.
+#
+# Only exact /32 addresses. If Toolspoke moves server, change this file and
+# reinstall it.
+http:
+  middlewares:
+    harborbox-toolspoke-allow:
+      ipAllowList:
+        sourceRange:
+          - 116.203.66.157/32
