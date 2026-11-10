@@ -30,6 +30,14 @@ from harborbox.schemas import SandboxCreate
 from harborbox.telemetry import SERVICE_NAME, export_is_configured, service_name_for
 
 COMPOSE = Path(__file__).resolve().parent.parent / "compose.internal-tools.yaml"
+# Traefik file-provider config installed by hand on the harborbox host. It holds
+# the Toolspoke allowlist, which cannot live in COMPOSE's labels (see below).
+TOOLSPOKE_ALLOWLIST = (
+    Path(__file__).resolve().parent.parent
+    / "deploy"
+    / "traefik"
+    / "harborbox-toolspoke-allow.yaml"
+)
 # The workflow that builds what COMPOSE pulls. Production servers do not build
 # images, so the images the deployed file needs come from here.
 IMAGES_WORKFLOW = (
@@ -406,10 +414,31 @@ def test_every_public_api_route_keeps_its_controls(compose: dict) -> None:
     assert labels[f"{router}.rule"] == "Host(`harborbox-toolspoke.onvo.ai`) && PathPrefix(`/v1`)"
     assert labels[f"{router}.entryPoints"] == "https"
     allow = labels[f"{router}.middlewares"]
-    assert allow == "harborbox-toolspoke-allow"
-    ranges = labels[f"traefik.http.middlewares.{allow}.ipallowlist.sourcerange"].split(",")
+    assert allow == "harborbox-toolspoke-allow@file"
+
+    dynamic = yaml.safe_load(TOOLSPOKE_ALLOWLIST.read_text())
+    middleware = dynamic["http"]["middlewares"][allow.removesuffix("@file")]
+    assert set(middleware) == {"ipAllowList"}
+    ranges = middleware["ipAllowList"]["sourceRange"]
     assert ranges
     assert all(r.endswith("/32") for r in ranges)
+
+
+def test_no_middleware_is_defined_on_a_service_coolify_publishes(compose: dict) -> None:
+    """Coolify attaches every middleware a service defines to its own routers.
+
+    fqdnLabelsForTraefik collects each `traefik.http.middlewares.<name>.*` label
+    on a service and adds <name> to the routers it generates for that service's
+    domains. Defining the Toolspoke allowlist on the api service therefore put it
+    on the public /health router as well, and every probe through Cloudflare got
+    403 from 2026-10-25 until it was moved to Traefik's file provider.
+
+    Middlewares a router here needs must come from `@file`, never from labels.
+    """
+    for name, service in compose["services"].items():
+        labels = service.get("labels") or []
+        defined = [label for label in labels if label.startswith("traefik.http.middlewares.")]
+        assert not defined, f"{name} defines middlewares Coolify will spread: {defined}"
 
 
 def test_the_builder_holds_no_docker_socket_either(builder_compose: dict) -> None:

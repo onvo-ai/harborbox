@@ -634,6 +634,22 @@ services:
     #   - PathPrefix(`/v1`), so /openapi.json and /docs stay unroutable.
     # If Toolspoke moves server, change the allowlist in the same change.
     #
+    # The allowlist is NOT defined in these labels, and must not be. Coolify
+    # collects every `traefik.http.middlewares.<name>.*` label on a service and
+    # attaches that middleware to the routers it generates for the service's
+    # domains (fqdnLabelsForTraefik in Coolify's bootstrap/helpers/docker.php).
+    # When the allowlist was defined here, Coolify put it on the public /health
+    # router too. harborbox.onvo.ai is behind Cloudflare, so Traefik saw only
+    # Cloudflare's addresses and answered every probe with 403, from
+    # 2026-10-25 until this change.
+    #
+    # So the middleware lives in Traefik's file provider instead:
+    # deploy/traefik/harborbox-toolspoke-allow.yaml, installed by hand at
+    # /data/coolify/proxy/dynamic/ on the host. The router refers to it as
+    # `harborbox-toolspoke-allow@file`. If that file is missing, Traefik
+    # refuses to build this router and the route returns 404. It fails closed;
+    # it never serves /v1 without the allowlist.
+    #
     # Router, middleware and service names are explicit because Coolify
     # generates its own `http-0-<uuid>` routers and passes label values through
     # without substituting variables. A second application deploying this file
@@ -651,9 +667,8 @@ services:
       - traefik.http.routers.harborbox-toolspoke.entryPoints=https
       - traefik.http.routers.harborbox-toolspoke.tls=true
       - traefik.http.routers.harborbox-toolspoke.tls.certresolver=letsencrypt
-      - traefik.http.routers.harborbox-toolspoke.middlewares=harborbox-toolspoke-allow
+      - traefik.http.routers.harborbox-toolspoke.middlewares=harborbox-toolspoke-allow@file
       - traefik.http.routers.harborbox-toolspoke.service=harborbox-toolspoke
-      - traefik.http.middlewares.harborbox-toolspoke-allow.ipallowlist.sourcerange=116.203.66.157/32
       - traefik.http.services.harborbox-toolspoke.loadbalancer.server.port=8000
     networks:
       # Each entry carries an alias deliberately. Coolify's compose rewriter
