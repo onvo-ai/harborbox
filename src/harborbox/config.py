@@ -179,6 +179,14 @@ class Settings(BaseSettings):
     registry_insecure: bool = True
     registry_timeout_seconds: float = Field(default=30.0, gt=0)
     sandbox_network: str = "harborbox-net"
+    # Read by nothing under the OpenSandbox runtime, which is the only runtime
+    # there is. It belonged to the direct-Docker provider, where a sandbox sat
+    # on an `internal: true` network and `egress: true` attached this second
+    # one. OpenSandbox starts every sandbox on its own `network_mode = "bridge"`
+    # (the `[docker]` block in the compose files), so every sandbox has
+    # outbound internet whatever this is set to and whatever `egress` the
+    # caller sent -- `tests/e2e_onvo_readiness.py` asserts exactly that. Kept
+    # so existing deployments' env vars still parse; it is not a control.
     sandbox_egress_network: str | None = None
     sandbox_runtime: str | None = None
 
@@ -194,7 +202,14 @@ class Settings(BaseSettings):
     default_sandbox_cpu: float = Field(default=1.0, gt=0)
     max_sandbox_cpu: float = Field(default=4.0, gt=0)
     max_parallel_cpu: float | None = Field(default=None, gt=0)
-    sandbox_pids_limit: int = Field(default=128, ge=16)
+    # What the API stores on the row and reports back as `pids_limit`. It does
+    # not set the limit: OpenSandbox applies the `pids_limit` in the `[docker]`
+    # block of its own config (compose.yaml, compose.internal-tools.yaml) to
+    # every container. Until 2026-11-12 this said 128 while OpenSandbox applied
+    # 4096, so the API reported a limit 32 times tighter than the real one.
+    # Both are 1024 now, and tests/test_compose_deployment.py fails if they
+    # ever disagree again. Change the two together.
+    sandbox_pids_limit: int = Field(default=1024, ge=16)
     sandbox_tmpfs_mb: int = Field(default=128, ge=16)
 
     # Reaper — reclaims sandboxes nothing will come back for. See reaper.py.
@@ -217,6 +232,25 @@ class Settings(BaseSettings):
     reaper_stuck_starting_after_seconds: int = Field(default=300, ge=30)
     # Long enough that a failure is still there when someone comes to look.
     reaper_failed_retention_hours: int = Field(default=24, ge=1)
+    # `pooled` / `pooling` rows are left over from the warm pool that lived in
+    # this table until 0.2.0 (see the comment in `create_sandbox`). Nothing
+    # creates them any more and nothing adopts them, but they are
+    # RESERVED_SANDBOX_STATES members. On 2026-11-12 production still had four
+    # from 2026-08-05 with no container behind them, each reserving 768 MB:
+    # 3,072 MB of a 10,686 MB budget, held for 99 days. An hour is far longer
+    # than the old pool ever took to warm a sandbox.
+    reaper_legacy_pooled_after_seconds: int = Field(default=3600, ge=60)
+    # A `paused_cold` sandbox keeps a filesystem snapshot until someone kills
+    # it. Nothing did: 205 such rows on 2026-11-12, 204 of them idle for more
+    # than 30 days. 0 disables. With the default `max_sandbox_lifetime_seconds`
+    # the lifetime sweep kills these first, at one day old; this is the
+    # backstop for a deployment that raises or disables that lifetime.
+    reaper_paused_cold_retention_days: int = Field(default=30, ge=0)
+    # How long a `killed` sandbox row and a finished execution row are kept
+    # for inspection before they are deleted. 0 disables. Production held
+    # 21,910 killed sandboxes and 123,373 executions (250 MB, 89,760 of them
+    # older than 30 days) on 2026-11-12 because nothing ever deleted either.
+    reaper_killed_retention_days: int = Field(default=30, ge=0)
 
     warm_pool_enabled: bool = True
     # Keyed by template name, so a `custom-<hash>` image a product built can be
@@ -275,6 +309,20 @@ class Settings(BaseSettings):
     default_execution_timeout_seconds: int = Field(default=30, ge=1)
     max_execution_timeout_seconds: int = Field(default=600, ge=1)
     default_idle_timeout_seconds: int = Field(default=300, ge=0)
+    # Ceiling on any sandbox's `idle_timeout_seconds`. A caller could ask for
+    # any value, and 0 meant "never suspend", so one request bought a sandbox
+    # that held its CPU and memory for as long as the caller liked. Requests
+    # above this, and 0, are clamped to it rather than refused (see
+    # `clamp_idle_timeout`). Production callers send 180 and 300.
+    max_idle_timeout_seconds: int = Field(default=3600, ge=1)
+    # The longest any sandbox may exist, measured from `created_at`. Native
+    # /v1 sandboxes had no maximum at all: in November 2026 a trial account
+    # kept a public shell (ttyd behind a tunnel) alive in one for an hour, and
+    # nothing would have stopped it at a week. Enforced by
+    # `Scheduler._terminate_expired_sandboxes`; activity does not extend it.
+    # One day matches `max_sandbox_timeout_seconds = 86400` in the OpenSandbox
+    # config and `warm_pool_acquired_timeout_seconds` below. 0 disables.
+    max_sandbox_lifetime_seconds: int = Field(default=86_400, ge=0)
 
     # The hot tier of the idle ladder. A sandbox idle for this long is frozen
     # (`paused_memory`) rather than snapshotted: CPU is released, the container
@@ -304,10 +352,19 @@ class Settings(BaseSettings):
     # `SERVER_LAZY_START_WAIT_TIMEOUT_SECONDS` in tests/live_client/client.py.
     lazy_start_wait_timeout_seconds: float = Field(default=60.0, gt=0)
     reaper_poll_seconds: float = Field(default=5.0, gt=0)
-    # How many started-but-unassigned sandboxes to keep ready. 0 disables the
-    # pool entirely, which is the old behaviour: every caller pays the container
-    # start. Each pooled sandbox holds its memory reservation but no CPU budget.
-    keep_completed_jobs_seconds: int = Field(default=86_400, ge=60)
+
+    def clamp_idle_timeout(self, requested: int) -> int:
+        """Bring a requested idle timeout under `max_idle_timeout_seconds`.
+
+        Clamped, not refused: a 422 would break an old client that still sends
+        a large value or 0, for no gain -- the caller cannot tell a sandbox
+        suspended at the cap from one suspended at the value it asked for
+        until it has been idle that long. 0 used to mean "never suspend",
+        which is the longest timeout there is, so it becomes the cap too.
+        """
+        if requested == 0 or requested > self.max_idle_timeout_seconds:
+            return self.max_idle_timeout_seconds
+        return requested
 
     @property
     def docker_kwargs(self) -> dict[str, str]:

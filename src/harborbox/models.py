@@ -35,10 +35,10 @@ class Sandbox(Base):
     memory_mb: Mapped[int] = mapped_column(Integer)
     cpu: Mapped[float] = mapped_column(Float)
     pids_limit: Mapped[int] = mapped_column(Integer)
-    # Whether this sandbox may reach the network at all. Off unless the caller
-    # asks: widget code is handed its data as files and needs none, so the
-    # default keeps "internet blocked" true for everything that does not
-    # explicitly opt out of it.
+    # What the caller asked for, recorded only. Under the OpenSandbox runtime
+    # nothing reads it: every sandbox runs on the bridge network with outbound
+    # internet, so `false` here does not mean "internet blocked". See
+    # `Settings.sandbox_egress_network`.
     egress: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )

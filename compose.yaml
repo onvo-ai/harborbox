@@ -117,7 +117,12 @@ configs:
       port_range_max = 32000
       drop_capabilities = ["AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG"]
       no_new_privileges = true
-      pids_limit = 4096
+      # The process limit OpenSandbox puts on every sandbox container. It
+      # must equal HARBORBOX_SANDBOX_PIDS_LIMIT (`Settings.sandbox_pids_limit`,
+      # default 1024), which is the number the API reports for a sandbox: this
+      # said 4096 while the API reported 128 until 2026-11-12.
+      # tests/test_compose_deployment.py pins the two together.
+      pids_limit = 1024
 
       [ingress]
       mode = "direct"
@@ -386,6 +391,9 @@ services:
       HARBORBOX_BASE_TEMPLATE_MEMORY_MB: ${HARBORBOX_BASE_TEMPLATE_MEMORY_MB:-512}
       HARBORBOX_BASE_TEMPLATE_CPU: ${HARBORBOX_BASE_TEMPLATE_CPU:-1.0}
       HARBORBOX_SANDBOX_NETWORK: harborbox-net
+      # Read by nothing under the OpenSandbox runtime. Sandboxes run on the
+      # bridge network (`network_mode = "bridge"` above) and have outbound
+      # internet whether or not a caller sends `egress: true`.
       HARBORBOX_SANDBOX_EGRESS_NETWORK: harborbox-egress
       HARBORBOX_SANDBOX_RUNTIME: ${HARBORBOX_SANDBOX_RUNTIME:-}
       HARBORBOX_HOST_MEMORY_RESERVE_PERCENT: ${HARBORBOX_HOST_MEMORY_RESERVE_PERCENT:-25}

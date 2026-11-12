@@ -33,6 +33,8 @@ _MAX_MEMORY_MB = 4_096
 _MAX_CPU = 4.0
 _POOLED_SANDBOXES = 3
 _DOCKER_ADDRESS = "tcp://docker-host:2375"
+_ONVO_IDLE_TIMEOUT = 180
+_IDLE_CAP = 600
 
 
 def make_settings(**overrides: object) -> Settings:
@@ -151,3 +153,44 @@ class TestWarmPoolBudgetValidation:
         assert settings.template_resources == {
             BASE_TEMPLATE: (_BASE_MEMORY_MB, _BASE_CPU)
         }
+
+
+class TestIdleTimeoutClamp:
+    """`clamp_idle_timeout` is the ceiling on how long an idle sandbox holds memory.
+
+    A caller used to be able to ask for any timeout, and 0 meant "never
+    suspend". The cap clamps rather than refuses, so an old client that still
+    sends a large value keeps working.
+    """
+
+    def test_a_value_under_the_cap_is_kept(self) -> None:
+        # 180 and 300 are what production callers send; neither may change.
+        settings = make_settings()
+
+        assert settings.clamp_idle_timeout(_ONVO_IDLE_TIMEOUT) == _ONVO_IDLE_TIMEOUT
+
+    def test_the_cap_itself_is_allowed(self) -> None:
+        settings = make_settings(max_idle_timeout_seconds=_IDLE_CAP)
+
+        assert settings.clamp_idle_timeout(_IDLE_CAP) == _IDLE_CAP
+
+    def test_a_value_over_the_cap_is_lowered_to_it(self) -> None:
+        settings = make_settings(max_idle_timeout_seconds=_IDLE_CAP)
+
+        assert settings.clamp_idle_timeout(_IDLE_CAP + 1) == _IDLE_CAP
+
+    def test_zero_no_longer_means_never_suspend(self) -> None:
+        """0 was the longest timeout there is, so it becomes the cap."""
+        settings = make_settings(max_idle_timeout_seconds=_IDLE_CAP)
+
+        assert settings.clamp_idle_timeout(0) == _IDLE_CAP
+
+
+def test_the_dead_completed_jobs_setting_is_gone() -> None:
+    """`keep_completed_jobs_seconds` was defined and read by nothing.
+
+    Retention is `reaper_killed_retention_days` now. A setting that parses but
+    does nothing invites someone to tune it and believe it worked.
+    """
+    assert "keep_completed_jobs_seconds" not in Settings.model_fields
+    assert "reaper_killed_retention_days" in Settings.model_fields

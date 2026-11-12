@@ -293,6 +293,105 @@ async def test_a_sandbox_cannot_be_sized_past_the_per_sandbox_ceiling(
     assert response.json()["detail"] == detail
 
 
+# --- the idle timeout cap and the maximum lifetime ----------------------------
+
+# One hour: `Settings.max_idle_timeout_seconds`' default.
+IDLE_CAP = 3600
+
+
+@pytest.mark.parametrize(
+    ("requested", "stored_value"),
+    [
+        # What production callers send. Neither may change.
+        (180, 180),
+        (300, 300),
+        # Over the cap: lowered to it, not refused, so an old client still works.
+        (86_400, IDLE_CAP),
+        # 0 meant "never suspend", the longest timeout there is.
+        (0, IDLE_CAP),
+    ],
+)
+async def test_a_created_sandbox_has_its_idle_timeout_clamped_to_the_cap(
+    client: httpx.AsyncClient, requested: int, stored_value: int
+) -> None:
+    response = await client.post(
+        "/v1/sandboxes",
+        json={"template": "base", "idle_timeout_seconds": requested},
+    )
+
+    assert response.status_code == HTTPStatus.CREATED
+    assert response.json()["idle_timeout_seconds"] == stored_value
+
+
+async def test_a_deployment_default_of_zero_is_clamped_as_well(
+    client: httpx.AsyncClient, settings: Settings
+) -> None:
+    """Otherwise the default hands every caller the sandbox the cap removes."""
+    settings.default_idle_timeout_seconds = 0
+
+    response = await client.post("/v1/sandboxes", json={"template": "base"})
+
+    assert response.json()["idle_timeout_seconds"] == IDLE_CAP
+
+
+@pytest.mark.parametrize(
+    ("requested", "stored_value"), [(180, 180), (86_400, IDLE_CAP), (0, IDLE_CAP)]
+)
+async def test_a_patched_idle_timeout_is_clamped_to_the_cap(
+    client: httpx.AsyncClient,
+    sessions: Sessions,
+    requested: int,
+    stored_value: int,
+) -> None:
+    """Without this the cap is one PATCH away from meaning nothing."""
+    await add(sessions, sandbox_row())
+
+    response = await client.patch(
+        "/v1/sandboxes/sbx-1", json={"idle_timeout_seconds": requested}
+    )
+
+    assert response.status_code == HTTPStatus.OK
+    assert response.json()["idle_timeout_seconds"] == stored_value
+    assert (await stored(sessions)).idle_timeout_seconds == stored_value
+
+
+async def test_a_new_sandbox_reports_the_configured_pids_limit(
+    client: httpx.AsyncClient, settings: Settings
+) -> None:
+    response = await client.post("/v1/sandboxes", json={"template": "base"})
+
+    assert response.json()["pids_limit"] == settings.sandbox_pids_limit
+
+
+async def test_a_command_on_an_over_age_sandbox_is_refused(
+    client: httpx.AsyncClient, sessions: Sessions, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Refused at the door, with the 409 a killed sandbox gives.
+
+    If new work were accepted, a caller could keep one execution always
+    running and the expiry sweep, which waits for the sandbox to be free,
+    would never get to kill it.
+    """
+    monkeypatch.setattr(app.state, "notifier", None, raising=False)
+    await add(
+        sessions,
+        sandbox_row(id="sbx-old", created_at=utc_now() - timedelta(days=2)),
+        sandbox_row(id="sbx-young"),
+    )
+
+    refused = await client.post("/v1/sandboxes/sbx-old/commands", json={"command": "true"})
+    accepted = await client.post(
+        "/v1/sandboxes/sbx-young/commands", json={"command": "true"}
+    )
+
+    assert refused.status_code == HTTPStatus.CONFLICT
+    assert refused.json()["detail"] == "sandbox has reached its maximum lifetime"
+    assert accepted.status_code == HTTPStatus.ACCEPTED
+    async with sessions() as session:
+        queued = (await session.scalars(select(Execution.sandbox_id))).all()
+    assert queued == ["sbx-young"]
+
+
 # --- reading sandboxes --------------------------------------------------------
 
 

@@ -48,12 +48,14 @@ from harborbox.presenters import execution_response
 from harborbox.reaper import reaper_loop
 from harborbox.scheduler import (
     ACTIVE_EXECUTION_STATES,
+    OVER_AGE_DETAIL,
     RESERVED_SANDBOX_STATES,
     TERMINAL_EXECUTION_STATES,
     Scheduler,
     has_sandbox_execution_slot,
     lazy_start_action,
     plan_pause,
+    sandbox_is_over_age,
 )
 from harborbox.schemas import (
     BuildContextResponse,
@@ -642,7 +644,10 @@ async def create_sandbox(
         memory_mb=memory_mb,
         cpu=cpu,
         pids_limit=settings.sandbox_pids_limit,
-        idle_timeout_seconds=(
+        # Clamped to `max_idle_timeout_seconds`, the deployment default
+        # included: a default of 0 would otherwise hand every caller the
+        # "never suspend" sandbox the cap exists to remove.
+        idle_timeout_seconds=settings.clamp_idle_timeout(
             body.idle_timeout_seconds
             if body.idle_timeout_seconds is not None
             else settings.default_idle_timeout_seconds
@@ -713,7 +718,11 @@ async def update_sandbox(
     if sandbox.status in {"created", "starting"}:
         sandbox = await ensure_ready(sandbox, request, session)
     if body.idle_timeout_seconds is not None:
-        sandbox.idle_timeout_seconds = body.idle_timeout_seconds
+        # Same clamp as create. Without it the cap is one PATCH away from
+        # meaning nothing.
+        sandbox.idle_timeout_seconds = settings_from(request).clamp_idle_timeout(
+            body.idle_timeout_seconds
+        )
     sandbox.last_activity_at = utc_now()
     await session.commit()
     await session.refresh(sandbox)
@@ -1154,6 +1163,16 @@ async def enqueue(
     sandbox = await get_sandbox_or_404(session, sandbox_id)
     if sandbox.status in {"killed", "failed"}:
         raise HTTPException(status_code=409, detail=f"sandbox is {sandbox.status}")
+    if sandbox_is_over_age(
+        sandbox.created_at,
+        now=utc_now(),
+        max_lifetime_seconds=settings.max_sandbox_lifetime_seconds,
+    ):
+        # Refused here as well as at admission (`_reject_ineligible`), so the
+        # caller gets the same 409 a killed sandbox gives instead of a 202 for
+        # an execution that can only fail. The sandbox is about to be killed:
+        # the expiry sweep takes it as soon as nothing is running in it.
+        raise HTTPException(status_code=409, detail=OVER_AGE_DETAIL)
     queue_depth = await session.scalar(
         select(func.count()).select_from(Execution).where(Execution.status == "queued")
     )
