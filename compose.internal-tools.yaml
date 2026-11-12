@@ -7,11 +7,16 @@
 #
 # Two deliberate differences from compose.yaml:
 #
-#   1. `HARBORBOX_SANDBOX_EGRESS_NETWORK` is empty, so sandboxes sit only on the
-#      `internal: true` network and have no route anywhere. Onvo's worker
-#      downloads datasource CSVs and passes them in as files, so widget code
-#      never needs to fetch anything. If that ever changes, the sandbox needs
-#      egress and this comment is the thing that was wrong.
+#   1. `HARBORBOX_SANDBOX_EGRESS_NETWORK` is empty. That does NOT cut sandboxes
+#      off from the network, although this comment said so until 2026-11-12.
+#      Sandboxes are started by OpenSandbox on `network_mode = "bridge"` (the
+#      `[docker]` block below), so every one of them has outbound internet.
+#      The setting and the per-sandbox `egress` flag belonged to the old
+#      direct-Docker provider and are read by nothing under the OpenSandbox
+#      runtime; tests/e2e_onvo_readiness.py asserts that a sandbox can open a
+#      connection to the internet. Onvo's worker still passes datasource CSVs
+#      in as files, so widget code has no need to fetch anything -- but nothing
+#      here stops it, and nothing stops any other caller's code either.
 #
 #   2. No published port. compose.yaml binds 127.0.0.1 for local development;
 #      here the API must not be reachable from the host at all.
@@ -113,8 +118,11 @@ configs:
         server builder builder:1234 resolvers docker init-addr libc,none
 
   # Mirrors compose.yaml's config, with two deliberate differences for this
-  # host: no egress section, because sandboxes here must reach nothing, and a
-  # narrower port range, since the Trigger stack shares these ephemeral ports.
+  # host: no `[egress]` section, and a narrower port range, since the Trigger
+  # stack shares these ephemeral ports. Leaving `[egress]` out does not block
+  # anything: that section configures OpenSandbox's optional egress sidecar,
+  # and without it sandboxes simply use the bridge network unfiltered, with
+  # full outbound internet.
   opensandbox-config:
     content: |
       [server]
@@ -175,7 +183,12 @@ configs:
       port_range_max = 25000
       drop_capabilities = ["AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG"]
       no_new_privileges = true
-      pids_limit = 4096
+      # The process limit OpenSandbox puts on every sandbox container. It
+      # must equal HARBORBOX_SANDBOX_PIDS_LIMIT (`Settings.sandbox_pids_limit`,
+      # default 1024), which is the number the API reports for a sandbox: this
+      # said 4096 while the API reported 128 until 2026-11-12.
+      # tests/test_compose_deployment.py pins the two together.
+      pids_limit = 1024
 
       [ingress]
       mode = "direct"
@@ -506,18 +519,15 @@ services:
       HARBORBOX_TEMPLATE_IMAGE_PREFIX: harborbox-sandbox
       HARBORBOX_TEMPLATE_VERSION: ${HARBORBOX_IMAGE_TAG:-local}
       HARBORBOX_SANDBOX_NETWORK: ${HARBORBOX_SANDBOX_NETWORK:-harborbox-net}
-      # Empty, matching the header: sandboxes sit only on the `internal: true`
-      # network and have no route anywhere.
+      # Empty, and it makes no difference what this is: nothing reads it under
+      # the OpenSandbox runtime. It named the network the old direct-Docker
+      # provider attached when a caller sent `egress: true` (`_connect_egress`,
+      # which no longer exists). Sandboxes now run on OpenSandbox's bridge
+      # network and have outbound internet, whatever `egress` the caller sent.
+      # See the header. Kept so a host that still sets the variable parses.
       #
-      # This named `harborbox-egress` until 2026-08-05, and that network has
-      # never existed on this host — `_connect_egress` does `networks.get(name)`
-      # only after a caller opts in, so the first request to ask for egress
-      # would have died on a Docker NotFound rather than being cleanly told no.
-      # Empty takes the `if not network_name: return` path instead.
-      #
-      # To actually offer egress here, declare the network below and set this;
-      # it is opt-in per sandbox (SandboxCreate.egress, default false), so
-      # widget code is unaffected either way.
+      # Blocking sandbox egress for real is a networking change (an OpenSandbox
+      # `[egress]` policy, or a bridge with no route out), not this setting.
       HARBORBOX_SANDBOX_EGRESS_NETWORK: ${HARBORBOX_SANDBOX_EGRESS_NETWORK:-}
       HARBORBOX_DEFAULT_SANDBOX_MEMORY_MB: ${HARBORBOX_ONVO_SANDBOX_MEMORY_MB:-768}
       HARBORBOX_DEFAULT_SANDBOX_CPU: ${HARBORBOX_ONVO_SANDBOX_CPU:-1}

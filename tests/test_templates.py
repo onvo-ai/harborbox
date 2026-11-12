@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from harborbox.api import static_template_response
 from harborbox.config import Settings
 from harborbox.models import SandboxTemplate
 from harborbox.schemas import SandboxCreate
@@ -417,3 +418,15 @@ def test_a_derived_image_tag_carries_its_conformance_version() -> None:
     )
     # A static template's image is configuration; the layer version is moot.
     assert settings.image_for_template("base", "0f99898f") == settings.base_image
+
+
+def test_a_static_template_left_out_of_the_warm_pool_reports_no_pool() -> None:
+    """A warm pool that names only a custom template must not break the listing.
+
+    `GET /v1/templates` builds one response per static template. Indexing the
+    pool sizes by name raised `KeyError: 'base'` in production on 2026-11-12,
+    when the pool was pointed at the custom template products actually use.
+    """
+    settings = Settings(warm_pool={"custom-39c01bbdfac9": 4})
+
+    assert static_template_response(settings, "base").warm_pool == 0

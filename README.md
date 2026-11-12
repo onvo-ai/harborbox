@@ -481,7 +481,15 @@ afterwards, while anything genuinely finished still goes cold on the same
 memory reservation, the tier is capped by `HARBORBOX_HOT_PAUSE_BUDGET_MB`;
 past the cap, sandboxes go straight to cold. Set
 `HARBORBOX_HOT_PAUSE_IDLE_SECONDS=0` to disable the tier entirely and restore
-the previous behavior. `idle_timeout_seconds: 0` still means "never suspend".
+the previous behavior.
+
+`idle_timeout_seconds` is capped by `HARBORBOX_MAX_IDLE_TIMEOUT_SECONDS`
+(default 3600). On create and on `PATCH`, a larger value, or `0` (which used
+to mean "never suspend"), is clamped to the cap rather than refused. A sandbox
+is also killed once it is older than `HARBORBOX_MAX_SANDBOX_LIFETIME_SECONDS`
+(default 86400, `0` disables), whatever its state: a running execution is
+allowed to finish, new ones are refused with `SandboxUnavailable`, and a
+`paused_cold` snapshot older than the lifetime is deleted with its sandbox.
 
 What the tier is worth, measured by `tests/e2e_pause_ladder.py` against a live
 stack at 256 MB / 0.5 cpu:

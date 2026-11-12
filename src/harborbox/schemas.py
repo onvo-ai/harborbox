@@ -42,10 +42,11 @@ class SandboxCreate(BaseModel):
     cpu: float | None = Field(default=None, gt=0)
     idle_timeout_seconds: int | None = Field(default=None, ge=0)
     metadata: dict[str, str] = Field(default_factory=dict)
-    # Opt-in. A sandbox with egress can reach whatever the egress network can,
-    # so it is only appropriate for code that must talk to something - a
-    # customer database, a third-party API - and never for code that was handed
-    # its data as files.
+    # Accepted and stored, but NOT enforced under the OpenSandbox runtime.
+    # It was the opt-in for the direct-Docker provider's egress network. Today
+    # every sandbox runs on OpenSandbox's bridge network and has outbound
+    # internet whether this is true or false, so `false` does not mean
+    # "internet blocked". Kept so existing clients' requests still validate.
     egress: bool = False
 
 

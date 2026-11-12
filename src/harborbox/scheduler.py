@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Literal
 
 from sqlalchemy import func, select, update
@@ -27,7 +28,6 @@ from harborbox.schemas import (
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
-    from datetime import datetime
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -76,12 +76,23 @@ ERROR_NAME_SANDBOX_STARTING = "SandboxStarting"
 
 TERMINAL_EXECUTION_STATES = ("succeeded", "failed", "cancelled")
 
+# What a caller is told when a sandbox has outlived
+# `max_sandbox_lifetime_seconds`: the `value` beside
+# ERROR_NAME_SANDBOX_UNAVAILABLE on a rejected execution, and the detail of
+# the 409 `enqueue` returns. One constant so the two paths cannot drift.
+OVER_AGE_DETAIL = "sandbox has reached its maximum lifetime"
+
 # Ceiling on a failing reaper stage's own backoff (see `_run_reaper_stage`),
 # on top of the ordinary `reaper_poll_seconds` cadence. Five minutes: long
 # enough that a stage stuck behind something slow (the DB pool, OpenSandbox)
 # stops adding to that pressure every few seconds, short enough that a fixed
 # operator is felt within one checkup cycle rather than needing a restart.
 REAPER_STAGE_BACKOFF_CAP_SECONDS = 300.0
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Read a naive timestamp as UTC, which is what every stored one is."""
+    return value if value.tzinfo else value.replace(tzinfo=UTC)
 
 
 def lazy_start_action(status: str) -> Literal["ready", "start", "unavailable"]:
@@ -157,27 +168,65 @@ class _ScanState:
     active_counts: dict[str, int] = field(default_factory=dict)
 
 
-def _reject_ineligible(execution: Execution, sandbox: Sandbox, now: datetime) -> bool:
+def sandbox_is_over_age(
+    created_at: datetime, *, now: datetime, max_lifetime_seconds: int
+) -> bool:
+    """Whether a sandbox has outlived `max_sandbox_lifetime_seconds`.
+
+    Measured from `created_at` and nothing else. `last_activity_at` would be
+    the wrong clock: the abuse this exists for (a trial account holding a
+    public shell open, November 2026) is a sandbox that is busy the whole
+    time, so any limit that activity can push back is no limit.
+
+    0 disables the limit. The column can come back naive (SQLite does that;
+    PostgreSQL does not), so both sides are compared as UTC.
+    """
+    if max_lifetime_seconds <= 0:
+        return False
+    age = _as_utc(now) - _as_utc(created_at)
+    return age.total_seconds() >= max_lifetime_seconds
+
+
+def _reject_ineligible(
+    execution: Execution,
+    sandbox: Sandbox,
+    now: datetime,
+    *,
+    max_lifetime_seconds: int = 0,
+) -> bool:
     """Resolve `execution` in place if it should never be admitted.
 
     Split out of `_admit_available_jobs`'s scan loop to keep that loop's
     branch count under the complexity threshold. Returns True if the
     execution was resolved here (the caller should skip it).
+
+    An over-age sandbox is refused here as well as killed by the expiry sweep,
+    and the two need each other. The sweep leaves a sandbox alone while an
+    execution is active in it, so that work is not cut off mid-run. Without
+    this refusal a caller could queue the next execution behind the current
+    one, forever, and the sweep would never find the sandbox idle.
     """
     if execution.cancel_requested:
         execution.status = "cancelled"
         execution.finished_at = now
         return True
+    reason: str | None = None
     if sandbox.status in {"killed", "failed"}:
-        execution.status = "failed"
-        execution.finished_at = now
-        execution.error = {
-            "name": ERROR_NAME_SANDBOX_UNAVAILABLE,
-            "value": f"sandbox is {sandbox.status}",
-            "traceback": [],
-        }
-        return True
-    return False
+        reason = f"sandbox is {sandbox.status}"
+    elif sandbox_is_over_age(
+        sandbox.created_at, now=now, max_lifetime_seconds=max_lifetime_seconds
+    ):
+        reason = OVER_AGE_DETAIL
+    if reason is None:
+        return False
+    execution.status = "failed"
+    execution.finished_at = now
+    execution.error = {
+        "name": ERROR_NAME_SANDBOX_UNAVAILABLE,
+        "value": reason,
+        "traceback": [],
+    }
+    return True
 
 
 @dataclass(frozen=True)
@@ -280,7 +329,9 @@ def plan_suspensions(
     speed up a resume that may never come, so those go straight to cold.
 
     `idle_timeout_seconds == 0` still means "never suspend this sandbox", at
-    either tier.
+    either tier -- but only for a row written before the API started clamping
+    it. Create and PATCH now turn 0 into `max_idle_timeout_seconds`, so no new
+    row carries it, and `max_sandbox_lifetime_seconds` ends the old ones.
     """
     freeze: list[str] = []
     cool: list[str] = []
@@ -505,7 +556,12 @@ class Scheduler:
             rejected_ids: list[str] = []
             for index, execution in enumerate(queued):
                 sandbox = execution.sandbox
-                if _reject_ineligible(execution, sandbox, now):
+                if _reject_ineligible(
+                    execution,
+                    sandbox,
+                    now,
+                    max_lifetime_seconds=self.settings.max_sandbox_lifetime_seconds,
+                ):
                     rejected_ids.append(execution.id)
                     continue
                 active_count = state.active_counts.get(sandbox.id, 0)
@@ -1048,6 +1104,35 @@ class Scheduler:
         await self.template_builder.collect_unused_templates()
 
     async def _terminate_expired_sandboxes(self) -> None:
+        """Kill every sandbox whose time is up, by either of two clocks.
+
+        The first is the OpenSandbox-compatible `expires_at` a caller sets and
+        may renew. The second is `max_sandbox_lifetime_seconds`, which no
+        caller can move: native /v1 sandboxes carry no `expires_at` at all, so
+        before it they had no maximum lifetime (the November 2026 trial-account
+        shell lived in one). Both end in the same kill.
+
+        A sandbox with an active execution is not selected, so nothing is cut
+        off mid-run; `_reject_ineligible` stops new work being admitted to an
+        over-age sandbox, so it does go idle and is killed on a later pass.
+
+        The lifetime covers every state that is not already terminal,
+        `paused_cold` included, so a snapshot older than the lifetime is
+        deleted with its sandbox. Exempting `paused_cold` would only move the
+        loss: the sandbox would be killed seconds after its next resume.
+
+        The warm pool is not affected. Idle pool sandboxes are not `Sandbox`
+        rows: OpenSandbox's pool manager owns them and tracks them in
+        `warm_pool_idle_sandboxes` (see `warm_pool.py`), with their own
+        `warm_pool_idle_ttl_seconds`. A pooled sandbox becomes a row here only
+        when `create_sandbox` makes one and a start acquires a container for
+        it, so the lifetime runs from the caller's create, not from the warmup.
+
+        One sandbox whose kill fails does not stop the rest. The first error is
+        re-raised after the loop so `_run_reaper_stage` still logs it and backs
+        off. That matters most on the first deploy with the lifetime on, when
+        this pass meets every sandbox older than a day at once.
+        """
         now = utc_now()
         async with session_factory() as session:
             sandboxes = list(
@@ -1064,11 +1149,31 @@ class Scheduler:
                     )
                 ).all()
             )
+        first_error: Exception | None = None
         for sandbox in sandboxes:
             expires_at = expiration(sandbox)
-            if expires_at is None or expires_at > now:
+            expired = expires_at is not None and expires_at <= _as_utc(now)
+            over_age = sandbox_is_over_age(
+                sandbox.created_at,
+                now=now,
+                max_lifetime_seconds=self.settings.max_sandbox_lifetime_seconds,
+            )
+            if not expired and not over_age:
                 continue
-            await self.runtime.kill(sandbox)
+            try:
+                await self.runtime.kill(sandbox)
+            except Exception as exc:  # noqa: BLE001 - re-raised after the loop
+                logger.warning(
+                    "could not kill expired sandbox",
+                    extra={"sandbox_id": sandbox.id, "reason": str(exc)},
+                )
+                first_error = first_error or exc
+                continue
+            if over_age and not expired:
+                logger.info(
+                    "killed sandbox at its maximum lifetime",
+                    extra={"sandbox_id": sandbox.id, "status": sandbox.status},
+                )
             async with session_factory() as session:
                 current = await session.get(Sandbox, sandbox.id)
                 if current is not None and current.status not in {"killed", "failed"}:
@@ -1077,6 +1182,8 @@ class Scheduler:
                     current.container_name = None
                     current.metadata_ = dict(sandbox.metadata_)
                     await session.commit()
+        if first_error is not None:
+            raise first_error
 
     async def _cold_pause_idle_sandboxes(self) -> None:
         """Walk idle sandboxes down the ladder: running -> paused_memory -> paused_cold."""

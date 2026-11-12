@@ -245,25 +245,53 @@ def test_derived_template_images_share_the_built_tag(
     )
 
 
-def test_sandboxes_cannot_reach_the_network(settings: Settings) -> None:
-    """The header's first stated invariant: widget code reaches nothing.
+def test_the_unused_egress_network_setting_stays_empty(settings: Settings) -> None:
+    """The setting is empty on this host. That is all this pins.
 
-    Data arrives as files. This caught the header disagreeing with the config
-    it describes — the header said "empty" while the value defaulted to
-    `harborbox-egress`, a network that has never existed on that host, so the
-    first caller to opt in would have hit a Docker NotFound instead of a clean
-    refusal.
+    This test was called `test_sandboxes_cannot_reach_the_network`, and it
+    never showed that. `sandbox_egress_network` belonged to the direct-Docker
+    provider; under the OpenSandbox runtime nothing reads it, sandboxes run on
+    `network_mode = "bridge"`, and every one of them has outbound internet
+    (`tests/e2e_onvo_readiness.py` asserts a sandbox can connect out). The
+    value is kept empty so that nobody reads a network name here and takes it
+    for a control that is in force.
     """
     assert not settings.sandbox_egress_network
 
 
-def test_egress_is_opt_in_so_an_empty_network_is_safe() -> None:
-    """Why empty is a refusal and not a silent downgrade.
+SANDBOX_NETWORK_MODE = re.compile(r'^\s*network_mode\s*=\s*"([^"]+)"', re.MULTILINE)
 
-    `_connect_egress` returns early for any sandbox that did not ask, so an
-    unset network changes nothing for widget code. If egress ever became
-    default-on, an empty network here would quietly mean "no egress" for
-    callers that believe they have it.
+
+@pytest.mark.parametrize("path", [COMPOSE, LOCAL_COMPOSE])
+def test_the_comments_about_sandbox_egress_match_the_network_mode(path: Path) -> None:
+    """The compose files may not claim an isolation they do not configure.
+
+    Until 2026-11-12 the header of compose.internal-tools.yaml said sandboxes
+    "have no route anywhere". They were on the bridge network the whole time,
+    with full outbound internet, and in November 2026 a trial account used
+    that to run a public shell through a tunnel. The claim is worse than no
+    comment: it is what a reviewer reads instead of checking.
+
+    If sandbox networking is ever locked down for real, `network_mode` changes
+    and this test is the reminder to rewrite the comments with it.
+    """
+    text = path.read_text(encoding="utf-8")
+    match = SANDBOX_NETWORK_MODE.search(text)
+    assert match is not None, f"{path.name} declares no sandbox network_mode"
+
+    assert match.group(1) == "bridge"
+    assert "no route anywhere" not in text
+    assert "must reach nothing" not in text
+
+
+def test_egress_is_opt_in_so_an_empty_network_is_safe() -> None:
+    """The `egress` field still defaults to false, and still changes nothing.
+
+    It was the opt-in for the direct-Docker provider's egress network
+    (`_connect_egress`, which no longer exists). Under the OpenSandbox runtime
+    the field is accepted and stored but not enforced: a sandbox has outbound
+    internet either way. The default is pinned so that a client which omits
+    the field keeps sending the same request if enforcement is ever built.
     """
     assert SandboxCreate.model_fields["egress"].default is False
 
@@ -953,3 +981,45 @@ def test_the_base_name_exists_before_the_api_starts(
         assert keepers <= set(compose["services"][name]["depends_on"]), (
             f"{name} can run before {sorted(keepers)} has pulled {source!r}."
         )
+
+
+SANDBOX_PIDS_LIMIT = re.compile(r"^\s*pids_limit\s*=\s*(\d+)\s*$", re.MULTILINE)
+
+
+@pytest.mark.parametrize("path", [COMPOSE, LOCAL_COMPOSE])
+def test_the_reported_pids_limit_is_the_one_opensandbox_applies(path: Path) -> None:
+    """One process limit, stated in two places that must agree.
+
+    OpenSandbox applies the `pids_limit` in the `[docker]` block of its config
+    to every sandbox container. Harborbox does not pass a limit down; it only
+    stores `Settings.sandbox_pids_limit` on the row and reports it as the
+    sandbox's `pids_limit`. Until 2026-11-12 the config said 4096 and the
+    setting said 128, so the API reported a limit 32 times tighter than the
+    one in force.
+
+    The TOML form (`pids_limit = N`) is what is matched. The YAML form
+    (`pids_limit: N`) in the same files limits Harborbox's own services, not
+    sandboxes.
+    """
+    applied = [int(n) for n in SANDBOX_PIDS_LIMIT.findall(path.read_text("utf-8"))]
+    assert len(applied) == 1, (
+        f"{path.name} should set the sandbox pids_limit exactly once, in the "
+        f"OpenSandbox [docker] block; found {applied}"
+    )
+
+    reported = Settings.model_fields["sandbox_pids_limit"].default
+    assert applied[0] == reported, (
+        f"{path.name} makes OpenSandbox apply pids_limit = {applied[0]}, but "
+        f"the API reports {reported} (Settings.sandbox_pids_limit). Change "
+        f"both together."
+    )
+
+
+@pytest.mark.parametrize("path", [COMPOSE, LOCAL_COMPOSE])
+def test_no_deployment_overrides_the_reported_pids_limit(path: Path) -> None:
+    """An env override would bring the drift back without touching the default."""
+    environment = yaml.safe_load(path.read_text("utf-8"))["services"]["api"][
+        "environment"
+    ]
+
+    assert "HARBORBOX_SANDBOX_PIDS_LIMIT" not in environment

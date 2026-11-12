@@ -156,3 +156,99 @@ def test_mixed_batch_is_split_correctly() -> None:
     )
     assert plan.delete == ("stuck",)
     assert plan.prune == ("oldfail",)
+
+
+LEGACY_POOLED_AFTER = timedelta(hours=1)
+PAUSED_COLD_RETENTION = timedelta(days=30)
+
+
+def run_with_stale_states(candidates: list[ReapCandidate]) -> ReapPlan:
+    """`run`, plus the two thresholds `reap_once` passes for stale states."""
+    return plan_reap(
+        candidates,
+        now=NOW,
+        stuck_created_after=STUCK_AFTER,
+        failed_retention=FAILED_RETENTION,
+        stuck_starting_after=STUCK_STARTING_AFTER,
+        legacy_pooled_after=LEGACY_POOLED_AFTER,
+        paused_cold_retention=PAUSED_COLD_RETENTION,
+    )
+
+
+class TestLegacyPooled:
+    """Rows the old in-table warm pool left behind still reserve memory.
+
+    Production, 2026-11-12: four `pooled` rows from 2026-08-05 with no
+    container behind them, 768 MB reserved each, for 99 days. Nothing creates
+    or adopts these rows since 0.2.0, so an old one is never coming back.
+    """
+
+    def test_kills_a_pooled_row_left_by_the_old_pool(self) -> None:
+        plan = run_with_stale_states([ReapCandidate("sbx_p", "pooled", at(days=99))])
+        assert plan.delete == ("sbx_p",)
+        assert plan.prune == ()
+
+    def test_kills_a_row_that_never_finished_pooling(self) -> None:
+        plan = run_with_stale_states([ReapCandidate("sbx_p", "pooling", at(hours=2))])
+        assert plan.delete == ("sbx_p",)
+
+    def test_leaves_one_inside_the_grace_period(self) -> None:
+        plan = run_with_stale_states(
+            [ReapCandidate("sbx_p", "pooled", at(minutes=10))]
+        )
+        assert plan.total == 0
+
+    def test_boundary_is_inclusive(self) -> None:
+        plan = run_with_stale_states([ReapCandidate("sbx_p", "pooled", at(hours=1))])
+        assert plan.delete == ("sbx_p",)
+
+
+class TestPausedColdRetention:
+    """A cold-paused sandbox keeps a snapshot until something kills it.
+
+    Production, 2026-11-12: 205 `paused_cold` rows, 204 idle for over 30 days.
+    """
+
+    def test_kills_one_idle_past_the_retention(self) -> None:
+        plan = run_with_stale_states(
+            [
+                ReapCandidate(
+                    "sbx_c", "paused_cold", at(days=90), last_activity_at=at(days=31)
+                )
+            ]
+        )
+        assert plan.delete == ("sbx_c",)
+
+    def test_idleness_counts_not_age(self) -> None:
+        """Created long ago, used last week: someone still wants the workspace."""
+        plan = run_with_stale_states(
+            [
+                ReapCandidate(
+                    "sbx_c", "paused_cold", at(days=90), last_activity_at=at(days=7)
+                )
+            ]
+        )
+        assert plan.total == 0
+
+    def test_no_retention_leaves_paused_cold_alone(self) -> None:
+        """`reaper_paused_cold_retention_days=0` reaches here as `None`."""
+        plan = plan_reap(
+            [ReapCandidate("sbx_c", "paused_cold", at(days=400))],
+            now=NOW,
+            stuck_created_after=STUCK_AFTER,
+            failed_retention=FAILED_RETENTION,
+            legacy_pooled_after=LEGACY_POOLED_AFTER,
+        )
+        assert plan.total == 0
+
+
+def test_stale_states_never_take_live_sandboxes_with_them() -> None:
+    old = at(days=400)
+    plan = run_with_stale_states(
+        [
+            ReapCandidate("a", "running", old),
+            ReapCandidate("b", "paused_memory", old),
+            ReapCandidate("c", "killed", old),
+        ]
+    )
+    assert plan.total == 0
