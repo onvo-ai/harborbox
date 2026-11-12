@@ -361,7 +361,13 @@ def static_template_response(settings: Settings, name: str) -> TemplateResponse:
         version=settings.template_version,
         memory_mb=resolved.memory_mb,
         cpu=resolved.cpu,
-        warm_pool=settings.warm_pool_sizes[name],
+        # `.get`, not `[name]`: HARBORBOX_WARM_POOL lists only the templates a
+        # deployment wants warm, and the static base need not be one of them.
+        # On 2026-11-12 production was set to `{"custom-39c01bbdfac9":4}` --
+        # the one template that week's 1,472 sandboxes actually used -- and
+        # every GET /v1/templates answered 500 with `KeyError: 'base'` until
+        # `"base":0` was added back by hand. An unlisted template has no pool.
+        warm_pool=settings.warm_pool_sizes.get(name, 0),
     )
 
 
