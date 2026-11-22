@@ -1382,14 +1382,22 @@ async def cancel_execution(
     session: AsyncSession = Depends(get_session),
 ) -> ExecutionResponse:
     execution = await get_execution_or_404(session, execution_id)
-    if execution.status == "queued":
-        execution.status = "cancelled"
-        execution.cancel_requested = True
-        execution.environment = scrub_environment(execution.environment)
-        execution.finished_at = utc_now()
-        await session.commit()
-        await session.refresh(execution)
-    elif execution.status not in {"succeeded", "failed", "cancelled"}:
+    # Conditional on `queued` in the statement itself, not on the status read
+    # above: the scheduler can admit the execution between that read and this
+    # write, and an unconditional write then cancels a command that runs anyway.
+    await session.execute(
+        update(Execution)
+        .where(Execution.id == execution_id, Execution.status == "queued")
+        .values(
+            status="cancelled",
+            cancel_requested=True,
+            environment=scrub_environment(execution.environment),
+            finished_at=utc_now(),
+        )
+    )
+    await session.commit()
+    await session.refresh(execution)
+    if execution.status not in TERMINAL_EXECUTION_STATES:
         raise HTTPException(
             status_code=409,
             detail="running execution interruption is not implemented",

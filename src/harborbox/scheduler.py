@@ -711,6 +711,11 @@ class Scheduler:
         Returns the sandbox to bring up, or None if the execution should not
         run (already resolved, or its sandbox died between admission and
         here — see `may_start_execution`).
+
+        An execution refused here is finished here. This task is the only
+        thing that moves an `admitted` row on, and DELETE cancels only
+        `queued` ones, so an execution admitted a moment before its sandbox
+        was deleted would otherwise stay `admitted` until the next restart.
         """
         async with session_factory() as session:
             execution = await session.scalar(
@@ -722,17 +727,32 @@ class Scheduler:
                 return None
             sandbox = execution.sandbox
             # Re-validate rather than trust admission — see may_start_execution.
-            if not may_start_execution(
+            if may_start_execution(
                 cancel_requested=execution.cancel_requested,
                 execution_status=execution.status,
                 sandbox_status=sandbox.status,
             ):
+                execution.status = "starting"
+                if sandbox.status in {"created", "paused_cold"}:
+                    sandbox.status = "starting"
+                await session.commit()
+                return sandbox
+            if execution.status in TERMINAL_EXECUTION_STATES:
                 return None
-            execution.status = "starting"
-            if sandbox.status in {"created", "paused_cold"}:
-                sandbox.status = "starting"
+            execution.finished_at = utc_now()
+            execution.environment = scrub_environment(execution.environment)
+            if execution.cancel_requested:
+                execution.status = "cancelled"
+            else:
+                execution.status = "failed"
+                execution.error = {
+                    "name": ERROR_NAME_SANDBOX_UNAVAILABLE,
+                    "value": f"sandbox is {sandbox.status}",
+                    "traceback": [],
+                }
             await session.commit()
-            return sandbox
+        await self._notify_finished(execution_id)
+        return None
 
     async def _mark_running(
         self, execution_id: str

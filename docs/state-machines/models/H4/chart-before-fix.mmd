@@ -1,0 +1,87 @@
+---
+title: "Harborbox execution lifecycle"
+---
+stateDiagram-v2
+  direction LR
+  state "Legend" as legend {
+    lg0: done
+    lg1: live
+    lg2: Breaks NoStrandedExecution
+    lg3: Breaks CancelTellsTruth or NoStrandedExecution or StartingHasAStart or TerminalIsFinal in some cases
+    lg4: Path to the CancelTellsTruth or NoStrandedExecution or StartingHasAStart or TerminalIsFinal bug
+  }
+  class lg0 teal
+  class lg1 yellow
+  class lg2 breaks
+  class lg3 mayBreak
+  class lg4 bugPath
+  state "At the same time" as all {
+    state "Execution" as r0 {
+      s0: Queued
+      s1: Cancelled
+      s2: Admitted
+      s3: Starting
+      s4: Admitted (no task left)
+      s5: Running
+      s6: Failed
+      s7: Succeeded
+      [*] --> s0
+      s0 --> s1: you delete the sandbox or the cancel is saved
+      s0 --> s2: the scheduler admits it
+      s2 --> s3: the run task begins [when Sandbox starting]
+      s2 --> s1: the cancel is saved
+      s2 --> s4: the run task begins [when Sandbox deleted]
+      s3 --> s5: the command is sent [unless Sandbox starting]
+      s3 --> s1: the cancel is saved
+      s3 --> s6: the sandbox comes up [when Sandbox deleted]
+      s5 --> s7: the result is saved
+      s1 --> s5: the command is sent [when Sandbox deleted or Sandbox running]
+      s4 --> s1: the cancel is saved
+      s5 --> s1: the cancel is saved
+      s5 --> s6: the command returns [when Sandbox deleted]
+      s6 --> s1: the cancel is saved
+      s1 --> s7: the result is saved [when Sandbox deleted or Sandbox running]
+      s7 --> s1: the cancel is saved
+    }
+    --
+    state "Sandbox" as r1 {
+      s8: Sandbox created
+      s9: Sandbox starting
+      s10: Sandbox deleted
+      s11: Sandbox running
+      [*] --> s8
+      s8 --> s9: the scheduler admits it [when Queued]
+      s8 --> s10: the container is removed [when Cancelled]
+      s9 --> s10: the container is removed
+      s9 --> s11: the sandbox comes up [unless Admitted]
+      s11 --> s10: the container is removed
+    }
+  }
+  classDef breaks fill:#ffecee,stroke:#e72e3b,stroke-width:2.5px,color:#cd2834
+  classDef mayBreak fill:#fff3e6,stroke:#e8730c,stroke-width:2.5px,color:#b85a06
+  class s0 yellow
+  class s0 bugPath
+  class s1 teal
+  class s1 mayBreak
+  class s1 bugPath
+  class s2 yellow
+  class s2 bugPath
+  class s3 yellow
+  class s3 bugPath
+  class s4 yellow
+  class s4 breaks
+  class s4 bugPath
+  class s5 yellow
+  class s5 mayBreak
+  class s5 bugPath
+  class s6 teal
+  class s6 mayBreak
+  class s7 teal
+  class s7 mayBreak
+  class s8 bugPath
+  class s9 mayBreak
+  class s9 bugPath
+  class s10 mayBreak
+  class s10 bugPath
+  class s11 mayBreak
+  class s11 bugPath
