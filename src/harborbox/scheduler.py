@@ -991,24 +991,38 @@ class Scheduler:
                 "sandbox %s: could not record its own start failure", sandbox_id
             )
 
-    async def _ensure_running_locked(self, sandbox_id: str) -> None:
+    @staticmethod
+    async def _begin_start(sandbox_id: str) -> Sandbox:
+        """Read the sandbox a start is for, and stamp the row if one begins.
+
+        The reaper times a stuck `starting` row from `updated_at`, so a retry
+        of a start that ran past its budget must restart that clock, or the
+        sweep reaps it mid-flight.
+        """
         async with session_factory() as session:
             sandbox = await session.get(Sandbox, sandbox_id)
             if sandbox is None:
                 message = "sandbox does not exist"
                 raise SandboxUnavailableError(message)
-            previous_status = sandbox.status
+            if sandbox.status in {"created", "starting", "paused_cold", "paused_memory"}:
+                sandbox.updated_at = utc_now()
+                await session.commit()
+            return sandbox
+
+    async def _ensure_running_locked(self, sandbox_id: str) -> None:
+        begun = await self._begin_start(sandbox_id)
+        previous_status = begun.status
 
         if previous_status == "paused_memory":
-            started = await self.runtime.resume(sandbox)
+            started = await self.runtime.resume(begun)
         elif previous_status in {"created", "starting", "paused_cold"}:
-            started = await self.runtime.start_sandbox(sandbox)
+            started = await self.runtime.start_sandbox(begun)
         elif previous_status == "running":
             started = None
         else:
             message = f"sandbox is {previous_status}"
             raise SandboxUnavailableError(message)
-        runtime_metadata = dict(sandbox.metadata_)
+        runtime_metadata = dict(begun.metadata_)
 
         async with session_factory() as session:
             sandbox = await session.get(Sandbox, sandbox_id)

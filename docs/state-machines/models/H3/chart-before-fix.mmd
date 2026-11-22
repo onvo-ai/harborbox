@@ -1,0 +1,91 @@
+---
+title: "Harborbox reaper against a sandbox coming back from idle"
+---
+stateDiagram-v2
+  state "Legend" as legend {
+    lg0: gone
+    lg1: live
+    lg2: rest
+    lg3: Breaks NoLiveSandboxReaped or ResumeNeverLosesTheSandbox
+    lg4: Breaks NoLiveSandboxReaped in some cases
+    lg5: Path to the NoLiveSandboxReaped or ResumeNeverLosesTheSandbox bug
+  }
+  class lg0 pink
+  class lg1 teal
+  class lg2 blue
+  class lg3 breaks
+  class lg4 mayBreak
+  class lg5 bugPath
+  s0: Paused cold
+  s1: Starting, start in flight
+  s2: Running
+  s3: Starting, start timed out
+  s4: Starting, start timed out, stuck
+  s5: Starting, start in flight, stuck
+  s6: Failed (lost)
+  s7: Killed, start in flight
+  s8: Running, stuck
+  s9: Killed, start timed out
+  s10: Killed
+  s11: Killed, start timed out, stuck
+  s12: Failed (lost), stuck
+  s13: Killed, start in flight, stuck
+  s14: Killed, stuck
+  [*] --> s0
+  s0 --> s1: you post a command
+  s1 --> s2: the start returns
+  s1 --> s3: the start runs past its budget
+  s1 --> s1: the reaper reads the sandbox or the reaper kills it in OpenSandbox
+  s3 --> s1: you retry
+  s3 --> s4: five minutes pass with no retry
+  s4 --> s5: you retry
+  s1 --> s6: the start returns
+  s1 --> s7: the reaper marks it killed
+  s5 --> s4: the start runs past its budget
+  s5 --> s8: the start returns
+  s3 --> s9: the reaper marks it killed
+  s2 --> s10: the reaper marks it killed
+  s6 --> s10: the reaper marks it killed
+  s7 --> s10: the start returns
+  s7 --> s9: the start runs past its budget
+  s4 --> s11: the reaper marks it killed
+  s5 --> s12: the start returns
+  s5 --> s13: the reaper marks it killed
+  s12 --> s14: the reaper marks it killed
+  s13 --> s11: the start runs past its budget
+  s13 --> s14: the start returns
+  s8 --> s14: the reaper marks it killed
+  classDef breaks fill:#ffecee,stroke:#e72e3b,stroke-width:2.5px,color:#cd2834
+  classDef mayBreak fill:#fff3e6,stroke:#e8730c,stroke-width:2.5px,color:#b85a06
+  class s0 blue
+  class s0 bugPath
+  class s1 blue
+  class s1 mayBreak
+  class s1 bugPath
+  class s2 teal
+  class s2 mayBreak
+  class s3 blue
+  class s3 mayBreak
+  class s4 blue
+  class s4 mayBreak
+  class s5 blue
+  class s5 mayBreak
+  class s6 pink
+  class s6 breaks
+  class s6 bugPath
+  class s7 pink
+  class s7 mayBreak
+  class s8 teal
+  class s8 mayBreak
+  class s9 pink
+  class s9 mayBreak
+  class s10 pink
+  class s10 mayBreak
+  class s11 pink
+  class s11 mayBreak
+  class s12 pink
+  class s12 breaks
+  class s13 pink
+  class s13 mayBreak
+  class s14 pink
+  class s14 mayBreak

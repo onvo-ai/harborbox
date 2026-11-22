@@ -62,7 +62,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 
 from harborbox.models import Execution, Sandbox
 
@@ -108,6 +108,9 @@ class ReapCandidate:
     status: str
     created_at: datetime
     last_activity_at: datetime | None = None
+    # When the row last changed, which for `starting` is when it entered it
+    # or when a start last began (`Scheduler._ensure_running_locked`).
+    updated_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -150,6 +153,11 @@ def plan_reap(  # noqa: PLR0913 - one threshold per state it decides on; a
     capacity and deserves its own, shorter threshold; callers that care
     about reclaiming it (`reap_once`) pass one explicitly.
 
+    A `starting` row is also timed from `updated_at`, whichever is later.
+    `last_activity_at` says when the sandbox was last used, and one coming
+    back from `paused_cold` was last used before its idle timeout, so by that
+    clock alone every resume looked stuck the moment it began.
+
     `legacy_pooled_after` and `paused_cold_retention` default to `None` for
     the same reason: a caller that does not name a threshold gets those
     states left alone, not an implicit cutoff. Both land in `delete`, which
@@ -161,6 +169,8 @@ def plan_reap(  # noqa: PLR0913 - one threshold per state it decides on; a
 
     for c in candidates:
         age_from = c.last_activity_at or c.created_at
+        if c.status == "starting" and c.updated_at is not None:
+            age_from = max(age_from, c.updated_at)
         age = now - age_from
         # A clock skew or a future timestamp must never make something look
         # ancient; treat anything not clearly old as young.
@@ -215,6 +225,7 @@ async def reap_once(
                     status=r.status,
                     created_at=_require(_aware(r.created_at)),
                     last_activity_at=_aware(getattr(r, "last_activity_at", None)),
+                    updated_at=_aware(getattr(r, "updated_at", None)),
                 )
                 for r in rows
             ],
@@ -237,35 +248,13 @@ async def reap_once(
         )
 
         by_id = {r.id: r for r in rows}
-        for sandbox_id in plan.delete:
-            sandbox = by_id[sandbox_id]
-            try:
-                # A stuck `created` may still have a half-built container behind
-                # it; ask the runtime to clear it before dropping the row, or the
-                # container is orphaned with nothing left pointing at it.
-                await runtime.kill(sandbox)
-            except Exception as exc:  # noqa: BLE001 - never let one row stop the sweep
-                log.warning("reaper: kill failed for %s: %s", sandbox_id, exc)
-                if sandbox.status == "paused_cold":
-                    # The one state where the kill is the point: it deletes the
-                    # snapshot, and the row holds the only record of the
-                    # snapshot's id. Marking it `killed` now would orphan the
-                    # snapshot for good. `runtime.kill` already treats "not
-                    # found" as success, so a failure here is transient: leave
-                    # the row and let the next sweep try again.
-                    continue
-            sandbox.status = "killed"
-            sandbox.container_id = None
-            sandbox.container_name = None
-            # `runtime.kill` drops the snapshot id from the metadata. Reassign
-            # so the JSON column is seen as changed and the id is not kept.
-            sandbox.metadata_ = dict(sandbox.metadata_)
-
         for sandbox_id in plan.prune:
             await session.delete(by_id[sandbox_id])
-
-        if plan.total:
+        if plan.prune:
             await session.commit()
+
+    for sandbox_id in plan.delete:
+        await _reclaim(session_factory, runtime, by_id[sandbox_id])
 
     if plan.total:
         log.info(
@@ -359,6 +348,68 @@ async def _purge_history(
             purged_executions,
         )
     return len(sandbox_ids), purged_executions
+
+
+async def _reclaim(
+    session_factory: async_sessionmaker[AsyncSession],
+    runtime: SandboxRuntime,
+    sandbox: Sandbox,
+) -> None:
+    """Mark `sandbox` killed if it is still the row the sweep read, then kill it.
+
+    The claim comes first and is conditional on the status and `updated_at`
+    the sweep read. Killing first and writing after deleted a sandbox that a
+    retried start had brought up in between, and wrote `killed` over its
+    `running`. A row that changed since the read is left for the next sweep
+    to judge again. A start that lands after the claim finds `killed` and
+    removes its own container (`Scheduler._ensure_running_locked`).
+    """
+    async with session_factory() as session:
+        claimed = await session.scalar(
+            update(Sandbox)
+            .where(
+                Sandbox.id == sandbox.id,
+                Sandbox.status == sandbox.status,
+                Sandbox.updated_at == sandbox.updated_at,
+            )
+            .values(status="killed")
+            .returning(Sandbox.id)
+        )
+        await session.commit()
+    if claimed is None:
+        return
+    try:
+        # A stuck `created` may still have a half-built container behind it;
+        # ask the runtime to clear it, or the container is orphaned with
+        # nothing left pointing at it.
+        await runtime.kill(sandbox)
+    except Exception as exc:  # noqa: BLE001 - never let one row stop the sweep
+        log.warning("reaper: kill failed for %s: %s", sandbox.id, exc)
+        if sandbox.status == "paused_cold":
+            # The one state where the kill is the point: it deletes the
+            # snapshot, and the row holds the only record of the snapshot's
+            # id. `runtime.kill` already treats "not found" as success, so a
+            # failure here is transient: put the row back for the next sweep.
+            async with session_factory() as session:
+                await session.execute(
+                    update(Sandbox)
+                    .where(Sandbox.id == sandbox.id, Sandbox.status == "killed")
+                    .values(status="paused_cold")
+                )
+                await session.commit()
+            return
+    async with session_factory() as session:
+        await session.execute(
+            update(Sandbox)
+            .where(Sandbox.id == sandbox.id)
+            # `runtime.kill` drops the snapshot id from the metadata.
+            .values(
+                container_id=None,
+                container_name=None,
+                metadata_=dict(sandbox.metadata_),
+            )
+        )
+        await session.commit()
 
 
 def _rowcount(result: object) -> int:
