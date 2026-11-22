@@ -18,21 +18,25 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import UTC, datetime, timedelta
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
+import httpx
 import pytest
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from harborbox import scheduler as scheduler_module
+from harborbox.api import app
 from harborbox.config import Settings
-from harborbox.db import Base
+from harborbox.db import Base, get_session
 from harborbox.errors import SandboxUnavailableError
 from harborbox.models import Execution, Sandbox, SandboxTemplate
 from harborbox.opensandbox_runtime import SNAPSHOT_METADATA_KEY
 from harborbox.runtime_protocol import StartedSandbox, WarmPoolReservation
 from harborbox.scheduler import Scheduler
 from harborbox.schemas import LogOutput, RuntimeExecutionResult
+from harborbox.security import require_api_key
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -339,3 +343,48 @@ async def test_a_boot_settles_each_pause_a_restart_cut_short(sessions: Sessions)
             await session.execute(delete(Sandbox).where(Sandbox.id.in_(list(states))))
             await session.commit()
     assert settled == {"sbx-1": "running", "sbx-2": "paused_memory", "sbx-3": "failed"}
+
+
+async def test_a_sandbox_deleted_during_its_pause_leaves_no_snapshot_behind(
+    sessions: Sessions,
+) -> None:
+    """DELETE lands while the sweep's pause is taking its snapshot.
+
+    DELETE removes what the row knows of, which is not the new snapshot. The
+    sweep then finds `killed` where its claim was, and deletes that snapshot
+    itself rather than leave it with nothing pointing at it.
+    """
+    runtime = PausingRuntime()
+    scheduler = cold_only(runtime)
+    await seed_idle_sandbox(sessions)
+    app.state.settings = scheduler.settings
+    app.state.runtime = runtime
+    app.state.scheduler = scheduler
+
+    async def override_session() -> AsyncIterator[AsyncSession]:
+        async with sessions() as opened:
+            yield opened
+
+    app.dependency_overrides[get_session] = override_session
+    app.dependency_overrides[require_api_key] = lambda: None
+    try:
+        async with (
+            asyncio.timeout(STEP_TIMEOUT_SECONDS),
+            httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://harborbox"
+            ) as client,
+        ):
+            sweep = asyncio.create_task(scheduler._cold_pause_idle_sandboxes())
+            await runtime.pause_entered.wait()
+            deleted = await client.delete("/v1/sandboxes/sbx-1")
+            runtime.release_pause.set()
+            await sweep
+    finally:
+        app.dependency_overrides.clear()
+
+    async with sessions() as session:
+        stored = await session.get(Sandbox, "sbx-1")
+    assert stored is not None
+    assert deleted.status_code == HTTPStatus.NO_CONTENT
+    assert stored.status == "killed"
+    assert runtime.snapshots == set()

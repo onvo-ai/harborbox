@@ -35,7 +35,8 @@ Fix: a pause first claims the sandbox as `pausing`. The claim locks the sandbox 
 active executions in a later statement. Admission locks the same rows and defers a command on a
 `pausing` sandbox. The tier is written over the claim only, and a lost claim deletes the new
 snapshot. The explicit pause route uses the same claim. A boot settles any `pausing` row by what
-its container says. A second test holds an admission pass open on PostgreSQL and shows the claim
+its container says. Other tests cover a DELETE during the pause (the new snapshot is deleted)
+and the boot. One test holds an admission pass open on PostgreSQL and shows the claim
 waits for it; it fails when the claim takes no row lock.
 
 New state: `pausing`. It reserves memory and CPU, and file calls get 409 with `Retry-After: 1`.
