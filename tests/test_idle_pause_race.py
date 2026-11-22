@@ -28,7 +28,7 @@ from harborbox import scheduler as scheduler_module
 from harborbox.config import Settings
 from harborbox.db import Base
 from harborbox.errors import SandboxUnavailableError
-from harborbox.models import Execution, Sandbox
+from harborbox.models import Execution, Sandbox, SandboxTemplate
 from harborbox.opensandbox_runtime import SNAPSHOT_METADATA_KEY
 from harborbox.runtime_protocol import StartedSandbox, WarmPoolReservation
 from harborbox.scheduler import Scheduler
@@ -130,7 +130,7 @@ async def sessions(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Sessions]:
     if not url:
         pytest.skip("HARBORBOX_TEST_DATABASE_URL is not set; needs a real PostgreSQL")
     engine = create_async_engine(url)
-    tables = [Sandbox.__table__, Execution.__table__]
+    tables = [Sandbox.__table__, Execution.__table__, SandboxTemplate.__table__]
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all, tables=tables)
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -291,3 +291,51 @@ async def test_a_pause_claim_waits_for_an_admission_pass_and_sees_what_it_admitt
     assert paused is False
     assert not runtime.pause_entered.is_set()
     assert stored.status == "running"
+
+
+class BootRuntime:
+    """Reports each container's state as OpenSandbox would after a restart."""
+
+    def __init__(self, states: dict[str, str | None]) -> None:
+        self.states = states
+
+    async def container_status(self, sandbox: Sandbox) -> str | None:
+        return self.states[sandbox.id]
+
+
+async def test_a_boot_settles_each_pause_a_restart_cut_short(sessions: Sessions) -> None:
+    """Where the container got to says where the sandbox is now."""
+    states: dict[str, str | None] = {
+        "sbx-1": "running",  # cut short before the snapshot: still running
+        "sbx-2": "paused",  # cut short before the thaw: still frozen
+        "sbx-3": "exited",  # its container is gone and the snapshot id with it
+    }
+    async with sessions() as session:
+        for sandbox_id in states:
+            session.add(
+                Sandbox(
+                    id=sandbox_id,
+                    status="pausing",
+                    container_id=f"c-{sandbox_id}",
+                    agent_token="token",  # noqa: S106
+                    memory_mb=512,
+                    cpu=0.5,
+                    pids_limit=128,
+                    idle_timeout_seconds=300,
+                    metadata_={},
+                )
+            )
+        await session.commit()
+    try:
+        scheduler = Scheduler(Settings(), BootRuntime(states))  # type: ignore[arg-type]
+        await scheduler._recover_interrupted_jobs()
+        async with sessions() as session:
+            settled = {
+                sandbox_id: (await session.get(Sandbox, sandbox_id)).status  # type: ignore[union-attr]
+                for sandbox_id in states
+            }
+    finally:
+        async with sessions() as session:
+            await session.execute(delete(Sandbox).where(Sandbox.id.in_(list(states))))
+            await session.commit()
+    assert settled == {"sbx-1": "running", "sbx-2": "paused_memory", "sbx-3": "failed"}
