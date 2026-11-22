@@ -1025,7 +1025,9 @@ class Scheduler:
         runtime_metadata = dict(begun.metadata_)
 
         async with session_factory() as session:
-            sandbox = await session.get(Sandbox, sandbox_id)
+            # Locked, so a DELETE either commits `killed` before this read or
+            # waits for this write and then kills the container it records.
+            sandbox = await session.get(Sandbox, sandbox_id, with_for_update=True)
             if sandbox is None:
                 message = "sandbox does not exist"
                 raise SandboxUnavailableError(message)

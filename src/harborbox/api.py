@@ -870,8 +870,16 @@ async def kill_sandbox(
         )
         .values(status="cancelled", cancel_requested=True, finished_at=utc_now())
     )
-    await runtime_from(request).kill(sandbox)
+    # `killed` is saved before the runtime is called, not after. A start in
+    # flight that comes up afterwards finds it and removes its own container
+    # (`Scheduler._ensure_running_locked`). Saved after, it overwrote the
+    # `running` such a start had just written, and the container ran on with
+    # no row pointing at it. The reread picks up a container id a start saved
+    # before this commit.
     sandbox.status = "killed"
+    await session.commit()
+    await session.refresh(sandbox)
+    await runtime_from(request).kill(sandbox)
     sandbox.container_id = None
     sandbox.container_name = None
     await session.commit()
