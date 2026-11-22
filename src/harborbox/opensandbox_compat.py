@@ -219,6 +219,7 @@ def lifecycle_status(sandbox: Sandbox) -> OpenSandboxStatus:
         "created": ("Pending", "awaiting_capacity", "Sandbox is ready to be provisioned."),
         "starting": ("Pending", "container_starting", "Sandbox is starting."),
         "running": ("Running", "container_running", "Sandbox is ready."),
+        "pausing": ("Pausing", "pause_in_progress", "Sandbox is being paused."),
         "paused_memory": ("Paused", "memory_paused", "Sandbox state is retained in memory."),
         "paused_cold": (
             "Paused",

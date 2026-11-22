@@ -6,7 +6,7 @@ import logging
 import os
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import selectinload
@@ -47,6 +47,9 @@ ACTIVE_EXECUTION_STATES = ("admitted", "starting", "running")
 RESERVED_SANDBOX_STATES = (
     "starting",
     "running",
+    # Claimed by a pause that is still taking its snapshot: the container is
+    # still there, and so is its memory. See `Scheduler._claim_for_pause`.
+    "pausing",
     "paused_memory",
     "pooling",
     "pooled",
@@ -113,12 +116,16 @@ def lazy_start_action(status: str) -> Literal["ready", "start", "unavailable"]:
     `SandboxUnavailableError("sandbox is pooled")`, and with it a warm-pool
     row would get marked `failed` by `_ensure_running`'s own cleanup,
     destroying it for a request that has no business touching it at all.
+    `pausing` is unavailable only for the few seconds a pause takes: its
+    container is being snapshotted and removed, so it can neither serve the
+    request nor be started until the pause lands.
+
     Every other non-running status (`created`, `starting`, `paused_cold`,
     `paused_memory`) is exactly what `_ensure_running_locked` handles.
     """
     if status == "running":
         return "ready"
-    if status in {"killed", "failed", "pooled", "pooling"}:
+    if status in {"killed", "failed", "pooled", "pooling", "pausing"}:
         return "unavailable"
     return "start"
 
@@ -488,7 +495,7 @@ class Scheduler:
         )
         reserved_cpu = await session.scalar(
             select(func.coalesce(func.sum(Sandbox.cpu), 0.0)).where(
-                Sandbox.status.in_(("starting", "running"))
+                Sandbox.status.in_(("starting", "running", "pausing"))
             )
         )
         return reserved_memory, reserved_cpu
@@ -541,6 +548,7 @@ class Scheduler:
                 .with_for_update(of=Execution)
             )
             queued = list(result.scalars())
+            await self._lock_sandboxes(session, queued)
 
             active_rows = (
                 await session.execute(
@@ -563,6 +571,11 @@ class Scheduler:
                     max_lifetime_seconds=self.settings.max_sandbox_lifetime_seconds,
                 ):
                     rejected_ids.append(execution.id)
+                    continue
+                if sandbox.status == "pausing":
+                    # Its container is being removed. Admitted now, the command
+                    # would run in it and be cut off; next pass it is paused
+                    # and admission starts it again from the snapshot.
                     continue
                 active_count = state.active_counts.get(sandbox.id, 0)
                 if not has_sandbox_execution_slot(
@@ -590,6 +603,26 @@ class Scheduler:
             task = asyncio.create_task(self._run_execution(execution_id))
             self._running_tasks[execution_id] = task
             task.add_done_callback(self._done_callback(execution_id))
+
+    @staticmethod
+    async def _lock_sandboxes(session: AsyncSession, queued: list[Execution]) -> None:
+        """Lock the queued executions' sandbox rows, and read them again under it.
+
+        The idle sweep claims a sandbox for a pause by locking its row and then
+        counting its active executions (`_claim_for_pause`). So it either waits
+        for this admission pass to commit and sees what it admitted, or commits
+        its `pausing` claim first and this pass defers to it.
+        """
+        sandbox_ids = sorted({execution.sandbox_id for execution in queued})
+        if not sandbox_ids:
+            return
+        await session.execute(
+            select(Sandbox)
+            .where(Sandbox.id.in_(sandbox_ids))
+            .order_by(Sandbox.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
 
     def _admit_or_defer(
         self,
@@ -1269,7 +1302,7 @@ class Scheduler:
         up after itself.
         """
         try:
-            await self._suspend(sandbox, memory=memory)
+            await self.suspend(sandbox, memory=memory)
         except SandboxUnavailableError as exc:
             logger.info(
                 "idle sandbox vanished before it could be paused",
@@ -1284,33 +1317,98 @@ class Scheduler:
                     current.status = "failed"
                     await session.commit()
 
-    async def _suspend(self, sandbox: Sandbox, *, memory: bool) -> None:
+    async def suspend(self, sandbox: Sandbox, *, memory: bool) -> bool:
         """Pause one sandbox and record the tier it landed in.
 
-        The status is re-read under the write so a sandbox that started running
-        again between the plan and here is left alone: the runtime call has
-        already happened by then, but writing `paused_*` over `running` is what
-        would strand it, since nothing else would ever bring it back.
+        Returns False, having done nothing, when the sandbox is no longer the
+        idle one the caller saw. The pause is claimed first, as `pausing`, and
+        only then is the runtime called: the plan was read earlier, and a
+        command admitted since then would run in a container this removes.
+        Admission defers to a `pausing` sandbox, so nothing new lands in it.
+
+        The tier is written over the claim only. Anything else there means the
+        sandbox was deleted meanwhile, and the snapshot this pause took is
+        deleted with it rather than left with nothing pointing at it.
         """
+        if not await self._claim_for_pause(sandbox):
+            return False
+        previous = sandbox.status
         target = "paused_memory" if memory else "paused_cold"
-        expected = "paused_memory" if target == "paused_cold" else "running"
-        if sandbox.status == "paused_memory" and not memory:
-            # See PausePlan.thaw_first: OpenSandbox will not snapshot a frozen
-            # container, so the ladder's own second rung has to unfreeze before
-            # it can go cold. Cheap next to the snapshot that follows it.
-            started = await self.runtime.resume(sandbox)
-            sandbox.container_id = started.id
-            sandbox.container_name = started.name
-        await self.runtime.pause(sandbox, memory=memory)
+        try:
+            if previous == "paused_memory" and not memory:
+                # See PausePlan.thaw_first: OpenSandbox will not snapshot a
+                # frozen container, so the ladder's own second rung has to
+                # unfreeze before it can go cold. Cheap next to the snapshot.
+                started = await self.runtime.resume(sandbox)
+                sandbox.container_id = started.id
+                sandbox.container_name = started.name
+            await self.runtime.pause(sandbox, memory=memory)
+        except BaseException:
+            await self._release_pause_claim(sandbox.id, previous)
+            raise
+        values: dict[Any, Any] = {
+            Sandbox.status: target,
+            Sandbox.metadata_: dict(sandbox.metadata_),
+        }
+        if not memory:
+            values[Sandbox.container_id] = None
+            values[Sandbox.container_name] = None
         async with session_factory() as session:
-            current = await session.get(Sandbox, sandbox.id)
-            if current is None or current.status not in {expected, "running"}:
-                return
-            current.status = target
-            if not memory:
-                current.container_id = None
-                current.container_name = None
-            current.metadata_ = dict(sandbox.metadata_)
+            recorded = await session.scalar(
+                update(Sandbox)
+                .where(Sandbox.id == sandbox.id, Sandbox.status == "pausing")
+                .values(values)
+                .returning(Sandbox.id)
+            )
+            await session.commit()
+        if recorded is None:
+            await self.runtime.kill(sandbox)
+            return False
+        return True
+
+    async def _claim_for_pause(self, sandbox: Sandbox) -> bool:
+        """Move `sandbox` to `pausing` if it is still idle, as the caller read it.
+
+        The row lock comes first and the count of active executions after it,
+        in its own statement, so the count reads past any admission pass that
+        held the lock (see `_admit_available_jobs`). `last_activity_at` must
+        match the caller's read as well: a command that ran and finished in
+        between makes the sandbox busy again, not idle.
+        """
+        async with session_factory() as session:
+            row = await session.scalar(
+                select(Sandbox)
+                .where(
+                    Sandbox.id == sandbox.id,
+                    Sandbox.status == sandbox.status,
+                    Sandbox.last_activity_at == sandbox.last_activity_at,
+                )
+                .with_for_update()
+            )
+            if row is None:
+                return False
+            active = await session.scalar(
+                select(func.count())
+                .select_from(Execution)
+                .where(
+                    Execution.sandbox_id == sandbox.id,
+                    Execution.status.in_(ACTIVE_EXECUTION_STATES),
+                )
+            )
+            if active:
+                return False
+            row.status = "pausing"
+            await session.commit()
+        return True
+
+    async def _release_pause_claim(self, sandbox_id: str, previous: str) -> None:
+        """Put a `pausing` claim back to the status it was taken from."""
+        async with session_factory() as session:
+            await session.execute(
+                update(Sandbox)
+                .where(Sandbox.id == sandbox_id, Sandbox.status == "pausing")
+                .values(status=previous)
+            )
             await session.commit()
 
     async def _recover_interrupted_jobs(self) -> None:
@@ -1355,4 +1453,22 @@ class Scheduler:
                     sandbox.status = "paused_cold"
                 else:
                     sandbox.status = "created"
+            # A pause cut short by the restart. Its container says how far it
+            # got. Once the container is gone the new snapshot's id is lost
+            # with the process, so the sandbox cannot be restored.
+            pausing_sandboxes = list(
+                (
+                    await session.scalars(
+                        select(Sandbox).where(Sandbox.status == "pausing")
+                    )
+                ).all()
+            )
+            for sandbox in pausing_sandboxes:
+                container_status = await self.runtime.container_status(sandbox)
+                if container_status == "running":
+                    sandbox.status = "running"
+                elif container_status == "paused":
+                    sandbox.status = "paused_memory"
+                else:
+                    sandbox.status = "failed"
             await session.commit()

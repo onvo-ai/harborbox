@@ -286,6 +286,8 @@ async def ensure_ready(
         raise HTTPException(
             status_code=409,
             detail=f"sandbox must be running; current status is {sandbox.status}",
+            # A pause lands in seconds, and the sandbox then starts again.
+            headers={"Retry-After": "1"} if sandbox.status == "pausing" else None,
         )
     if action == "ready":
         return sandbox
@@ -758,12 +760,15 @@ async def pause_sandbox(
     plan = plan_pause(sandbox.status, memory=body.memory)
     if plan is None:
         raise HTTPException(status_code=409, detail=f"cannot pause {sandbox.status}")
-    if plan.thaw_first:
-        started = await runtime_from(request).resume(sandbox)
-        sandbox.container_id = started.id
-        sandbox.container_name = started.name
     if plan.call_runtime:
-        await runtime_from(request).pause(sandbox, memory=body.memory)
+        # Through the scheduler's claim, not straight to the runtime: the
+        # check above is a read, and a command admitted after it would run in
+        # the container the pause removes. `suspend` works on its own rows,
+        # so this session lets go of its copy first.
+        session.expunge(sandbox)
+        if not await scheduler_from(request).suspend(sandbox, memory=body.memory):
+            raise HTTPException(status_code=409, detail="sandbox has an active execution")
+        return await get_sandbox_or_404(session, sandbox_id)
     sandbox.status = plan.target
     if plan.target == "paused_cold":
         sandbox.container_id = None

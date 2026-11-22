@@ -2,6 +2,7 @@ export type SandboxStatus =
   | "created"
   | "starting"
   | "running"
+  | "pausing"
   | "paused_memory"
   | "paused_cold"
   | "killed"

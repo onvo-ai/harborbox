@@ -15,6 +15,8 @@ SandboxStatus = Literal[
     "pooling",
     "pooled",
     "running",
+    # Claimed by a pause that is taking its snapshot; lasts seconds.
+    "pausing",
     "paused_memory",
     "paused_cold",
     "killed",
