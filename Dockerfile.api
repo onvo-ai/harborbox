@@ -54,6 +54,14 @@ RUN apt-get update \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
+# nft, for the sandbox-guard service, which runs this image with a different
+# command to fence the sandbox network on the host (DEV-2727). The API itself
+# never calls it and holds no capability that would let it.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nftables \
+    && rm -rf /var/lib/apt/lists/* \
+    && nft --version
+
 COPY pyproject.toml README.md /app/
 COPY src/harborbox /app/src/harborbox
 

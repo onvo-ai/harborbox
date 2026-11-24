@@ -520,6 +520,34 @@ reserves an additional 25% of the VM, with a 1 GiB minimum by default.
 
 Important settings are documented in `.env.example`.
 
+### What a sandbox can reach on its host
+
+Sandboxes run on `harborbox-sandbox-v1`, a bridge that the `sandbox-guard`
+service creates and fences with an nftables table on the host
+(`src/harborbox/sandbox_network.py`, DEV-2727). From inside a sandbox:
+
+| Destination | Reachable |
+|---|---|
+| The internet, DNS included | yes |
+| This host, at any address and port (gateway, docker0, public, private) | no |
+| Another sandbox's execd, directly or through its published port | no |
+| `169.254.169.254` and every private, link-local or CGNAT range | no |
+| Anything over IPv6 | no |
+
+Until DEV-2727 sandboxes ran on Docker's default `bridge` and reached every
+row of that table. `com.docker.network.bridge.inhibit_ipv4` on an internal
+network, which closes the same hole elsewhere, does not fit here: Docker
+publishes no ports on an internal network and refuses connections to ports
+published on a network without a host address, and the API reaches execd only
+through those ports. `tests/e2e_sandbox_isolation.py` measures the table from
+inside a real sandbox.
+
+The guard needs the host's network namespace, `CAP_NET_ADMIN` and the Docker
+socket, and `opensandbox` does not start until it is healthy. Docker never
+changes an existing network's options, so a change to them ships under a new
+network name (`-v2`) rather than as an edit; the guard refuses to remove a
+network that still has sandboxes on it.
+
 ### Stronger isolation with gVisor
 
 For a stronger isolation boundary, run sandboxes under gVisor. Each sandbox

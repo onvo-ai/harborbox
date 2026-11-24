@@ -26,6 +26,7 @@ import pytest
 import yaml
 
 from harborbox.config import Settings
+from harborbox.sandbox_network import NETWORK_NAME
 from harborbox.schemas import SandboxCreate
 from harborbox.telemetry import SERVICE_NAME, export_is_configured, service_name_for
 
@@ -272,16 +273,60 @@ def test_the_comments_about_sandbox_egress_match_the_network_mode(path: Path) ->
     that to run a public shell through a tunnel. The claim is worse than no
     comment: it is what a reviewer reads instead of checking.
 
-    If sandbox networking is ever locked down for real, `network_mode` changes
-    and this test is the reminder to rewrite the comments with it.
+    Since DEV-2727 sandboxes run on `harborbox-sandbox-v1`, fenced from the
+    host and every private range but still with outbound internet -- so the
+    old claims are still false, and still banned. If egress is ever cut for
+    real, `network_mode` changes again and this test is the reminder to
+    rewrite the comments with it.
     """
     text = path.read_text(encoding="utf-8")
     match = SANDBOX_NETWORK_MODE.search(text)
     assert match is not None, f"{path.name} declares no sandbox network_mode"
 
-    assert match.group(1) == "bridge"
+    assert match.group(1) == NETWORK_NAME
     assert "no route anywhere" not in text
     assert "must reach nothing" not in text
+
+
+@pytest.mark.parametrize("path", [COMPOSE, LOCAL_COMPOSE])
+def test_sandboxes_are_not_on_the_default_bridge(path: Path) -> None:
+    """DEV-2727: on Docker's `bridge` a sandbox reached the host and its siblings.
+
+    From inside one: a host listener on 0.0.0.0 through the gateway, another
+    sandbox's execd directly and through its published port (execd takes no
+    token), and 169.254.169.254. Only the guarded network is fenced.
+    """
+    match = SANDBOX_NETWORK_MODE.search(path.read_text(encoding="utf-8"))
+    assert match is not None
+    assert match.group(1) not in {"bridge", "host", "default"}
+
+
+@pytest.mark.parametrize(
+    ("path", "fixture"), [(COMPOSE, "compose"), (LOCAL_COMPOSE, "local_compose")]
+)
+def test_the_sandbox_guard_fences_the_network_before_any_sandbox_starts(
+    path: Path, fixture: str, request: pytest.FixtureRequest
+) -> None:
+    """The opensandbox service must not start before the firewall is in."""
+    document = request.getfixturevalue(fixture)
+    guard = document["services"]["sandbox-guard"]
+    assert guard["command"] == ["python", "-m", "harborbox.sandbox_network", "guard"]
+    assert guard["healthcheck"]["test"] == [
+        "CMD", "python", "-m", "harborbox.sandbox_network", "check",
+    ]
+    # The rules belong to the host's network namespace, and NET_ADMIN is the
+    # only capability writing them takes.
+    assert guard["network_mode"] == "host"
+    assert guard["cap_drop"] == ["ALL"]
+    assert guard["cap_add"] == ["NET_ADMIN"]
+    assert guard.get("privileged") is not True
+    assert any(v.endswith(":/var/run/docker.sock") for v in guard["volumes"])
+    # The image that ships nft: the API's, which CI already builds.
+    assert resolve(guard["image"]).split("/")[-1].split(":")[0] == "harborbox-api"
+    assert guard["restart"] == "unless-stopped"
+
+    depends = document["services"]["opensandbox"]["depends_on"]
+    assert depends["sandbox-guard"]["condition"] == "service_healthy", path.name
 
 
 def test_egress_is_opt_in_so_an_empty_network_is_safe() -> None:

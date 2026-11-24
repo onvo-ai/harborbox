@@ -193,6 +193,8 @@ jobs:
             --include='src/harborbox/config.py'
           uv run coverage report --fail-under=100 \
             --include='src/harborbox/opensandbox_runtime.py'
+          uv run coverage report --fail-under=100 \
+            --include='src/harborbox/sandbox_network.py'
           # Already at 100% and holding nothing but a docstring and __version__.
           # Pinned so that the first piece of logic anyone puts in the package
           # __init__ arrives with a test rather than quietly lowering the tree.
