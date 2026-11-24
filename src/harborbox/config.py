@@ -182,8 +182,9 @@ class Settings(BaseSettings):
     # Read by nothing under the OpenSandbox runtime, which is the only runtime
     # there is. It belonged to the direct-Docker provider, where a sandbox sat
     # on an `internal: true` network and `egress: true` attached this second
-    # one. OpenSandbox starts every sandbox on its own `network_mode = "bridge"`
-    # (the `[docker]` block in the compose files), so every sandbox has
+    # one. OpenSandbox starts every sandbox on `harborbox-sandbox-v1`, a bridge
+    # with a gateway (the `[docker]` block in the compose files, and
+    # `harborbox.sandbox_network`), so every sandbox has
     # outbound internet whatever this is set to and whatever `egress` the
     # caller sent -- `tests/e2e_onvo_readiness.py` asserts exactly that. Kept
     # so existing deployments' env vars still parse; it is not a control.

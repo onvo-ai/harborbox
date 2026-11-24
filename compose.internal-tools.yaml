@@ -9,14 +9,22 @@
 #
 #   1. `HARBORBOX_SANDBOX_EGRESS_NETWORK` is empty. That does NOT cut sandboxes
 #      off from the network, although this comment said so until 2026-11-12.
-#      Sandboxes are started by OpenSandbox on `network_mode = "bridge"` (the
-#      `[docker]` block below), so every one of them has outbound internet.
-#      The setting and the per-sandbox `egress` flag belonged to the old
-#      direct-Docker provider and are read by nothing under the OpenSandbox
-#      runtime; tests/e2e_onvo_readiness.py asserts that a sandbox can open a
-#      connection to the internet. Onvo's worker still passes datasource CSVs
-#      in as files, so widget code has no need to fetch anything -- but nothing
-#      here stops it, and nothing stops any other caller's code either.
+#      Sandboxes are started by OpenSandbox on `harborbox-sandbox-v1` (the
+#      `[docker]` block below), a bridge with a gateway, so every one of them
+#      has outbound internet. The setting and the per-sandbox `egress` flag
+#      belonged to the old direct-Docker provider and are read by nothing under
+#      the OpenSandbox runtime; tests/e2e_onvo_readiness.py asserts that a
+#      sandbox can open a connection to the internet. Onvo's worker still
+#      passes datasource CSVs in as files, so widget code has no need to fetch
+#      anything -- but nothing here stops it, and nothing stops any other
+#      caller's code either.
+#
+#      What IS stopped, since DEV-2727, is everything else: the `sandbox-guard`
+#      service fences that bridge with a host firewall, so a sandbox cannot
+#      reach this host (any address, any port -- the Trigger stack's listeners
+#      included), another sandbox's execd, 169.254.169.254, or any private
+#      range. Until then sandboxes ran on Docker's default `bridge` and reached
+#      all of it. See src/harborbox/sandbox_network.py.
 #
 #   2. No published port. compose.yaml binds 127.0.0.1 for local development;
 #      here the API must not be reachable from the host at all.
@@ -121,8 +129,9 @@ configs:
   # host: no `[egress]` section, and a narrower port range, since the Trigger
   # stack shares these ephemeral ports. Leaving `[egress]` out does not block
   # anything: that section configures OpenSandbox's optional egress sidecar,
-  # and without it sandboxes simply use the bridge network unfiltered, with
-  # full outbound internet.
+  # and without it sandboxes have full outbound internet. What they cannot
+  # reach is this host or anything private: that is sandbox-guard's firewall,
+  # not OpenSandbox's.
   opensandbox-config:
     content: |
       [server]
@@ -154,7 +163,14 @@ configs:
       path = "/var/lib/opensandbox/opensandbox.db"
 
       [docker]
-      network_mode = "bridge"
+      # A bridge of Harborbox's own, not Docker's default `bridge`. The
+      # sandbox-guard service creates it and fences it: a sandbox keeps
+      # outbound internet and loses this host, its siblings, the metadata
+      # address and every private range (DEV-2727). OpenSandbox refuses to
+      # create a sandbox on a network that does not exist, so a missing guard
+      # fails closed. tests/test_compose_deployment.py pins this name to
+      # harborbox.sandbox_network.NETWORK_NAME.
+      network_mode = "harborbox-sandbox-v1"
       host_ip = "host.docker.internal"
       # Where Docker publishes each sandbox's ports, execd's included. execd's
       # port takes no token, so the 0.0.0.0 default would put every sandbox's
@@ -364,8 +380,48 @@ services:
         aliases:
           - buildkit-gateway
 
+  # The sandbox network, and the host firewall that fences it (DEV-2727).
+  #
+  # Creates `harborbox-sandbox-v1` if it is missing and installs an nftables
+  # table that drops everything a sandbox sends to this host or to a private,
+  # link-local or CGNAT address, while leaving outbound internet and the API's
+  # own connections into execd alone. It re-applies the table every 30s, so a
+  # firewall reload on the host heals by itself; the table outlives the
+  # container, so a guard restart leaves no gap.
+  #
+  # The API image, run as something else: CI already builds and pushes it, and
+  # it ships `nft`. It needs the host's network namespace -- the rules belong
+  # to the host, not to a container -- CAP_NET_ADMIN to write them and nothing
+  # else, and the Docker socket to create the network. opensandbox waits for
+  # it to be healthy, which means the table is in the kernel.
+  sandbox-guard:
+    image: ghcr.io/onvo-ai/harborbox-api:${HARBORBOX_DEPLOY_TAG:-production}
+    command: ["python", "-m", "harborbox.sandbox_network", "guard"]
+    network_mode: host
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "python", "-m", "harborbox.sandbox_network", "check"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    mem_limit: 96m
+    memswap_limit: 96m
+    pids_limit: 32
+    restart: unless-stopped
+
   opensandbox:
     image: opensandbox/server:release-1.1.1
+    depends_on:
+      sandbox-guard:
+        condition: service_healthy
     environment:
       SANDBOX_CONFIG_PATH: /etc/opensandbox/config.toml
       OPENSANDBOX_SERVER_API_KEY: ${SERVICE_PASSWORD_64_OPENSANDBOXAPI:?see the API service below - the same key must reach both sides.}
@@ -522,8 +578,8 @@ services:
       # Empty, and it makes no difference what this is: nothing reads it under
       # the OpenSandbox runtime. It named the network the old direct-Docker
       # provider attached when a caller sent `egress: true` (`_connect_egress`,
-      # which no longer exists). Sandboxes now run on OpenSandbox's bridge
-      # network and have outbound internet, whatever `egress` the caller sent.
+      # which no longer exists). Sandboxes now run on `harborbox-sandbox-v1`
+      # and have outbound internet, whatever `egress` the caller sent.
       # See the header. Kept so a host that still sets the variable parses.
       #
       # Blocking sandbox egress for real is a networking change (an OpenSandbox
@@ -737,6 +793,12 @@ networks:
   # that did not exist, and every sandbox went straight to `failed` with nothing
   # in the API log to say why. Created once out of band with:
   #   docker network create --internal harborbox-net
+  #
+  # No sandbox runs on it. It dates from the direct-Docker provider; under
+  # OpenSandbox the API is its only member and `Settings.sandbox_network` is
+  # read by nothing. Sandboxes run on `harborbox-sandbox-v1`, which
+  # sandbox-guard owns (DEV-2727) -- this one's `--internal` was never what
+  # isolated them.
   sandboxes:
     name: ${HARBORBOX_SANDBOX_NETWORK:-harborbox-net}
     external: true

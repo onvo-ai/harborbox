@@ -92,7 +92,12 @@ configs:
       path = "/var/lib/opensandbox/opensandbox.db"
 
       [docker]
-      network_mode = "bridge"
+      # Harborbox's own bridge, created and fenced by the sandbox-guard service
+      # below: outbound internet, but not the host, not another sandbox, not
+      # 169.254.169.254, not any private range (DEV-2727). Same name as
+      # compose.internal-tools.yaml; tests/test_compose_deployment.py pins both
+      # to harborbox.sandbox_network.NETWORK_NAME.
+      network_mode = "harborbox-sandbox-v1"
       host_ip = "host.docker.internal"
       # Where Docker publishes each sandbox's ports, execd's included. execd's
       # port takes no token, so the 0.0.0.0 default would put every sandbox's
@@ -265,8 +270,41 @@ services:
       - build
       - control
 
+  # Creates the sandbox network and keeps the host firewall that fences it in
+  # place. See the same service in compose.internal-tools.yaml and
+  # src/harborbox/sandbox_network.py. Built from the API's Dockerfile, which
+  # ships `nft`; a Linux Docker host (or Docker Desktop's VM) with nftables
+  # in its kernel is all it needs.
+  sandbox-guard:
+    image: harborbox-api:local
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    command: ["python", "-m", "harborbox.sandbox_network", "guard"]
+    network_mode: host
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "python", "-m", "harborbox.sandbox_network", "check"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    mem_limit: 96m
+    memswap_limit: 96m
+    pids_limit: 32
+    restart: unless-stopped
+
   opensandbox:
     image: opensandbox/server:release-1.1.1
+    depends_on:
+      sandbox-guard:
+        condition: service_healthy
     environment:
       SANDBOX_CONFIG_PATH: /etc/opensandbox/config.toml
       OPENSANDBOX_SERVER_API_KEY: ${OPENSANDBOX_API_KEY:-change-me-opensandbox}
@@ -391,8 +429,8 @@ services:
       HARBORBOX_BASE_TEMPLATE_MEMORY_MB: ${HARBORBOX_BASE_TEMPLATE_MEMORY_MB:-512}
       HARBORBOX_BASE_TEMPLATE_CPU: ${HARBORBOX_BASE_TEMPLATE_CPU:-1.0}
       HARBORBOX_SANDBOX_NETWORK: harborbox-net
-      # Read by nothing under the OpenSandbox runtime. Sandboxes run on the
-      # bridge network (`network_mode = "bridge"` above) and have outbound
+      # Read by nothing under the OpenSandbox runtime. Sandboxes run on
+      # `harborbox-sandbox-v1` (`network_mode` above) and have outbound
       # internet whether or not a caller sends `egress: true`.
       HARBORBOX_SANDBOX_EGRESS_NETWORK: harborbox-egress
       HARBORBOX_SANDBOX_RUNTIME: ${HARBORBOX_SANDBOX_RUNTIME:-}
