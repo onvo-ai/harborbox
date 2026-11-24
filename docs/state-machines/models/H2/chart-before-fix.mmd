@@ -1,0 +1,99 @@
+---
+title: "Harborbox idle pause against a new command"
+---
+stateDiagram-v2
+  state "Legend" as legend {
+    lg0: lost
+    lg1: live
+    lg2: rest
+    lg3: Breaks IdleNeverLosesTheSandbox or NoOrphanSnapshot or NoPauseUnderACommand
+    lg4: Path to the IdleNeverLosesTheSandbox or NoOrphanSnapshot or NoPauseUnderACommand bug
+  }
+  class lg0 pink
+  class lg1 teal
+  class lg2 blue
+  class lg3 breaks
+  class lg4 bugPath
+  state "Sandbox Running" as s0 {
+    s1: Command No command
+    s2: Command Command queued
+    s3: Command Command admitted
+    s4: Command Command running
+    s5: Command Command done
+  }
+  state "Sandbox Running, no container" as s6 {
+    s7: Command No command
+    s8: Command Command queued
+    s9: Command Command admitted
+    s10: Command Command running
+    s11: Command Command done
+  }
+  state "Sandbox Paused cold, no container" as s12 {
+    s13: Command No command
+    s14: Command Command queued
+    s15: Command Command admitted
+    s16: Command Command running
+    s17: Command Command done
+  }
+  state "Sandbox Starting, no container" as s18 {
+    s19: Command Command admitted
+    [*] --> s19
+  }
+  state "Sandbox Failed (lost), no container" as s20 {
+    s21: Command Command failed
+  }
+  [*] --> s1
+  s1 --> s2: you post a command
+  s1 --> s7: the sandbox is snapshotted and its container removed
+  s2 --> s2: the scheduler reads the queue or the idle sweep picks the sandbox
+  s7 --> s13: the sweep records the pause
+  s7 --> s8: you post a command
+  s2 --> s8: the sandbox is snapshotted and its container removed
+  s2 --> s3: the scheduler admits the command
+  s13 --> s14: you post a command
+  s8 --> s14: the sweep records the pause
+  s3 --> s4: the command starts
+  s8 --> s9: the scheduler admits the command
+  s3 --> s9: the sandbox is snapshotted and its container removed
+  s4 --> s5: the command returns
+  s14 --> s18: the scheduler admits the command
+  s9 --> s15: the sweep records the pause
+  s9 --> s21: the command starts
+  s14 --> s15: the scheduler admits the command
+  s4 --> s10: the sandbox is snapshotted and its container removed
+  s19 --> s4: the command starts
+  s15 --> s21: the command starts
+  s21 --> s21: the sweep records the pause
+  s10 --> s21: the command returns
+  s10 --> s16: the sweep records the pause
+  s5 --> s11: the sandbox is snapshotted and its container removed
+  s16 --> s21: the command returns
+  s11 --> s17: the sweep records the pause
+  classDef breaks fill:#ffecee,stroke:#e72e3b,stroke-width:2.5px,color:#cd2834
+  class s1 teal
+  class s1 bugPath
+  class s2 teal
+  class s2 bugPath
+  class s3 teal
+  class s3 bugPath
+  class s4 teal
+  class s4 bugPath
+  class s5 teal
+  class s7 teal
+  class s8 teal
+  class s9 teal
+  class s9 bugPath
+  class s10 teal
+  class s10 breaks
+  class s10 bugPath
+  class s11 teal
+  class s13 blue
+  class s14 blue
+  class s15 blue
+  class s16 blue
+  class s16 breaks
+  class s17 blue
+  class s19 blue
+  class s21 pink
+  class s21 breaks
+  class s21 bugPath

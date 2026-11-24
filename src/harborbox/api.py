@@ -286,6 +286,8 @@ async def ensure_ready(
         raise HTTPException(
             status_code=409,
             detail=f"sandbox must be running; current status is {sandbox.status}",
+            # A pause lands in seconds, and the sandbox then starts again.
+            headers={"Retry-After": "1"} if sandbox.status == "pausing" else None,
         )
     if action == "ready":
         return sandbox
@@ -758,12 +760,15 @@ async def pause_sandbox(
     plan = plan_pause(sandbox.status, memory=body.memory)
     if plan is None:
         raise HTTPException(status_code=409, detail=f"cannot pause {sandbox.status}")
-    if plan.thaw_first:
-        started = await runtime_from(request).resume(sandbox)
-        sandbox.container_id = started.id
-        sandbox.container_name = started.name
     if plan.call_runtime:
-        await runtime_from(request).pause(sandbox, memory=body.memory)
+        # Through the scheduler's claim, not straight to the runtime: the
+        # check above is a read, and a command admitted after it would run in
+        # the container the pause removes. `suspend` works on its own rows,
+        # so this session lets go of its copy first.
+        session.expunge(sandbox)
+        if not await scheduler_from(request).suspend(sandbox, memory=body.memory):
+            raise HTTPException(status_code=409, detail="sandbox has an active execution")
+        return await get_sandbox_or_404(session, sandbox_id)
     sandbox.status = plan.target
     if plan.target == "paused_cold":
         sandbox.container_id = None
@@ -865,8 +870,16 @@ async def kill_sandbox(
         )
         .values(status="cancelled", cancel_requested=True, finished_at=utc_now())
     )
-    await runtime_from(request).kill(sandbox)
+    # `killed` is saved before the runtime is called, not after. A start in
+    # flight that comes up afterwards finds it and removes its own container
+    # (`Scheduler._ensure_running_locked`). Saved after, it overwrote the
+    # `running` such a start had just written, and the container ran on with
+    # no row pointing at it. The reread picks up a container id a start saved
+    # before this commit.
     sandbox.status = "killed"
+    await session.commit()
+    await session.refresh(sandbox)
+    await runtime_from(request).kill(sandbox)
     sandbox.container_id = None
     sandbox.container_name = None
     await session.commit()
@@ -1382,14 +1395,22 @@ async def cancel_execution(
     session: AsyncSession = Depends(get_session),
 ) -> ExecutionResponse:
     execution = await get_execution_or_404(session, execution_id)
-    if execution.status == "queued":
-        execution.status = "cancelled"
-        execution.cancel_requested = True
-        execution.environment = scrub_environment(execution.environment)
-        execution.finished_at = utc_now()
-        await session.commit()
-        await session.refresh(execution)
-    elif execution.status not in {"succeeded", "failed", "cancelled"}:
+    # Conditional on `queued` in the statement itself, not on the status read
+    # above: the scheduler can admit the execution between that read and this
+    # write, and an unconditional write then cancels a command that runs anyway.
+    await session.execute(
+        update(Execution)
+        .where(Execution.id == execution_id, Execution.status == "queued")
+        .values(
+            status="cancelled",
+            cancel_requested=True,
+            environment=scrub_environment(execution.environment),
+            finished_at=utc_now(),
+        )
+    )
+    await session.commit()
+    await session.refresh(execution)
+    if execution.status not in TERMINAL_EXECUTION_STATES:
         raise HTTPException(
             status_code=409,
             detail="running execution interruption is not implemented",

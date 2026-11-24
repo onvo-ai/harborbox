@@ -1,0 +1,32 @@
+---
+title: "Harborbox reaper against a sandbox coming back from idle"
+---
+stateDiagram-v2
+  state "Legend" as legend {
+    lg0: gone
+    lg1: live
+    lg2: rest
+  }
+  class lg0 pink
+  class lg1 teal
+  class lg2 blue
+  s0: Paused cold
+  s1: Starting, start in flight
+  s2: Running
+  s3: Starting, start timed out
+  s4: Starting, start timed out, stuck
+  s5: Killed, start timed out, stuck
+  [*] --> s0
+  s0 --> s1: you post a command
+  s1 --> s2: the start returns
+  s1 --> s3: the start runs past its budget
+  s3 --> s1: you retry
+  s3 --> s4: five minutes pass with no retry
+  s4 --> s1: you retry
+  s4 --> s5: the reaper marks it killed
+  class s0 blue
+  class s1 blue
+  class s2 teal
+  class s3 blue
+  class s4 blue
+  class s5 pink

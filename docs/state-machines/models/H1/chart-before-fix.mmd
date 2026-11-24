@@ -1,0 +1,46 @@
+---
+title: "Harborbox sandbox start against DELETE"
+---
+stateDiagram-v2
+  direction LR
+  state "Legend" as legend {
+    lg0: ok
+    lg1: Breaks DeletedStaysDeleted or NoOrphanContainer in some cases
+    lg2: Path to the DeletedStaysDeleted or NoOrphanContainer bug
+  }
+  class lg0 blue
+  class lg1 mayBreak
+  class lg2 bugPath
+  state "At the same time" as all {
+    state "Row" as r0 {
+      s0: Starting
+      s1: Deleted
+      s2: Running, knows its container
+      [*] --> s0
+      s0 --> s2: the start saves running
+      s0 --> s1: DELETE saves killed
+      s1 --> s2: the start saves running
+      s2 --> s1: DELETE saves killed
+    }
+    --
+    state "Container" as r1 {
+      s3: No container
+      s4: Container up
+      [*] --> s3
+      s3 --> s4: OpenSandbox creates the container [unless Running, knows its container]
+      s4 --> s3: DELETE kills what it knows of [unless Deleted]
+      s4 --> s3: the start saves running [when Deleted]
+    }
+  }
+  classDef mayBreak fill:#fff3e6,stroke:#e8730c,stroke-width:2.5px,color:#b85a06
+  class s0 blue
+  class s0 bugPath
+  class s1 mayBreak
+  class s1 bugPath
+  class s2 blue
+  class s2 mayBreak
+  class s2 bugPath
+  class s3 blue
+  class s3 bugPath
+  class s4 mayBreak
+  class s4 bugPath

@@ -1,0 +1,45 @@
+---
+title: "Harborbox idle pause against a new command"
+---
+stateDiagram-v2
+  direction LR
+  state "Legend" as legend {
+    lg0: live
+    lg1: rest
+  }
+  class lg0 teal
+  class lg1 blue
+  state "At the same time" as all {
+    state "Sandbox" as r0 {
+      s0: Running
+      s1: Pausing
+      s2: Pausing, no container
+      s3: Paused cold, no container
+      s4: Starting, no container
+      [*] --> s0
+      s0 --> s1: the idle sweep picks the sandbox [unless Command admitted or Command running]
+      s1 --> s2: the sandbox is snapshotted and its container removed
+      s2 --> s3: the sweep records the pause
+      s3 --> s4: the scheduler admits the command [when Command queued]
+      s4 --> s0: the command starts
+    }
+    --
+    state "Command" as r1 {
+      s5: No command
+      s6: Command queued
+      s7: Command admitted
+      s8: Command running
+      s9: Command done
+      [*] --> s5
+      s5 --> s6: you post a command
+      s6 --> s7: the scheduler admits the command [when Paused cold, no container or Running]
+      s7 --> s8: the command starts
+      s8 --> s9: the command returns
+    }
+  }
+  class s0 teal
+  class s1 blue
+  class s2 blue
+  class s3 blue
+  class s4 blue
+  class s8 teal

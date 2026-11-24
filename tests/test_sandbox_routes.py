@@ -26,6 +26,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from harborbox import scheduler as scheduler_module
 from harborbox.api import SANDBOX_START_FAILED_CODE, SANDBOX_STARTING_CODE, app
 from harborbox.build_contexts import BuildContextStore
 from harborbox.config import Settings
@@ -127,11 +128,14 @@ def gzipped_tar(files: dict[str, bytes]) -> bytes:
 
 
 @pytest.fixture
-async def sessions() -> AsyncIterator[Sessions]:
+async def sessions(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Sessions]:
     engine = create_async_engine("sqlite+aiosqlite://")
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
-    yield async_sessionmaker(engine, expire_on_commit=False)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    # The pause route goes through the scheduler, which opens its own sessions.
+    monkeypatch.setattr(scheduler_module, "session_factory", factory)
+    yield factory
     await engine.dispose()
 
 

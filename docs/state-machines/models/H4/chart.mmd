@@ -1,0 +1,52 @@
+---
+title: "Harborbox execution lifecycle"
+---
+stateDiagram-v2
+  direction LR
+  state "Legend" as legend {
+    lg0: done
+    lg1: live
+  }
+  class lg0 teal
+  class lg1 yellow
+  state "At the same time" as all {
+    state "Execution" as r0 {
+      s0: Queued
+      s1: Cancelled
+      s2: Admitted
+      s3: Starting
+      s4: Failed
+      s5: Running
+      s6: Succeeded
+      [*] --> s0
+      s0 --> s1: you delete the sandbox or the cancel is saved
+      s0 --> s2: the scheduler admits it
+      s2 --> s3: the run task begins [when Sandbox starting]
+      s2 --> s4: the run task begins [when Sandbox deleted]
+      s3 --> s5: the command is sent [unless Sandbox starting]
+      s3 --> s4: the sandbox comes up [when Sandbox deleted]
+      s5 --> s6: the result is saved
+      s5 --> s4: the command returns [when Sandbox deleted]
+    }
+    --
+    state "Sandbox" as r1 {
+      s7: Sandbox created
+      s8: Sandbox starting
+      s9: Sandbox deleted
+      s10: Sandbox running
+      [*] --> s7
+      s7 --> s8: the scheduler admits it [when Queued]
+      s7 --> s9: the container is removed [when Cancelled]
+      s8 --> s9: the container is removed
+      s8 --> s10: the sandbox comes up [when Starting]
+      s10 --> s9: the container is removed
+    }
+  }
+  class s0 yellow
+  class s1 teal
+  class s2 yellow
+  class s3 yellow
+  class s4 teal
+  class s5 yellow
+  class s6 teal
+  class s8 yellow
